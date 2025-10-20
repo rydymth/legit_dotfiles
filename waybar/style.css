@@ -1,0 +1,232 @@
+@define-color bg       #0e1116;
+@define-color bg_alt   #1f242d;
+@define-color fg       #d9d9d9;
+@define-color fg_1     #ffffff;
+@define-color fg_2     #a0a8b7;
+
+@define-color teal     #00a99d;
+@define-color blue     #4d90d9;
+@define-color purple   #8c6cd1;
+@define-color yellow   #e6c27a;
+@define-color red      #d96b6b;
+
+* {
+  border: none;
+  border-radius: 0;
+  font-family: GoMono Nerd Font;
+  background: @bg;
+  font-size: 13px;
+  min-height: 0;
+}
+
+#tags button {
+  color: @base;
+  border-radius: 50%;
+  /* background-color: @base; */
+  margin-left: 1px;
+  margin-right: 1px;
+  padding: 2 6 2 6;
+}
+
+#tags button.urgent * {
+  color: @mauve;
+}
+
+#tags button.urgent {
+  color: @red;
+  box-shadow: none;
+  /* Remove predefined box-shadow */
+  text-shadow: none;
+  /* Remove predefined text-shadow */
+  border: 0px;
+  border-radius: 10px;
+  background: none;
+}
+
+/* #tags * { */
+/*   color: whitesmoke; */
+/* } */
+
+#tags {
+  border-style: solid;
+  background-color: @base;
+  opacity: 1;
+  border-radius: 10px;
+  margin: 8px 0px 8px 10px;
+}
+
+#tags button.occupied {
+  color: @blue;
+  border-radius: 20px;
+  color: @teal;
+  /* background-color: @flamingo; */
+}
+
+#tags button.focused * {
+  color: @purple;
+}
+
+/* Workspace Container */
+/* Workspace Container */
+#workspaces {
+  margin: 0 3px;
+  padding: 0 4px;
+}
+
+/* Base buttons */
+#workspaces button {
+  padding: 3px;
+  margin: 0 2px;
+  color: @teal;
+}
+
+#workspaces button.persistent {
+  padding: 3px;
+  margin: 0 2px;
+  color: @fg_2;
+}
+
+/* Focused workspace */
+#workspaces button.focused {
+  padding: 3px;
+  margin: 0 2px;
+  color: @purple;
+  font-weight: bold;
+}
+
+/* Urgent workspace */
+#workspaces button.urgent {
+  background: @red;
+  color: @fg_1;
+  font-weight: bold;
+  box-shadow: 0 0 6px rgba(217, 107, 107, 0.8);
+}
+
+/* Hover */
+#workspaces button:hover {
+  color: @purple;
+}
+
+
+#clock {
+  padding: 0 3px;
+  background: @bg_alt;
+  color: @fg_1;
+  font-weight: 500;
+}
+
+/* Right-side modules */
+#pulseaudio, #network, #battery, #tray, #custom-notification, #custom-github {
+  padding: 0 3px;
+  margin: 0 1px;
+  color: @fg;
+}
+
+/* Alerts */
+#battery.warning {
+  color: @yellow;
+}
+#battery.critical {
+  color: @red;
+}
+#network.disconnected {
+  color: @red;
+}
+#custom-ubuntu {
+  padding: 0 6px;
+  margin: 0 3px;
+  color: @teal;
+  font-weight: bold;
+}
+#custom-ubuntu:hover {
+  color: @purple; /* hover accent */
+}
+#custom-separator {
+  margin: 0 2px;
+  padding: 0;
+  border-left: 1px solid @bg_alt;
+}
+#disk {
+  padding: 0 12px;
+  margin: 0 6px;
+  color: @teal;
+  font-weight: 500;
+  transition: all 0.15s ease;
+}
+
+#disk:hover {
+  background: @bg;
+  border: 1px solid @teal;
+  color: @fg_1;
+  box-shadow: 0 0 6px rgba(0, 169, 157, 0.4);
+}
+
+/* === Aurora Midnight Minimal Flat Look === */
+#tray, 
+#pulseaudio, 
+#network, 
+#battery, 
+#clock, 
+#custom-notification, 
+#custom-brightness, 
+#custom-volume, 
+#disk {
+  background: none;
+  border: none;
+  border-radius: 0;
+  padding: 0 2px;
+  margin: 0 1px;
+  font-weight: 500;
+}
+
+/* Individual accent colors for clarity */
+#pulseaudio {
+  color: @teal;       /* sound - teal accent */
+}
+
+#network {
+  color: @blue;       /* network - blue accent */
+}
+
+#battery {
+  color: @yellow;     /* battery - yellow accent */
+}
+
+#clock {
+  color: @purple;     /* time - purple accent */
+}
+
+#tray {
+  color: @fg_2;       /* tray icons - neutral gray */
+}
+
+#custom-notification {
+  color: @red;        /* notifications - red accent */
+}
+
+#disk {
+  color: @blue;       /* disk space - same as volume for cohesion */
+}
+
+#custom-brightness {
+  color: @blue;       /* brightness - soft blue */
+}
+
+#custom-volume {
+  color: @teal;       /* volume - same teal for consistency */
+}
+
+/* Hover effects: subtle text glow */
+#tray:hover,
+#pulseaudio:hover,
+#network:hover,
+#battery:hover,
+#clock:hover,
+#custom-notification:hover,
+#custom-brightness:hover,
+#custom-volume:hover,
+#disk:hover {
+  color: @fg_1;
+  text-shadow: 0 0 6px currentColor;
+  transition: color 0.15s ease, text-shadow 0.15s ease;
+}

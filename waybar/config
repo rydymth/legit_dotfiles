@@ -1,0 +1,161 @@
+{
+  "position": "top",
+  "height": 36,
+  "spacing": 0,
+
+  "modules-left": [
+    "custom/ubuntu",
+    "custom/separator",
+    "river/tags",
+    "custom/separator",
+    "river/window",
+  ],
+
+  "modules-center": [
+  ],
+
+  "modules-right": [
+    "tray",
+    "custom/separator",
+    "pulseaudio",
+    "custom/separator",
+    "battery",
+    "custom/separator",
+    "disk",
+    "custom/separator",
+    "custom/github",
+    "custom/separator",
+    "custom/notification",
+    "custom/separator",
+    "clock"
+  ],
+
+     "river/tags": {
+		"num-tags": 7,
+       "tag-labels": [
+       " ",   // Terminal
+       " ",   // Browser
+       " ",   // Personal coding
+       " ",   // Work coding
+       " ",   // Leisure (Spotify, media)
+       " ",   // Gaming/Streaming
+       " "   // System/Config
+       ]
+    },
+
+  "sway/workspaces": {
+  "disable-scroll": true,
+  "all-outputs": true,
+  "format": "{icon}",
+  "persistent_workspaces": {
+    "1": [],
+    "2": [],
+    "3": [],
+    "4": [],
+    "5": [],
+    "6": [],
+    "7": []
+  },
+  "format-icons": {
+    "1": "term  ",   // Terminal
+    "2": "web  ",   // Browser
+    "3": "pers  ",   // Personal coding
+    "4": "work  ",   // Work coding
+    "5": "leis  ",   // Leisure (Spotify, media)
+    "6": "game  ",   // Gaming/Streaming
+    "7": "sys  ",   // System/Config
+    "urgent": " ",
+    "default": " "
+  },
+  "format-names": {
+    "1": "term",
+    "2": "web",
+    "3": "pers",
+    "4": "work",
+    "5": "leis",
+    "6": "game",
+    "7": "sys"
+  }
+},
+
+"river/layout": {
+    "format": "{}",
+    "min-length": 4,
+    "align": "right"
+},
+
+  "river/window": {
+    "format": "{}",
+    "max-length": 60
+  },
+
+  "clock": {
+    "tooltip-format": "<big>{:%Y %B}</big>\n<tt><small>{calendar}</small></tt>",
+    "format": "{:%a %d %b, %H:%M}"
+  },
+
+  "battery": {
+    "states": {
+      "warning": 30,
+      "critical": 15
+    },
+    "format": "{capacity}% {icon}",
+    "format-charging": "{capacity}% 󰂄 ",
+    "format-plugged": "{capacity}% ",
+    "format-icons": [" ", " ", " ", " ", " "]
+  },
+
+  "pulseaudio": {
+    "format": "{volume}% {icon}",
+    "format-muted": "",
+    "format-icons": [" ", " ", " "],
+    "on-click": "pavucontrol"
+  },
+
+  "tray": {
+    "spacing": 12
+  },
+
+  "custom/notification": {
+    "tooltip": true,
+    "format": "{icon}",
+    "format-icons": {
+      "notification": " <span foreground='red'><sup> </sup></span>",
+      "none": " "
+    },
+    "return-type": "json",
+    "exec-if": "which swaync-client",
+    "exec": "swaync-client -swb",
+    "on-click": "swaync-client -t -sw"
+  },
+
+  "custom/github": {
+	    "format": "{}  ",
+	    "return-type": "json",
+	    "interval": 60,
+	    "exec": "$HOME/.config/scripts/github.sh",
+	    "on-click": "xdg-open https://github.com/notifications"
+	},
+
+"custom/ubuntu": {
+  "format": " ",
+  "tooltip": false,
+  "on-click": "wofi -c ~/.config/wofi/spotlight_search --allow-images --allow-markups" 
+},
+"custom/separator": {
+    "format": " ",
+    "interval": "once",
+    "tooltip": false
+},
+"disk": {
+  "interval": 30,                                       // refresh every 30s
+  "path": "/",                                          // mount point
+  "unit": "GB",                                         // display in GB
+  "format-alt": "   {specific_free:0.2f} GB free / {specific_total:0.2f} GB", 
+  "format": "   {percentage_free}% free on {path}",  // toggle view
+  "tooltip-format": "Path: {path}\nUsed: {specific_used:0.2f} GB\nFree: {specific_free:0.2f} GB\nTotal: {specific_total:0.2f} GB ({percentage_free}% free)",
+  "on-click": "thunar /",                               // or nautilus, dolphin, etc.
+  "on-click-right": "gnome-disks"                       // open disk manager
+}
+
+}

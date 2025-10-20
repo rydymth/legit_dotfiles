@@ -1,0 +1,51 @@
+window {
+  margin: 0px;
+  border: 2px solid #00a99d; /* Teal border */
+  background-color: #0e1116; /* bg */
+  font-family: Ubuntu, sans-serif;
+  font-size: 14px;
+  color: #d9d9d9; /* fg */
+}
+
+#input {
+  margin: 6px;
+  border: 1px solid #1f242d; /* bg_alt */
+  background-color: #181c24; /* bg_2 */
+  color: #e6e6e6; /* fg */
+  padding: 6px;
+}
+
+#inner-box {
+  margin: 6px;
+  background-color: #0e1116; /* bg */
+}
+
+#outer-box {
+  margin: 6px;
+  background-color: #0e1116;
+}
+
+#scroll {
+  margin: 0px;
+}
+
+#text {
+  margin: 4px;
+  color: #a0a8b7; /* fg_2 */
+}
+
+#entry {
+  padding: 6px;
+  margin: 2px 0px;
+}
+
+#entry:selected {
+  background-color: #00a99d; /* Teal highlight */
+  color: #0e1116;            /* Dark background for strong contrast */
+  font-weight: 600;          /* Optional: make it bold for clarity */
+}
+
+#text:selected {
+  color: #0e1116;            /* Dark background for strong contrast */
+  font-weight: 600;          /* Optional: make it bold for clarity */
+}

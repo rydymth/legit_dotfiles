@@ -1,0 +1,17 @@
+# Window settings
+width=270
+height=600
+location=bottom_left
+show=dmenu
+prompt=Select Wallpaper
+layer=overlay
+yoffset=-50
+xoffset=25
+
+# Layout
+columns=3
+image_size=250x141 # 16:9
+allow_images=true
+insensitive=true
+hide_scroll=true
+sort_order=alphabetical
