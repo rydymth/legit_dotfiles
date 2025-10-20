@@ -34,6 +34,7 @@ They’re in ./walls/
 
 **Tools Used**
 | Tools | Need |
+|-------|--|
 | Wofi | App launcher and stuff |
 | Waybar | Status bar |
 | ghostty | Terminal emulator |
