@@ -1,0 +1,1510 @@
+# Module: Approval Engine
+
+Started: 2026-09-28
+Branches: teaching = `review/approval` (worktree: `../hrmsystemBe_manual_approval`) | delivery = `feature/approval` (this directory)
+Spec: `../hrmsystemfe/docs/specs/Approval-Engine-Backend-Spec.md` (frontend-authored, written without backend access - several assumptions corrected below against the live schema)
+
+## Phase 0 - Git & workspace
+- [x] Remotes identified: `tdd` (sandbox) / `gitea` (production) / `origin` (gitlab mirror, untouched) - same as UDF module
+- [x] Branches created: both cut from `rudra`@`ae50cc7` ("Tracking changes")
+- [x] Worktree set up: `git worktree add ../hrmsystemBe_manual_approval review/approval`
+
+## Phase 1 - Architecture
+- [x] Legacy/existing implementation reviewed: Travel Management's approval flow is not legacy - it's this same backend's own prior implementation of nearly this same spec, just scoped to Travel Management and named with a `TM` prefix. Reviewed in depth: `TravelConfigRepository.cs`, `TripApprovalRepository.cs`, `TripApprovalService.cs`, `TravelApprovalWorkflow.cs`, and the live table scripts (user-provided, not the stale `Deployment_script_HRMS_29012026.sql`).
+- [x] Shared/legacy schema constraints identified: none block this module. `HR_TM_TravelConfig`/`HR_TM_TravelConfigApprovers`/`HR_TM_FormDocNoMaster`/`HR_TM_StatusMaster`/`HR_TM_TripRequestApproval` are all this backend's own tables (not `hr_payroll`-owned), so renaming/extending them is safe re: [[schema_shared_legacy_tables]]. `Unit` (branch master target) looks like a separate legacy ERP table (GST/TIN/ECC columns, no `HR_` prefix) - treat as read-only, do not alter.
+- [x] Existing reusable infra identified:
+  - `HR_TM_FormDocNoMaster` = spec's `HR_FormDocMaster`, already live.
+  - `HR_TM_TravelConfig` + `HR_TM_TravelConfigApprovers` = spec's `HR_ApprovalConfig` + `HR_ApprovalConfigApprover`, already live, same `ApprovalMode` CHECK constraint (`default_chain`/`any_one`/`selected_employee_override`), same nullable company/branch scoping.
+  - `HR_TM_StatusMaster` (Id, Status) - existing ID-based status lookup, only 3 rows today (Pending/Approved/Rejected, resolved by keyword in `TravelSetupRepository.GetApprovalStatusIdsAsync`). Reused for the new engine (see decisions) instead of the spec's proposed varchar+CHECK columns.
+- **Gap found, not just a naming mismatch**: the spec's `HR_ApprovalInstance`/`HR_ApprovalStep` (one row per required approver, arbitrary N) does not exist. What's live instead, `HR_TM_TripRequestApproval`, is a flat one-row-per-transaction table with exactly 3 fixed bit columns (`ClientApproval`/`FinanceApproval`/`HrApproval` = RM/Finance/HR). `TravelApprovalWorkflow.ResolveOverallStatusId` maps `selected_employee_override`'s arbitrary-length approver list onto those 3 slots by keyword-matching each approver's free-text `ApprovalType` tag against "hr"/"fin"/"report". **Two approvers both tagged "Finance Manager" cannot both be tracked** - only one `FinanceApproverEmpId`/`FinanceApproval` slot exists. This is the real reason to build the spec's per-approver step table, not gold-plating.
+- Corrections to the spec's guessed schema:
+  - `HR_TM_Trip` -> actually `HR_TM_TripRequest`.
+  - `HR_TM_AdvancePayment` -> actually `HR_TM_TravelAdvancePaymentLine`, and it is **not** its own approval flow - it's a payment line hanging off an already-approved `HR_TM_TripRequestApproval` row (`TripRequestApprovalId` FK). The spec's `FormDocId=5` "Approve Advance Payment" as an independent `CreateInstance` target doesn't match reality.
+  - `BranchMasterId` FK target resolved: `Unit.UnitMasterId`, not `HR_UnitMaster`/`HR_BranchMaster`.
+- Decisions (user-confirmed 2026-09-28):
+  1. **Engine scope**: full generic rebuild. Real `HR_ApprovalInstance`/`HR_ApprovalStep` (arbitrary N approvers per step, no 3-slot cap). Rename the TM config tables to be cross-module rather than leaving them Travel-only.
+  2. **Rollout phasing**: PHASED. This module wires up the generic engine + renamed cross-module config tables, and connects **only Recruitment** (`approverequisition`/`hrapproverequisition`, `FormDocId` 1 and 2). `HR_TM_TripRequestApproval` and Travel Management's existing flat 3-slot tracking stay completely untouched and working as today - migrating Travel Management onto the new engine is an explicit future follow-up module, not part of this one.
+  3. **Status modeling**: reuse the existing status master table (renamed generically, see Phase 2) rather than the spec's varchar+CHECK columns - keeps one status vocabulary instead of two, and Travel Management's `StatusName`-driven UI needs no translation layer once it eventually migrates. New rows needed for step-level `Skipped` and instance-level `Cancelled` (data only).
+- Unrelated, confirmed out of scope: `HrJobInterviewRound`'s interviewer approve/reject flow is a different, deliberately-shelved feature ([[interview-approval-skipped]]) - do not touch, do not key any logic off it.
+
+## Phase 2 - Schema / DB design
+- [x] Table names confirmed non-colliding (checked against deployment script + already-scaffolded entities, both clean)
+- [x] Migration file written, idempotent: `SolutionOne_DataAccessLayer/SqlScripts/Migration_ApprovalEngine_20260928.sql`
+- [x] Migration run against dev DB (2026-09-28)
+- **Re-scaffold `HrmsystemContext`: decided NOT needed for this module.** The only typed-EF consumer of the 4 renamed tables (`RecruitmentRequisitionRepository.IsRequisitionApprover`) was rewritten as raw Dapper SQL instead, matching how the rest of this engine and all of Travel Management's own repos already work. Everything in this module compiles and runs against the live renamed tables with the DbContext model still stale for those 4 tables. That staleness is real tech debt, not resolved, just not blocking - see note below.
+- **Known tradeoff, left as-is deliberately**: `HrmsystemContext`'s model still thinks `HrTmTravelConfig`/`HrTmFormDocNoMaster`/`HrTmStatusMaster`/`HrTmTravelConfigApprover` map to the old (now nonexistent) table names. This is inert today - nothing queries those DbSets anymore - but it's a landmine for later: anyone who writes `_hrmsystemContext.HrTmTravelConfigs` in the future (reasonable, since that's what autocomplete offers) gets a runtime "invalid object name" SqlException, not a compile error. Re-scaffolding whenever convenient removes this landmine entirely; it's cleanup, not a blocker.
+- [x] FK type mismatches: none new - everything's `BIGINT` end to end (`HR_EmployeeMaster.EmployeeMasterID`, `HR_FormDocMaster.Id`, etc.), no legacy `int` PK mismatch here like UDF had.
+- Tables:
+  - Renamed: `HR_TM_FormDocNoMaster` -> `HR_FormDocMaster` (+ additive `ModuleKey` column, backfilled `'TravelManagement'` for existing rows)
+  - Renamed: `HR_TM_TravelConfig` -> `HR_ApprovalConfig`
+  - Renamed: `HR_TM_TravelConfigApprovers` -> `HR_ApprovalConfigApprover`
+  - Renamed: `HR_TM_StatusMaster` -> `HR_ApprovalStatusMaster` (+ new `Cancelled`/`Skipped` rows)
+  - New: `HR_ApprovalInstance`, `HR_ApprovalStep` (status columns are `BIGINT` FKs into `HR_ApprovalStatusMaster`, not the spec's varchar+CHECK, per Phase 1 decision)
+  - Additive: `HR_RecruitmentRequisition.ApprovalInstanceId` (nullable FK) - only transaction table touched this phase
+  - New function: `fn_GetSubordinateEmployeeIds` (table-valued, recursive CTE - `OPTION (MAXRECURSION 50)` required at every call site, can't be baked into the function itself)
+- **Correction vs. the spec's draft**: `HR_FormDocMaster.FormDocId` is `IDENTITY` and Travel Management's rows already occupy the low values, so Recruitment's two new rows do NOT get hardcoded `FormDocId 1`/`2` (spec's seed table assumed a fresh 1-5 range). C# resolves them by `(ModuleKey, FormName)` lookup instead - see `ApprovalFormDocKeys` in Phase 4.
+- `HR_TM_TripRequestApproval` is untouched - not renamed, not migrated, stays exactly as today (separate future module).
+
+## Phase 3 - Design pattern
+- Pattern chosen: TBD - follow this repo's existing Decorator convention where a cross-cutting concern applies (see [[dotnet-patterns-tdd]], and how UDF's `CachingUdfMasterRepositoryDecorator` did it)
+- Why: TBD
+
+## Phase 4 - Implementation
+
+### Delivery branch (`feature/approval`)
+| File | What | Status |
+|---|---|---|
+| `Migration_ApprovalEngine_20260928.sql` | Table renames + new tables/function | done, **ran successfully against dev DB (2026-09-28)** |
+| `SolutionOne_Core/Utilities/ApprovalExceptions.cs` | 5 typed exceptions per spec §8 | done |
+| `SolutionOne_Core/ApprovalModels/ApprovalWorkflow.cs` | Mode/status/stage constants + `ApprovalStepEvaluator` (pure, DB-free stage-completion logic) | done |
+| `SolutionOne_Core/ApprovalModels/*.cs` | Request/response DTOs (`CreateApprovalInstanceModel`, `ApprovalActionModel`, `PendingApprovalModel`, `TeamApprovalRequestModel`, `ApprovalStepTimelineModel`, `FormDocModel`) | done |
+| `IApprovalRepository`/`ApprovalRepository` (Dapper) | `CreateInstanceAsync`, `ActionAsync` (txn + `UPDLOCK, ROWLOCK`), `GetPendingAsync`, `GetTeamRequestsAsync`, `GetInstanceTimelineAsync`, `ResolveFormDocIdAsync`, `GetSubordinateEmployeeIdsAsync` | done |
+| `IApprovalService`/`ApprovalService` | Exception→HTTP status mapping (400/403/404/409/500) | done |
+| `ApprovalController` | 5 endpoints. `EmployeeId` for `Action`/`GetPending`/`GetTeamRequests` is always resolved from `IRequestMetadata`, **never** the request body/query - see security note below | done |
+| `EmployeeMasterController.GetDescendantIds` | Thin wrapper over `fn_GetSubordinateEmployeeIds`, per spec §5.8 | done |
+| `TravelConfigService.GetAllForms` + repo/controller | Added optional `moduleKey` filter now that the column exists | done |
+| `ApprovalDependencyInjection` (DAL + BLL) + `Program.cs` wiring | DI registration | done |
+| Mechanical rename pass | 10 files' SQL literals: `HR_TM_TravelConfig(Approvers)`/`HR_TM_FormDocNoMaster`/`HR_TM_StatusMaster` → new names. Verified clean via repo-wide grep. | done |
+| `RecruitmentRequisitionRepository.IsRequisitionApprover` | Rewritten as raw Dapper SQL via `_hrmsystemContext.Database.GetDbConnection()` (two queries, mirroring the original EF LINQ's specific-then-global-fallback shape exactly) instead of the scaffolded EF entities - this was the only typed-EF consumer of the 4 renamed tables anywhere outside `Entities/`, so removing it means **no code in this module needs `HrmsystemContext` re-scaffolded at all** | done |
+| `RecruitmentRequisitionRepository.SetApprovalInstanceIdAsync` | Raw SQL via `Database.ExecuteSqlInterpolatedAsync` - deliberately bypasses the entity/DbSet so it doesn't wait on the re-scaffold | done |
+| `RecruitmentRequisitionService.InsertRecruitmentRequisition` | Now calls `CreateInstance` (FormDocId resolved by name, not hardcoded) after a successful insert; failure is logged, not fatal - see code comment for why | done |
+
+**Bug caught and fixed while wiring Recruitment**: `ResolveConfigSql`'s branch-match condition (`ac.BranchMasterId = @branchMasterId`) is never TRUE when both sides are NULL (SQL's three-valued logic) - and `HR_RecruitmentRequisition` has no `BranchMasterId` column at all, so Recruitment always calls `CreateInstance` with a null branch. Without the fix, a deliberately branch-agnostic (NULL) config row would silently fail its exact-match test and fall through to the global fallback arm - wrong result for exactly the module this table exists for. Fixed with `ISNULL(x, -1) = ISNULL(y, -1)` pairing on both sides.
+
+**Cut over (2026-09-28, user decision)**: `UpdateApprovalRecruitmentRequisition`, `UpdateHRStatusRequisition`, `GetAllRecruitmentRequisitions` now route through the engine; `GetHRApprovalRequisitionList` deliberately does not (see below).
+
+- **Design gap found while wiring this**: Recruitment has *two* independent approval tracks over the same `HR_RecruitmentRequisition` row ("Raise Requisition", "HR Approve Requisition" - spec §3.1), but the additive `ApprovalInstanceId` column (spec §3.6) only has room for one FK. Fixed by adding `IApprovalRepository.GetInstanceIdAsync(formDocId, transactionRecordId)`, which resolves either track independently via `HR_ApprovalInstance`'s own `UQ_HR_ApprovalInstance_Transaction` key. `ApprovalInstanceId` is kept only as a "most recently touched instance" convenience pointer, not the source of truth.
+- **Cross-FormDoc chaining decision**: nothing in the spec says when the "HR Approve Requisition" instance gets created. Went with: when the raise-approval `Action` call closes `Approved`, `UpdateApprovalRecruitmentRequisition` immediately calls `CreateInstance` for "HR Approve Requisition" over the same row. This matches this codebase's own pre-existing intent - `GetHRApprovalRequisitionList`'s doc comment already said `[Status = Approved]` before any of this work started. Not spec-confirmed, flagged here in case wrong.
+- **`GetHRApprovalRequisitionList` filtering (2026-09-28, user confirmed)**: initially left unfiltered on purpose, since its doc comment documented a prior deliberate "show all" decision. User explicitly asked to apply the same `GetPending`-based filtering here too, so this now shows only what's Pending on the caller at the "HR Approve Requisition" stage (FormDocId 2) - same mechanism as `GetAllRecruitmentRequisitions(applyApproverFilter: true)`, just against the other FormDoc.
+- **"Reopen" transitions bypass the engine entirely**: `ApprovalStatus`/`HRStatus` values other than "Approved"/"Rejected" (case-insensitive) skip `Action` and fall through to the old column-update path unchanged - the engine's Pending→terminal state machine has no concept of reopening a closed instance, and inventing one wasn't asked for.
+- **New real enforcement, not just a data-source swap**: both actions previously had zero server-side authorization - any authenticated caller could set any status on any requisition Id. `Action`'s pending-step lookup is now the actual boundary.
+
+### Teaching branch (`review/approval`)
+Not started - user's own implementation, separate worktree.
+
+## Phase 5 - Testing
+- [ ] Tests written for the new Approval Engine code (ApprovalRepository/ApprovalService/the Recruitment cutover) - **not yet done**, real gap
+- [ ] Scratch-table smoke test for the migration DDL - **not yet done**. The renames/new tables have run successfully against the dev DB and the app builds+passes the existing suite against them, which is real signal, but that's not the same as a dedicated smoke test of the DDL itself
+- **Side quest, resolved (2026-09-28)**: user asked to re-scaffold `HrmsystemContext` "since we're on Dapper anyway" territory - turned out NOT needed for this module (only one typed-EF consumer existed, `IsRequisitionApprover`, rewritten as raw Dapper). Rescaffolding was attempted anyway per user request, but the scaffold tool used a different Humanizer/EF-Design version than whatever originally generated this DbContext, producing different capitalization for several unrelated entities (`HR_LoanEMI*`, `HR_UDFQueryConfig`) and, once chased further, unrelated Asset Management entities too - a pre-existing tooling-version mismatch, not anything this module caused. After the collateral damage spread beyond what could be safely hand-verified, **fully reverted the entity model back to its pre-session committed state** (`git checkout rudra -- Entities/` for tracked files, user-approved deletion of 5 abandoned hand-patched duplicates for untracked ones). Confirmed via full rebuild (succeeds) and full existing test suite (398/398 passing) that this leaves everything exactly as it was before, with the Approval Engine's own new tables/renames intact and working via Dapper regardless. **Lesson for next time this needs doing**: pin the exact scaffold tool version first, or expect to hand-verify every touched entity, not just the ones a build error surfaces.
+
+## Phase 6 - Optimization
+- [x] Full build passing (`dotnet build SolutionOneWebPortal/SolutionOneWebPortal_API.csproj`) - verified 2026-09-28
+- [x] Full existing test suite passing (`dotnet test SolutionOne_Tests`) - 398/398, 0 failures, verified 2026-09-28
+- [ ] Any caching/perf work: none added - `ResolveConfig` isn't a proven hot path yet, matches Phase 3 decision
+
+## Phase 7 - Merge
+- [ ] Teaching vs delivery comparison done (if both exist) - winner:
+- [ ] Merged to production remote's integration branch
+- [ ] Tracking file marked complete
+
+## Deferred / out of scope
+- `HrJobInterviewRound` interviewer approve/reject flow - unrelated, shelved feature, do not touch.
+
+## Phase 8 - Travel Management migration (2026-09-28, user-requested follow-up)
+
+Scoped via a research pass before any code: "migrate Travel Management" turned out to be three
+differently-sized jobs, not one. Decisions:
+1. **In scope this pass**: Trip Request approval + Advance Payment approval (share `HR_TM_TripRequestApproval`, differentiated by `FormDocId`/`FormName` - straightforward, same shape as Recruitment).
+2. **Explicitly out of scope**: Travel Expense approval. It does NOT use `HR_TM_TripRequestApproval` at all - its steps are rebuilt dynamically on every read (`ApproveTravelExpenseRepository.BuildApprovalStepsAsync`) from live config, with its own duplicated any-one/unanimous logic and its own auth check, backed by `HR_TM_TripExpenseSubmit.SubmitStatus` + `HR_TM_TripExpenseSubmitApprovalLine` (a separate, `MERGE`-upserted table with defensive "does this exist yet" fallback code suggesting it's newer/less settled). Migrating this needs real design work (how dynamically-rebuilt steps map onto persisted `HR_ApprovalStep` rows), not a mechanical swap - a separate future module.
+3. **Company/Branch-wide role visibility** (`TravelRoleScopeOptions`/`TripApprovalScopeResolver` - Travel Admins see the whole company, Finance/Accounts see their whole branch, regardless of personal approver assignment): the new engine's `GetPending` has no equivalent (it only ever answers "do I personally have a pending step"). **Not built as new engine capability this pass** - solved implicitly instead, see the dual-write decision below. Long-term direction (user-stated): don't revive the old appsettings-role-list mechanism as a bolt-on - the real fix is generalizing `HR_ApprovalConfig`/`HR_ApprovalConfigApprover` to accept *roles* as approvers/viewers directly, not just individual employees, once employee-level migration is solid. That's a real future piece of work, not started.
+
+### Architecture: dual-write, not a union/cutover
+
+Live module, real in-flight data in `HR_TM_TripRequestApproval` - a union-based list rewrite would
+need a new cross-table Id scheme (real collision risk: two independent IDENTITY columns) and would
+break the existing Company/Branch-wide visibility query, which only knows how to read that one
+table. Instead:
+
+- **Submission side** (`TripRequestRepository.AddTripRequest`/`AddTripRequestRange`): the existing
+  `HR_TM_TripRequestApproval` row(s) are still written exactly as before (unchanged) - `BuildApprovalSeedAsync` still gates hard on missing config, matching existing behavior (unlike Recruitment,
+  where a missing config is non-fatal - different modules, matched each one's own existing
+  semantics rather than copying Recruitment's choice). *After* that transaction commits, a **separate**
+  call creates the real `HR_ApprovalInstance`/`HR_ApprovalStep` rows via `CreateInstance` (one per
+  FormDoc: Trip Request Approval, and Advance Payment Approval if applicable). This second call is
+  non-fatal on failure (logged only) - by the time it runs, config is already known-good, so a
+  failure here means something unrelated went wrong after the real trip request already saved
+  successfully.
+- **Action side** (`TripApprovalRepository.ApproveTrip` - also covers Advance Payment, which just
+  delegates to this same method): before touching the legacy flat-column update, resolves the
+  instance via `GetInstanceIdAsync(formDocId, tripRequestId)` and calls `Action`. Rows created
+  before this migration have no matching instance and skip straight to the unchanged legacy logic.
+  Rows created after it get real enforcement first (`NotAuthorizedApproverException`/
+  `InstanceAlreadyClosedException` now mapped to 403/409 in `TripApprovalService.ApproveTrip`,
+  matching the Recruitment cutover's HTTP contract) - only on success does the existing flat-column
+  mirror update still run, unchanged, so **list/detail/Company-Branch-wide visibility keep working
+  exactly as today for both old and new rows**, since they're still reading the same table they
+  always read. This is *why* the role-visibility gap didn't need solving as a new engine capability
+  this pass - the mirror table already serves it.
+- **Real, load-bearing gotcha found while wiring this**: `ApprovalRepository.CreateInstanceAsync`/
+  `ActionAsync` each manage their own transaction (`BeginTransactionAsync`/`CommitAsync` on the
+  scoped `IDapperContext`). `DapperContext.BeginTransactionAsync` unconditionally opens a new
+  transaction and `CommitAsync` unconditionally closes the connection - calling either from *inside*
+  `TripRequestRepository`'s or `TripApprovalRepository`'s own already-open transaction (same scoped
+  instance per request) would silently clobber the outer transaction and prematurely close the
+  connection out from under it. Both engine calls are deliberately placed as their own separate,
+  sequential transactions (after the trip's own commit; before the trip's own approve-transaction
+  begins) - not a stylistic choice, a correctness requirement.
+
+### Status
+- [x] `TripRequestRepository` wired: `CreateInstance` on submit, both FormDocs
+- [x] `TripApprovalRepository.ApproveTrip` wired: `Action` gate before legacy update (covers Advance Payment via delegation)
+- [x] `TripApprovalService.ApproveTrip`: new exceptions mapped to 403/409
+- [x] Full build passing, full existing test suite passing (398/398) - verified 2026-09-28
+- [ ] No new automated tests written for this migration specifically - same gap as Phase 5/6 for the original Recruitment work
+- [ ] Not manually tested against a real trip submission end-to-end (no DB access from this session)
+- [ ] Travel Expense approval - explicit separate future module
+- [ ] Role-based config (roles as approvers, not just employees) - explicit future direction, not started
+
+### Revision (2026-10-06): list visibility switched to strict `GetPending`, matching every other module
+
+**Found while auditing Trip Request's full chain at the user's request** ("let us go slow and start
+with this"): `TripApprovalService.ListAllTripApprovals` never used the generic engine's `GetPending`
+at all - it used `TripApprovalScopeResolver` (a role-based company/branch-wide visibility model:
+Travel Admin sees the whole company, Finance/Accounts their branch, deliberately preserved during
+the original Phase 8 migration) plus an inline, hand-rolled `HR_ApprovalConfigApprover` `EXISTS`
+check in `TripApprovalRepository.ListTripApprovalsForListAsync` for the non-admin case. That inline
+check derives eligibility from **static config/role fields**, never from the actual
+`HR_ApprovalStep` instance state - it could show a row as "yours" even when the engine's current
+stage wasn't actually waiting on you yet (no `CurrentStageOrder` awareness at all).
+
+**User's explicit decision**: replace this with strict `GetPending`-based filtering, identical to
+Recruitment/Income Tax/FNF/every other module - no exceptions for any role, full stop.
+Role/department/designation-based broader visibility (the thing `TripApprovalScopeResolver` was
+reaching for) is an **explicit, deliberately deferred later scope**, not solved now.
+
+- [x] `TripApprovalService.ListAllTripApprovals`: now fetches company-scoped rows only (basic
+  tenant boundary, unrelated to "who may decide"), then filters to the caller's own
+  `GetPending(formDocId, employeeId)` result set via `TransactionRecordId` (matched against
+  `ListTripApproveDto.TripRequestId`, **not** `.Id` - `TransactionRecordId` was set to the trip
+  request's own ID at `CreateInstance` time, not the `HR_TM_TripRequestApproval` row's PK, an easy
+  mismatch to get wrong). A caller with no employee record sees nothing, same as every prior
+  module's unresolvable-identity fallback.
+- [x] `TripApprovalScopeResolver`/`TripApprovalListScope`/role-based `ApproverViewerEmpId` SQL in
+  `ListTripApprovalsForListAsync` are left in place, now simply unreachable (nothing sets
+  `ApproverViewerEmpId` or a non-Company `Scope` anymore) - not deleted, since the user's own framing
+  ("roles, departments and designation... is a later scope") suggests this plumbing may be revisited
+  when that broader-visibility work actually happens, rather than rebuilt from scratch.
+- [x] **Scope note**: this pass only covers Trip Request Approval's list screen
+  (`GetAllTripApprovalRequests`). Advance Payment Approval has its own separate controller/list
+  endpoint and was **not** touched this pass - explicit next step, not forgotten.
+- [x] Full build + full test suite (402/402) passing
+
+## Phase 9 - FormDocMaster ↔ MenuItem link (2026-09-29)
+
+Per `FormDocMaster-MenuItem-Link-Backend-Spec.md` (hrmsystemfe) - backs the frontend's
+`admin/form-doc-menu-link` screen. Not previously implemented; checked and confirmed absent before
+starting.
+
+- [x] `Migration_FormDocMasterMenuLink_20260929.sql`: additive nullable `HR_FormDocMaster.MenuId BIGINT` FK to `HR_MenuItems.MenuID` - **not yet run against the dev DB**, pending
+- [x] `ListFormDto.MenuId` - no SQL change needed for `GetAll`, it's already `SELECT *`
+- [x] `POST /api/FormDocMaster/UpdateMenuLink` - validates `formDocId` exists (404), `menuId` exists in `HR_MenuItems` if not null (404) - deliberately does **not** check `IsActive` on the target menu item (spec §5's own suggested default: frontend's picker already filters those out, so this is only reachable via direct API), and does **not** cross-check `ModuleKey` against the menu item's route (also spec's suggested default) or enforce uniqueness on `MenuId` (multiple FormDocs can share one menu item, matching Recruitment's own precedent)
+- [x] Full build + full test suite (398/398) passing
+- [ ] Migration not yet run against dev DB - **user needs to run it** before this is live
+- [ ] `HR_MenuItems' PK column resolved: `MenuID` (bigint), not the spec's guessed `int MenuId` - confirmed via deployment script, corrected in the migration
+- [ ] Confirmed to frontend (spec §7 step 4) - not yet, pending migration run
+
+## Phase 10 - FormDocMaster create endpoint (2026-09-29)
+
+Per `FormDocMaster-Create-Endpoint-Ask.md` (hrmsystemfe). Closes the gap where every new module's
+`FormDocMaster` row needed a backend dev to insert one by hand.
+
+- [x] `POST /api/FormDocMaster/Create` - `{docNo, formName, description?, moduleKey}` -> `ListFormDto` (menuId always null on create; use `UpdateMenuLink` after, per the spec's own two-step design)
+- [x] Validation: `docNo`/`formName`/`moduleKey` required (400), `docNo` uniqueness enforced (409) - matches the spec's own suggested defaults
+- [x] Same insert shape/defaults as `TravelSetupRepository.EnsureFormDocAsync`'s existing auto-seed path (`CreatedBy=1` placeholder, `IsConfigured=0`) - this is that same insert, exposed as an explicit admin action
+- [x] Full build + full test suite (398/398) passing
+
+## Phase 11 - Broader module rollout, module 1: Loan (2026-09-29)
+
+Scoped via 6 parallel research forks across Attendance, FNF, Loan, Assets, Income Tax, and Payroll
+before any code - see chat for the full comparison table and recommended sequencing. Doing these
+one at a time, easiest/most-decided first.
+
+**Loan Request -> Loan Approval** and **Loan EMI Adjustment** - both done.
+
+- [x] `Migration_LoanApprovalFormDoc_20260929.sql` / `Migration_LoanEmiAdjustmentFormDoc_20260929.sql` - seed rows, `ModuleKey='Loan'`. **Not yet run against the dev DB.**
+- [x] `HR_LoanRequests`/`HR_LoanApproval` are legacy-shared (confirmed in the deployment script) - untouched, no schema change; `HR_ApprovalInstance.TransactionRecordId` needs no FK, same pattern as Recruitment/Trip Request. `HR_LoanEMIAdjustmentRequest`/etc. are this backend's own tables, not legacy, but got the same treatment for consistency.
+- [x] `LoanRequestService.Insert` / `LoanEmiAdjustmentService.Insert`: `CreateInstance` after the real insert, non-fatal, using the **applicant's own branch** (`HR_EmployeeMaster.BranchMasterId`), not the submitting session's - both screens let an Admin act on another employee's behalf, so session branch would be wrong.
+- [x] `LoanApprovalService.Decide` / `LoanEmiAdjustmentService.Decide`: `Action` gate before the existing write logic, mapped to 403/409, using `IPayrollPeriodService.GetLoggedInEmployeeId()` for the acting identity - **skipped entirely when that's null** (an Admin login with no employee record can't be represented as `HR_ApprovalStep.ApproverEmployeeId` at all; falls back to the existing `RequireAdmin()` role check alone for that case, unchanged).
+- [x] Neither `Decide` method's repository wraps a transaction at all (confirmed by the research fork) - no transaction-nesting hazard here, simplest migration yet.
+- [x] "Pending" is a legitimate partial-save state on both screens, not a final decision - the engine has no concept of it, so a Pending save skips the gate entirely and falls straight to the existing logic, same as Recruitment's "Reopen" bypass.
+- [x] `LoanEmiAdjustmentService.Revert` (Approved -> Cancelled, undoing a closed decision) is **not** gated through the engine at all - there's no engine concept of un-approving something already closed; left exactly as it was.
+- [x] Full build + full test suite (398/398) passing
+
+**Config-mode note for whoever sets this up**: "who may decide" today is `IPayrollPeriodService.IsAdmin()`, a blanket role check, not an org-chart resolution the engine has anything like. Expected setup is `any_one` mode with the actual admin employee(s) listed explicitly as `HR_ApprovalConfigApprover` rows - arguably more precise than today (a named, auditable list instead of "anyone with the Admin role"), but it does mean whoever configures this needs to explicitly enumerate the admins, and each one needs a real `HR_EmployeeMaster` row (the `GetLoggedInEmployeeId()`-null case above).
+
+### Bug found and fixed (2026-09-29): the gate was a no-op in 5 flows
+
+While scoping Comp-Off, found that `LoanApprovalService`, `LoanEmiAdjustmentService`,
+`IncomeTaxProofApprovalService`, `MaterialRequisitionApprovalService`, and `AssetIssueApprovalService`
+all called `IApprovalService.Action` (the BLL-layer wrapper) wrapped in
+`try { ... } catch (NotAuthorizedApproverException) catch (InstanceAlreadyClosedException)` -
+copying the shape that's correct for `IApprovalRepository.ActionAsync` (the raw, throwing
+repository method Travel Management calls directly). But `ApprovalService.Action` **catches both
+exceptions internally and returns a failed `ResponseModel`, never rethrowing them** - so every one
+of those catch blocks was dead code, and an unauthorized or already-closed decision fell straight
+through to the legacy write path in all 5 flows. Recruitment (the original template) got this
+right by checking `actionResult.IsSuccess`, not by catching. Fixed all 5 call sites to check
+`IsSuccess`/`Status`/`Message` on the returned `ResponseModel<ApprovalActionResultModel>` instead of
+catching, matching Recruitment's pattern. Full build + full test suite (398/398) still passing after
+the fix. **This means the "real enforcement" claim for Loan/Income Tax/Assets in the sections above
+was not true until this fix landed** - worth knowing if anything was manually tested against those
+flows before today.
+
+## Phase 11 - Broader module rollout, module 2: Income Tax (2026-09-29)
+
+**Income Tax Proof Submission -> Income Tax Proof Approval** - done.
+
+- [x] `Migration_IncomeTaxApprovalFormDoc_20260929.sql` - seed row, `ModuleKey='IncomeTax'`. **Not yet run against the dev DB.**
+- [x] `IncomeTaxProofSubmissionService.SaveAsync`: `CreateInstance` after `_repo.UpsertAsync(...)`, non-fatal, only on first submission (`existingSubmissionId is null` - a re-save of an already-submitted declaration doesn't spawn a second instance), using `_meta.CompanyId`/`_meta.BranchId` (this module has no "act on someone else's behalf" concept, unlike Loan, so session scope is correct here).
+- [x] `IncomeTaxProofApprovalService.SaveAsync`: `Action` gate inserted **before** `_repo.UpsertAsync(...)` - that call opens its own `_tx.BeginTransactionAsync()`, so the gate had to run as a fully separate step first, same transaction-nesting discipline as Trip Approval/Recruitment. Gated only when `dto.ApprovalStatus` is `Approved`/`Rejected`; uses `_meta.EmployeeMasterId` directly (this class's own claims-reading is already funneled through `IRequestMetadata`, unlike Loan/Assets, so no null-check/skip needed - `MissingClaimException` would already have surfaced earlier in the request pipeline if it were missing).
+- [x] Exceptions mapped via `res.FastRet(false, HttpStatusCode.Forbidden/Conflict, ex.Message, null, null)`, matching this service's own existing response-building convention rather than a `Refuse(...)` helper (this class didn't have one).
+- [x] Full build + full test suite (398/398) passing
+
+**Config-mode note**: "who may decide" today has no org-chart resolution either - expected setup is `any_one` (or `default_chain` if a real RM chain applies here) with the actual approver(s) configured explicitly, same reasoning as Loan.
+
+### Follow-up fix (2026-10-05): the approval queue itself had no caller-scoping at all
+
+Once the user configured `HR_ApprovalConfig` for "Income Tax Proof Approval" for real and started
+testing, it turned out `IncomeTaxProofApprovalService.GetQueueAsync` (the approval screen's list
+endpoint) had **zero server-side visibility scoping** - not even company-level, let alone
+per-approver. `IncomeTaxProofApprovalRepository.GetQueueAsync`'s only filters were the two
+*optional*, caller-supplied `BranchMasterID`/`CategoryMasterID` query params; omit both (nothing
+forced a caller to send them) and any authenticated user saw every pending submission across every
+company. The `SaveAsync` gate (above) was always correct, but it only blocks the *decide* action -
+the list itself was wide open regardless of whether the config existed.
+
+Two fixes, both following established precedent rather than inventing new patterns:
+- **Company scoping, unconditional**: `IIncomeTaxProofApprovalRepository.GetQueueAsync` now takes
+  `companyMasterId` and the SQL adds `AND e.CompanyMasterID = @CompanyMasterId` - the one filter
+  that was never optional and should never have been caller-omittable.
+- **Approver-only visibility, same mechanism as Recruitment's `applyApproverFilter`**:
+  `IncomeTaxProofApprovalService.GetQueueAsync` now resolves the caller's actually-Pending
+  submissions via `IApprovalService.GetPending(formDocId, employeeId)` and filters the queue down to
+  those `TransactionRecordId`s - identical to
+  `RecruitmentRequisitionService.GetAllRecruitmentRequisitions(applyApproverFilter: true)`/
+  `GetHRApprovalRequisitionList`.
+- [x] Full build + full test suite (402/402) passing
+
+**Correction, same day**: the first pass of this fix exempted HR Admin from the filter (full
+company-wide view), borrowed from `IncomeTaxProofSubmissionService.GetAllAsync`'s own convention for
+the sibling submission screen. **Wrong precedent to copy** - the user's test account is Admin-role
+only (no separate non-admin test identity exists in this environment), and Recruitment's own
+`applyApproverFilter` has **no role-based exemption at all**: an Admin there only sees what their
+own employee record is actually the configured approver for, same as anyone else. Removed the
+exemption entirely so Income Tax now matches Recruitment's behavior exactly, with zero bypass for
+any role. If a genuine company-wide oversight view is wanted later, it should be its own explicit,
+caller-requested toggle (mirroring Recruitment's own `applyApproverFilter` parameter), not a silent
+role check baked into the one list endpoint.
+
+## Phase 11 - Broader module rollout, module 3: Assets (2026-09-29)
+
+**Material Requisition -> Material Requisition Approval** and **Asset Issue -> Asset Issue Approval** - both done.
+
+- [x] `Migration_AssetsApprovalFormDoc_20260929.sql` - seeds both rows in one script, `ModuleKey='Assets'`. **Not yet run against the dev DB.**
+- [x] `MaterialRequisitionService.Insert` / `AssetIssueService.Insert`: `CreateInstance` after the real insert, non-fatal. Requestor resolved as `model.EmployeeMasterId`/`model.IssueToType==Employee` when raised on behalf of an employee, else the acting session user (visitor-targeted requisitions/issues have no employee to attribute the instance to). `BranchMasterId` is always `null` for both - neither entity carries branch data, unlike Loan's applicant-branch resolution.
+- [x] `MaterialRequisitionApprovalService.Decide` / `AssetIssueApprovalService.Decide`: `Action` gate inserted before `_repository.Save(entity)` / before the `Approve-and-deduct-stock`/`Reject-and-reopen` branch respectively - neither method's repository call wraps its own transaction that the gate would nest inside, confirmed by reading both repos in full, same "simplest migration" shape as Loan. Both classes needed a **new** `GetLoggedInEmployeeId()` helper (reads the `"UserEmpId"` claim, nullable) - neither had one; their existing `GetLoggedInUserId()` reads a *different* claim (`"UserId"`) used only for audit columns, not for approver identity. Gate is skipped entirely when `GetLoggedInEmployeeId()` is null, same admin-with-no-employee-record fallback as Loan.
+- [x] Full build + full test suite (398/398) passing
+
+**Config-mode note**: same shape as Loan/Income Tax - no org-chart resolution exists today for either Assets flow, so expected setup is `any_one` mode with the actual approving employee(s) configured explicitly.
+
+## Phase 11 - Broader module rollout, module 4: Comp-Off (2026-09-29)
+
+**Corrected scoping note**: the user's original tally ("Attendance(2), Payroll(1), FNF(1)") was not a
+double-count - all of Leave/Attendance-Adjustment/Comp-Off/FNF live in this codebase's `Payroll` C#
+folder (not an `Attendance` folder), which is what confused two earlier research passes into thinking
+"Payroll(1)" and one of "Attendance(2)" were the same flow. There are 4 real distinct flows, and
+Comp-Off - previously invisible to both scoping passes - is one of them. Remaining after this:
+Attendance Adjustment, Leave Approval (the architecturally complex one, deferred - see its own section
+below), FNF.
+
+**Comp-Off Application -> Comp-Off Approval** - done. Unlike every other module in this rollout, its
+`Decide` is a **batch** operation (`CompOffApprovalController.Decide` accepts optional `Ids` -
+"Approve All"/"Reject All" against everything the caller may decide), which changed the shape of the
+gate from a single insertion to a per-row loop - see below.
+
+- [x] `Migration_CompOffApprovalFormDoc_20260929.sql` - seed row, `ModuleKey='CompOff'`. **Not yet run against the dev DB.**
+- [x] `HR_CompOffApplications` confirmed legacy-shared (deployment script, pre-existing seeded data, line 923/4649+) - untouched, no schema change.
+- [x] `CompOffService.InsertApplication`: `CreateInstance` after `_repository.InsertApplication(entity)`, non-fatal. `InsertApplication`'s own pre-existing guard (`employee.ReportingPersonId is null or 0` refuses the submission outright) means `entity.ReportingPersonId` is always a real, positive `EmployeeMasterId` by the time the engine call runs - no null-handling needed.
+- [x] `CompOffService.Decide`: the engine gate runs as a loop over `allowed` (the batch of ids the legacy authorization already cleared), one `Action` call per application, **before** `_repository.Decide`'s own single bulk `UPDATE ... WHERE ID IN @Ids` (which opens its own `SqlTransaction` on the shared DbContext connection) - same "sequence fully outside any other open transaction" discipline as every prior module, just looped since this is the first module whose decide call is itself batched rather than one-row-at-a-time.
+- [x] **Design decision**: the `EmployeeId` passed to each `Action` call is always **that row's own `ReportingPersonId`** (from the queue already loaded), never the acting session's own `employeeId`. Reasoning: `HR_ApprovalStep.ApproverEmployeeId` was set to the requestor's reporting person at `CreateInstance` time (the engine's `default_chain` mode resolves it from the exact same `HR_EmployeeMaster.ReportingPersonID` column CompOff's own legacy logic already uses), so this is what the gate's step lookup requires regardless of whether the row is being decided by that actual reporting person or by an Admin exercising CompOff's own pre-existing "Admin may decide anyone's queue" override. `HR_CompOffApplications.ApprovedBy` still correctly records the true acting employee id either way - the engine schema has no separate "acted on behalf of" concept, so this is the only way to satisfy its authorization gate without inventing one. Flagged here since it's a genuine judgment call, not a mechanical port.
+- [x] A row the engine refuses (e.g. an instance already closed via a different route) is treated as a skip, not a batch-wide failure, logged as a warning - consistent with the existing "a row that raced between queue-read and write is a skip" semantics already in this method.
+- [x] Full build + full test suite (398/398) passing
+
+**Config-mode note**: **`default_chain`, `IsReportingMgrRequired=true` only** (no HR/Finance stage) - the best-fitting mapping of any module migrated so far, because it's not an approximation: the engine's dynamic RM resolution and Comp-Off's own "approver = reporting person" rule read the exact same column.
+
+### Bug found and fixed while scoping this module (2026-09-29)
+
+Before writing Comp-Off's gate, found that the gate inserted into **5 already-shipped flows** (Loan
+Request Approval, Loan EMI Adjustment, Income Tax Proof Approval, Material Requisition Approval,
+Asset Issue Approval) was silently a no-op - see the dedicated writeup under Phase 11 module 1
+(Loan) above for the full explanation and fix. Comp-Off's gate was written using the corrected
+(`IsSuccess`-checking) pattern from the start.
+
+## Attendance Leave Approval - scoped, deferred (2026-09-29)
+
+Leave Approval turned out to be a materially bigger architectural lift than every module migrated so
+far - not a flat status-column flow like Loan/IncomeTax/Assets/Comp-Off. Full research findings (file
+paths, line numbers) are in the chat history; summary:
+
+- `HR_LeaveAppAuthLeavel` is **already its own homegrown multi-level approval-chain engine** (one row
+  per required level, built by a legacy stored proc walking the org chart) - not this backend's own
+  table (absent from the deployment script), but functionally overlapping with what `HR_ApprovalStep`
+  already does. Currently dormant in practice (every employee's `LeaveApproverUserMasterID` is NULL
+  today, so it falls back to a single Level-1 approver = the applicant's reporting manager).
+- `LeaveApprovalRepository.ApplyDecisions` is a **batch decision across N different leave
+  applications, inside one shared transaction**, where each iteration's escalate-vs-settle branching
+  depends on DB state re-read inside that same transaction - a loop-shaped transaction-nesting hazard,
+  not a single before/after seam like Comp-Off's batch turned out to be.
+- The signed `ReportingPersonId` convention (positive = `EmployeeMasterID`, negative = `-UserMasterID`
+  for an admin approver with no employee record) has no equivalent in `HR_ApprovalStep`'s schema.
+  Unreachable today (same all-NULL `LeaveApproverUserMasterID` reason above), but a real design gap
+  if it's ever populated.
+- **Recommended direction (not started)**: treat `HR_LeaveAppAuthLeavel` as staying the actual
+  workflow engine for Leave specifically, and build `HR_ApprovalInstance`/`HR_ApprovalStep` only as a
+  dual-write mirror for cross-module reporting/visibility - not the real authorization boundary the
+  way it became for every other module. Needs an explicit design conversation before any code.
+
+## Phase 11 - Broader module rollout, module 5: Attendance Adjustment (2026-09-29)
+
+**Attendance Adjustment** - done, including a new engine capability (see below).
+
+**Correction to the earlier scoping note above**: reading `AttendanceAdjustmentRepository.ApplyDecision`'s
+raw SQL (not just the service layer) showed the "two independent parties, each with their own
+required column" framing was wrong. The real legacy rule is **first-decision-wins**: whichever of
+{the employee's actual reporting manager} or {any HR/Admin} decides first - Approve *or* Reject -
+sets the final outcome immediately (`GetPendingApprovals` excludes a row from the queue the instant
+*either* column reaches a terminal state, and the HR-path SQL writes the shared `ApprovalStatus`
+column too, not just its own `HRApprovalStatus`). The two status columns are for audit attribution
+(which capacity made the call), not two independently-required gates.
+
+None of the 3 existing modes can express that: `default_chain`/`any_one` always put the Reporting
+Manager stage strictly *before* any other stage (HR's step isn't even actionable until RM's stage
+resolves), and `any_one`'s reject rule is deliberately unanimous-within-the-stage (so one of several
+equal approvers rejecting doesn't block the others) - the opposite of "one reject ends it".
+
+**New engine capability, added for this module**: a fourth `ApprovalStageGroupMode`/`ApprovalModes`
+value, `FirstDecisionWins` (`SolutionOne_Core/ApprovalModels/ApprovalWorkflow.cs`). At the config
+level it puts Reporting Manager (if resolvable) and the whole configured approver pool together in
+ONE stage (`StageOrder 0`); at the step-evaluation level, `ApprovalStepEvaluator.IsStageApproved`
+treats it like `AnyOne` (any single Approved closes it), but `IsStageRejected` treats it like
+`Unanimous` (any single Rejected closes it too) - the "first decision, either way, wins" property
+neither existing mode has alone. Doesn't touch the other 3 modes' behavior or any of the 6
+already-migrated flows.
+
+- [x] `Migration_AttendanceAdjustmentApprovalFormDoc_20260929.sql` - seeds the FormDocMaster row (`ModuleKey='AttendanceAdjustment'`) **and** extends `HR_ApprovalStep`'s `CK_HR_ApprovalStep_GroupMode` CHECK constraint to allow `'FirstDecisionWins'` (this table is this backend's own, not legacy-shared, so extending its constraint is safe per [[schema_shared_legacy_tables]]). **Not yet run against the dev DB.**
+- [x] `HR_AttendenceAdjustment` confirmed legacy-shared (deployment script, pre-existing seeded data) - untouched, no schema change.
+- [x] `ApprovalRepository.GetReportingManagerIdAsync` fixed to `NULLIF(ReportingPersonID, 0)` - `ReportingPersonID` is `NOT NULL` and `0` is this codebase's own established "no reporting person set" convention (per `AttendanceAdjustmentRepository`'s own comment); without this fix, an employee with no manager would have resolved to a bogus `ApproverEmployeeId` of `0` instead of "no Reporting Manager step". Applies to every mode that calls this helper, not just the new one, though Attendance Adjustment is the first module to actually exercise a `0` in practice (every other module either doesn't hit it or guards it away upstream, e.g. Comp-Off's `InsertApplication`).
+- [x] `AttendanceAdjustmentService.Insert`: `CreateInstance` after `_repository.Insert(...)`, non-fatal, called regardless of whether the employee has a reporting person - the new mode's builder falls back to the configured HR/Admin pool alone when there's no RM to include, matching the legacy "only HR can approve it" message.
+- [x] `AttendanceAdjustmentService.Decide`: batch gate (like Comp-Off), looped over the resolved target id set **before** `_repository.ApplyDecision`'s own single bulk `UPDATE` (which opens no transaction at all, confirmed by reading the repository - no nesting hazard). `EmployeeId` passed to `Action` depends on which side is deciding: **`actAsManager`** (including an HR/Admin override acting "as manager") always uses **that row's own `ReportingPersonID`** from the already-loaded queue, matching Comp-Off's precedent, since Admin override doesn't change who the authoritative RM identity is; **`actAsHr`** uses **the actor's own resolved employeeId** instead, since the HR/Admin pool is a fixed configured list with no "this row's own" identity to fall back to. Either side falls through unguarded (engine gate skipped, legacy check remains sole authorization) when the needed identity can't be resolved (no reporting person on the row, or an HR/Admin login with no employee record) - same fallback as every prior module.
+- [x] **Real bug caught while wiring this, not shipped**: `_repository.ApplyDecision`'s own contract treats an *empty* id list as "no id filter = every pending, in-scope row" (its "Approve All" convention). Naively passing the engine-filtered subset straight through would have meant "the engine refused every row" silently turned into "decide every row" whenever that subset was empty. Fixed by short-circuiting to `changed = 0` before calling `ApplyDecision` when the filtered set is empty, rather than relying on/colliding with that method's own empty-list semantics.
+- [x] Full build + full test suite (398/398) passing
+
+**Config-mode note**: `first_decision_wins`, `IsReportingMgrRequired=true` - maps directly onto Attendance Adjustment's own existing rule, with the actual HR/Admin employee(s) who should be able to act as HR configured explicitly as `HR_ApprovalConfigApprover` rows (`IsHr()` is a blanket role/Admin check today, not an org-chart resolution, same reasoning as every prior module's config-mode note).
+
+**Follow-up bug found and fixed (2026-09-30), while writing the frontend spec for this mode**: the engine itself was ready for `first_decision_wins` from day one, but the existing admin config screen (`TravelConfigController`/`TravelConfigService`/`TravelConfigRepository` - same endpoints that configure every module's `HR_ApprovalConfig` row, see the API contract doc §7) had two independent, hand-maintained copies of the valid-`ApprovalMode` whitelist, neither of which the engine's own canonical `ApprovalModes.Normalize()` feeds into:
+- `TravelConfigService.ValidateTravelConfigPayload` hard-rejected any `ApprovalMode` other than the original 3 with `"Invalid approval mode."` - a `first_decision_wins` config could never be saved at all.
+- `TravelConfigRepository.SyncTravelConfigApproversAsync` only persisted `HR_ApprovalConfigApprover` rows for `any_one`/`selected_employee_override` - even past the first bug, the approver pool this mode needs would have been silently dropped on save.
+
+Fixed both (added the mode to each whitelist, plus the same "at least one of {RM, pool}" validation `any_one` already gets). **This means Attendance Adjustment's approval mode was effectively unconfigurable through the existing admin screen from when it shipped (2026-09-29) until this fix** - worth knowing if anyone tried to set it up in that window and got a confusing "Invalid approval mode" error. No dedicated "list valid approval modes" endpoint exists anywhere for the frontend to discover these strings dynamically - they're plain hardcoded strings on both ends, hence three independent copies of the same whitelist instead of one.
+
+## Phase 11 - Broader module rollout, module 6: Leave Approval (2026-09-29)
+
+**Leave Approval** - done, but deliberately **not** wired the way every other module is.
+
+Per the deferred scoping above, this module keeps `HR_LeaveAppAuthLeavel` as the real
+workflow/authorization engine and only dual-writes `HR_ApprovalInstance`/`HR_ApprovalStep` as a
+**non-authoritative mirror**, for cross-module visibility (`GetPending`/`GetTeamRequests`/timeline)
+- it never blocks a leave decision. This is the one module in the whole rollout where the engine is
+not the enforcement boundary. Reasons, unchanged from the original scoping:
+
+- `HR_LeaveAppAuthLeavel` supports arbitrary-length org-chain escalation (via the legacy
+  `csp_Payroll_InsertLeaveApprovalLevels` proc), which the engine's `default_chain` cannot express
+  (fixed RM/HR/Finance stages, not an arbitrary walk). Currently dormant in practice - every
+  employee's `LeaveApproverUserMasterID` is NULL today, so it always falls back to a single Level-1
+  approver = the applicant's `ReportingPersonID`, which the engine's `default_chain`
+  (`IsReportingMgrRequired=true` only) matches exactly.
+- The signed `ReportingPersonId` convention (positive = `EmployeeMasterID`, negative =
+  `-UserMasterID` for an HR-Admin approver with no employee record) has no schema equivalent in
+  `HR_ApprovalStep.ApproverEmployeeId` (a bare, FK-constrained `bigint`). Unreachable today for the
+  same all-NULL reason above.
+- `LeaveApprovalRepository.ApplyDecisions` is a **batch across potentially several different leave
+  applications, inside one shared EF transaction**, with each iteration's escalate-vs-settle branch
+  decided by DB state re-read inside that same transaction - a loop-shaped hazard with no clean
+  before/after seam to insert a gating `Action()` call into, unlike Comp-Off/Attendance Adjustment's
+  batches (both turned out to open no transaction of their own at all).
+
+**Submission side** (`LeaveApplicationService.InsertApplication`): `CreateInstance` after
+`_repository.InsertApplication(...)` returns (that call's own EF transaction has already committed -
+same "fully separate, sequential step" discipline as every prior module, no nesting hazard). Config:
+`default_chain`, `IsReportingMgrRequired=true` only.
+
+**Decision side** (`LeaveApprovalService.ApplyDecisions`): the real decision-making is completely
+untouched - `_repository.ApplyDecisions` runs exactly as it always has, and its result is what the
+caller sees. *After* that call returns (transaction already committed), a new
+`MirrorDecisionsToApprovalEngineAsync` helper runs:
+- Resolves the **distinct `LeaveApplicationId`s** touched by this batch from the already-loaded
+  `queue` (which maps `LeaveAppAuthId -> LeaveApplicationId`).
+- Re-reads each one's **current** `Status`/`ReportingPersonId` via a new
+  `ILeaveApprovalRepository.GetOutcomesAsync` method (a fresh, lightweight query - not derived from
+  `ApplyDecisions`' own aggregate `Approved`/`Rejected`/`Finalised`/`Escalated` counts, which don't
+  say *which* application landed where). This is the only reliable way to tell "genuinely decided" 
+  apart from "escalated to a further level" (unreachable today, but if it ever happens the engine's
+  single-step mirror would just diverge safely, staying Pending) or "skipped inside the transaction
+  as stale".
+- For each application whose status is now `Approved`/`Rejected`, calls `Action()` using **that
+  application's own `ReportingPersonId`** (frozen at submission time on `HR_LeaveApplication`, the
+  same column/moment the engine's own Reporting-Manager step was created from) - not the acting
+  session's identity, same reasoning as Comp-Off/Attendance-Adjustment-manager-side: an HR-Admin
+  override shouldn't change who the engine thinks the authoritative approver is.
+- **Every failure here is logged and swallowed, never surfaced or blocking** - `ApplyDecisions`'
+  own `ResponseModel`/`LeaveApprovalResultModel` is unaffected either way. This is the load-bearing
+  difference from every other module's gate.
+
+- [x] `Migration_LeaveApprovalFormDoc_20260929.sql` - seed row, `ModuleKey='Leave'`. **Not yet run against the dev DB.**
+- [x] `HR_LeaveApplication` confirmed legacy-shared (deployment script, pre-existing seeded data via `HR_Authorize`) - untouched. `HR_LeaveAppAuthLeavel` is this backend's own table (migration 008) but also untouched - it keeps doing exactly what it already does.
+- [x] New `ILeaveApprovalRepository.GetOutcomesAsync(leaveApplicationIds, companyMasterId)` - the only new repository surface this module needed.
+- [x] `SolutionOne_Core/ApprovalModels/ApprovalWorkflow.cs`: `ApprovalModuleKeys.Leave`, `LeaveFormDocNames.Approval` (doc comment flags the non-authoritative design so nobody mistakes this for a normal gate later).
+- [x] Full build + full test suite (398/398) passing
+
+**Config-mode note**: `default_chain`, `IsReportingMgrRequired=true` only - matches today's real, single-level behaviour exactly. If `LeaveApproverUserMasterID` is ever populated (enabling the legacy multi-level/signed-approver paths), the mirror will start silently under-representing reality (its single step closes after one decision even if the legacy chain escalates further) - flagged here for whoever eventually does that, not solved now since it's unreachable with current data.
+
+## Phase 11 - Broader module rollout, module 7: FNF (2026-09-30)
+
+**FNF (Full & Final Settlement) Approval** - done. Scoped via a dedicated research pass first (per
+the user's own explicit request to understand the problems before implementing), which corrected
+the original "separate, later conversation" framing in both directions:
+
+- **Overcautious on transaction risk**: `FnfSettlementRepository` shares the exact same scoped
+  `IDapperContext` as `ApprovalRepository`, but every one of its methods opens and commits its OWN
+  independent transaction - there is no single transaction wrapping Approve's cascading side
+  effects (push to payroll, settle loan schedule). This is actually the simplest transaction shape
+  of the whole rollout - placing the engine gate as its own step before `ApproveCaseHeaderAsync`
+  is safe, same discipline as every prior module.
+- **Undercounted on authorization**: there was no "no approver-config concept", there was **no
+  decision-level authorization at all** - `FnfCaseService.ApproveAsync`/`RejectAsync` checked only
+  `WorkflowStatus`/checklist completeness, nothing case-specific, not even a blanket `IsAdmin()`
+  check like Loan/Assets/Comp-Off had before their own migrations. This migration is genuinely
+  adding real enforcement where none existed, not translating an existing rule.
+- **Side effects entangle two other modules, neither in conflict**: Approve pushes into
+  `HR_EmployeeWiseSalaryHead`/`HR_SalaryAdditionalHead` (plain payroll config tables, never
+  approval-gated) and marks `HR_LoanEMISchedule.IsPaid` (an accounting/schedule table, distinct
+  from `HR_LoanRequests`/`HR_LoanApproval` which Loan Request Approval already gates) - no
+  interaction with any already-migrated gate.
+- Single case, single decision, no batching - simplest shape of the whole rollout.
+
+**A real, FNF-specific design problem found while wiring this, not present in any prior module**:
+`RejectAsync` returns a rejected case to Draft for the SAME `caseId`, and the preparer is expected to
+edit and resubmit it - a normal, common, expected part of this workflow (unlike every other
+module's reject-is-terminal shape). Since `HR_ApprovalInstance` is uniquely keyed on
+`(FormDocId, TransactionRecordId)` with no "reopen" concept (same gap already accepted for
+Recruitment's Reopen transitions), a resubmission's `CreateInstance` call always fails on the
+duplicate key (caught, logged, non-fatal) - and a subsequent decision would then resolve to the
+STALE, already-closed instance from the first cycle. Handled by having the gate treat "instance
+already closed" (HTTP 409, from `InstanceAlreadyClosedException`) as "fall through to the legacy
+`WorkflowStatus` check" rather than a hard refusal, while still hard-blocking on "not authorized"
+(HTTP 403) - the legacy `WorkflowStatus` check plus `ApproveCaseHeaderAsync`/`RejectCaseAsync`'s own
+`rows == 0` optimistic-concurrency guard already catch a genuine double-decision race on the same
+live pending case, so this doesn't reopen a real hole. **Known, disclosed limitation**: a case that
+gets rejected even once permanently loses the new engine-level enforcement on all its future
+decisions (every resubmission collides with the same stale instance) - strictly better than the
+pre-migration baseline (zero enforcement for every case) but not as strong as first-time-clean
+cases get. A real "reopen" capability in the engine would close this gap; not built now, same
+"flagged, not solved" precedent as every other cross-cutting engine gap found this rollout.
+
+- [x] `Migration_FnfApprovalFormDoc_20260930.sql` - seed row, `ModuleKey='FNF'`. **Not yet run against the dev DB.**
+- [x] `HR_FNFSettlement`/`HR_FNFCheck`/`HR_FNFRecovery` cross-referenced against `hr_payroll` migrations 110/111/113/114 per this repo's own comments (likely legacy-shared) - **not confirmed against a live schema**, flagged for an `sp_help` check before anyone assumes these are safe to `ALTER` later. No schema change needed for this migration regardless.
+- [x] `FnfCaseService.SubmitAsync`: `CreateInstance` after `_repository.SubmitCaseAsync(...)` succeeds, non-fatal, using the exiting employee (`existing.EmployeeMasterId`) as requestor.
+- [x] `FnfCaseService.ApproveAsync`/`RejectAsync`: shared `ApplyApprovalEngineGateAsync` helper, called before `ApproveCaseHeaderAsync`/`RejectCaseAsync` respectively, using `_requestMetadata.EmployeeMasterId` directly (this module already funnels identity through `IRequestMetadata`, same as Income Tax, so no null-check/skip needed).
+- [x] Full build + full test suite (402/402) passing
+
+**Config-mode note**: no existing rule to preserve, since none existed - a genuine policy decision, not something inferable from legacy code. `HR_FNFSettlement` already carries per-case `HrExecutiveUserMasterId`/`PayrollExecutiveUserMasterId`/`FinanceExecutiveUserMasterId`/`ApproverUserMasterId` planning fields, but they're **UserMasterIds, not EmployeeMasterIds**, and are purely informational today (read/written by `SaveAsync`, never checked anywhere) - wiring them into the engine would need a UserMasterId→EmployeeMasterId resolution this migration doesn't add. Recommend either `any_one` with the actual Finance/HR/Payroll employee(s) who sign off F&F cases configured explicitly, or `default_chain` (`IsReportingMgrRequired=true`) if the intended policy is "the exiting employee's manager approves it" (`HR_FNFSettlement.ReportingPersonId` is available for this) - which one matches actual company policy is for the user/admin to decide.
+
+This closes out the modules named in the original rollout ask.
+
+## Phase 12 - Cross-cutting bug: `HR_ApprovalConfigApprover.TravelConfigId` was never renamed (2026-10-05)
+
+**Found while debugging why Income Tax Proof Approval never created an instance**, after the
+config row's company/branch mismatch had already been ruled out: the engine's own
+`ApprovalRepository.GetConfigApproversAsync` - the approver-pool resolution used by **every**
+module on `any_one`/`selected_employee_override`/`first_decision_wins` mode, not just Income Tax -
+queries `WHERE ApprovalConfigId = @approvalConfigId` against `HR_ApprovalConfigApprover`. That
+column has never existed. `Migration_ApprovalEngine_20260928.sql` (Phase 2) renamed the *table*
+(`sp_rename 'dbo.HR_TM_TravelConfigApprovers', 'HR_ApprovalConfigApprover'`) but never renamed the
+*column* inside it - confirmed still `TravelConfigId` via the live-DB-scaffolded entity
+(`HrApprovalConfigApprover.cs`). This has been throwing "Invalid column name 'ApprovalConfigId'"
+since the query was first written - caught by `CreateInstance`'s generic catch-all and logged as a
+non-fatal warning, which is exactly why no instance was ever created for any module on one of those
+3 modes. `default_chain`-only modules (Comp-Off, most of Loan/Assets/FNF's recommended config)
+never hit this, since they resolve RM/HR/Finance a different way and never call this method - that's
+why this went unnoticed through 7 modules' worth of migration work.
+
+**Fixed properly, not patched**: per the user's explicit request to complete the Phase 1 cross-module
+rename rather than special-case the one broken query, renamed the column itself
+(`Migration_RenameApprovalConfigApproverColumn_20261005.sql`) and updated every one of the 9 files
+that referenced it under the old name to keep working - all 9 were using the correct, real column
+name (`TravelConfigId`) and would have broken had only the migration run without the matching code
+change:
+- `TravelConfigRepository.cs` (the admin config screen itself - `GetAllTravelConfigurations`,
+  `GetTravelConfigurationById`, `SyncTravelConfigApproversAsync`, plus the private
+  `TravelConfigApproverRow` row type)
+- `TravelSettlementRepository.cs`, `TravelPaymentRepository.cs` (both: a `tc_inner.Id AS
+  TravelConfigId` alias + a real-column reference, both renamed together)
+- `AdvancePaymentApprovalRepository.cs`, `TravelSetupRepository.cs` (one real-column reference each)
+- `TripApprovalRepository.cs` - **the already-shipped Phase 8 Trip Approval flow** - a shared SQL
+  fragment alias (`BranchScopedTravelConfigApply`, reused at 2 call sites) plus 2 real-column
+  references
+- `ApproveTravelExpenseRepository.cs` - the trickiest one: `cfg.TravelConfigId` is read off a
+  **dynamic** Dapper row (`QueryFirstOrDefaultAsync<dynamic>`), so the C# property access and the
+  SQL alias it binds to both had to be renamed together or it throws a `RuntimeBinderException`
+  instead of a SQL error - same bug shape, different failure mode
+
+**Deliberately left alone**: `HrTmTravelConfigApprover.cs` (the orphaned, pre-rename scaffolded
+entity) and `HrmsystemContext.cs`'s Fluent config for it - confirmed dead code, no `DbSet`, nothing
+queries it (same "known tradeoff, left as-is" call already made for the sibling table renames in
+Phase 2). `HrApprovalConfigApprover.cs`'s own `TravelConfigId` property was also left as-is - also
+confirmed to have zero live EF wiring (no `DbSet<HrApprovalConfigApprover>` exists at all; this
+table is Dapper-only everywhere). Renaming either risks the exact "DbContext rescaffold disaster"
+this project already got burned by once, for zero functional benefit since nothing reads them.
+
+- [x] `Migration_RenameApprovalConfigApproverColumn_20261005.sql` - idempotent `sp_rename`. **Not yet run against the dev DB. Must run before/with this code change - the code now expects `ApprovalConfigId` everywhere, and will break the 9 already-working files above until the column is actually renamed.**
+- [x] Full build + full test suite (402/402) passing
+
+## Phase 13 - Trip Request/Approval consolidated onto `IRequestMetadata`; "Travel Config" messaging corrected (2026-10-06)
+
+**Part 1 - duplicate claims-reading eliminated.** Found while auditing the Trip Request create flow
+at the user's request: `TravelUserContext.FromHttpContext` (`TripRequestService`, `TripApprovalService`,
+`AdvancePaymentApprovalService` each had their own copy of this call) re-read JWT claims directly off
+`IHttpContextAccessor` - a second, parallel implementation of exactly what `IRequestMetadata` already
+centralizes for every other service in this codebase. The only real reason it existed separately:
+`IRequestMetadata`'s existing properties (`CompanyId`/`BranchId`/`UserId`/`EmployeeMasterId`) all
+**throw** `MissingClaimException` when a claim is absent, and Travel Management's whole pattern is
+built around "the claim might legitimately be absent" being a normal branch to check
+(`viewer.EmployeeMasterId <= 0` for an Admin login with no employee record), not an error worth
+throwing for.
+
+**Fix, not a workaround**: extended `IRequestMetadata` itself (user's explicit go-ahead: "if you want
+to implement more things in the requestMeta please feel free") rather than inventing a second
+mechanism to route around the throwing one:
+- `TryGetCompanyId`/`TryGetBranchId`/`TryGetUserId`/`TryGetEmployeeMasterId(out long value)` - tolerant
+  companions to the existing throwing properties, same claim names, returning `false`/`0` instead of
+  throwing.
+- `RoleId` (tolerant, defaults to `0` - same "not wired up yet" caveat `TravelUserContext`'s own doc
+  comment already carried) and `RoleNames` (every `ClaimTypes.Role` claim, `UserRole` folded in at the
+  front if not already present - multi-role support `UserRole` alone never gave).
+- `RequestMetadata.cs` internally refactored onto two shared private helpers
+  (`GetRequiredLongClaim`/`TryGetLongClaim`) so the throwing and tolerant paths share one piece of
+  claim-reading logic instead of two near-duplicates within the same file.
+
+`TravelUserContext` itself is kept (its shape is depended on by `TripRequestScopeResolver`/
+`TripApprovalScopeResolver`/`TravelApprovalAccessResolver`/`TravelRoleScopePolicy` - not worth a
+wider signature rewrite across all of those for this) but its `FromHttpContext` factory is replaced
+with `FromRequestMetadata(IRequestMetadata meta)`, built entirely from the new tolerant members - the
+class no longer touches `IHttpContextAccessor`/`ClaimTypes` at all.
+
+- [x] `TripRequestService`, `TripApprovalService`, `AdvancePaymentApprovalService`: `IHttpContextAccessor`
+  dropped from the constructor entirely, replaced with `IRequestMetadata`; every ad-hoc inline
+  `_httpContextAccessor.HttpContext?.User.Claims.FirstOrDefault(c => c.Type == "UserId")` block
+  (there were 6 of these across the 3 files, each a near-identical copy) replaced with
+  `_requestMetadata.TryGetUserId(out var uid)`.
+- [x] **Drive-by correctness fix** in `AdvancePaymentApprovalService.ResolveTravelUserContextAsync`'s
+  branch-fallback path: it rebuilt a new `TravelUserContext` when filling in a missing branch, but the
+  object initializer never copied `RoleNames` across (silently reset to empty) - fixed while already
+  touching this exact method; not something this pass went looking for.
+- [x] Full build + full test suite (402/402) passing
+
+**Explicitly not done, flagged as a separate, larger cleanup**: several other Travel Management
+services (`TripExpenseSubmitService`, `TravelPolicyService`, `TravelPaymentService`,
+`TravelConfigService`, `TravelSettlementService`) still read `IHttpContextAccessor` claims directly
+with their own inline patterns, same root shape as what was just fixed here. Out of scope for this
+pass (it was focused on the Trip Request/Approval chain specifically); worth revisiting as its own
+pass if the same "why is there a separate implementation" question comes up for those screens too.
+
+**Part 2 - "Travel Config" error-message text corrected to the real screen.** The actual admin screen
+is the generic HR Config screen (`admin/hr-config/form`, backed by `/api/TravelConfig/*` - same
+`HR_ApprovalConfig`/`HR_ApprovalConfigApprover` tables every other module uses, confirmed in the
+2026-10-05 conversation). `TravelSetupRepository.cs`'s own preflight-check error strings (`"Add it
+under Travel Config"`, `"Travel Config is missing for '...'"`, `"...not set in Travel Config"` - 8
+occurrences total, every actionable "go fix this" message the create-form-context preflight can
+produce) all said "Travel Config" verbatim, which doesn't exist as a screen name a user could
+actually find. Reworded all 8 to name the real screen and its route explicitly
+(`"...in HR Config (admin/hr-config/form)."`), so a blocked user gets an instruction that actually
+points somewhere real.
+
+**Deliberately NOT renamed**: the `TravelConfigController`/`TravelConfigService`/
+`TravelConfigRepository` **class names and API routes** (`/api/TravelConfig/*`) themselves - doing
+that would change the actual endpoint URLs the frontend already calls, which needs a coordinated
+frontend change, not a silent backend rename. This pass only corrected the *text shown to a user*,
+not the wire contract. A few more "Travel Config" mentions remain as code comments or as a UI label
+specific to the **not-yet-migrated** Travel Expense approval screen
+(`ApproveTravelExpenseRepository.cs`'s `"Not assigned (Travel Config)"`) - left alone, out of scope
+for the same reason Travel Expense itself is (Phase 8's own explicit carve-out).
+
+## Phase 14 - Trip Approval `Approve` endpoint: UserMasterId/EmployeeMasterId conflated, and a
+## generic-approver column-resolution gap (2026-10-07)
+
+**Bug report**: `POST /api/TripApproval/Approve` with `{"approvalType":"approver", ...}` threw
+`System.ArgumentException: Invalid approval type` from
+`TripApprovalRepository.ResolveApprovalColumn`, 500ing the whole request.
+
+**Root cause, two separate things found together while auditing `TripApprovalController.cs` +
+`ApprovalRepository.cs` per the user's explicit "we store EmployeeMasterID, let's not confuse
+ourselves with UserMasterId" instruction:**
+
+1. **Identity conflation.** `TripApprovalService.ApproveTrip` resolved both `callerUserId`
+   (`TryGetUserId`) and `empId` (`TryGetEmployeeMasterId`), but only ever passed a single `uid` int
+   into `ITripApprovalRepository.ApproveTrip(..., int uid, ...)` - at one point `callerUserId`, after a
+   prior edit `empId`. That one parameter was overloaded for two different, incompatible meanings
+   inside the repository: `ActionAsync`'s `EmployeeId` (must be EmployeeMasterID - the engine's
+   `HR_ApprovalStep.ApproverEmployeeId` is always an EmployeeMasterID) and `LastModifiedBy` (an audit
+   column that, by this table's own `CreatedBy = entity.EntryUserMasterId` convention set at insert
+   time in `TripRequestRepository.InsertTripApprovalRowAsync`, is a UserMasterID). Whichever one was
+   wired up, the other was silently wrong. The same conflation existed on the Advance Payment path:
+   `AdvancePaymentApprovalService.ApproveAsync` passed `(int)callerUserId` (UserMasterID) straight
+   through to the same repository method's `ActionAsync` call - meaning advance payment approvals
+   routed through the Approval Engine were authorizing against the wrong id the whole time this was
+   wired up, and would 403 (`NotAuthorizedApproverException`) for any user whose UserMasterID doesn't
+   numerically equal their EmployeeMasterID.
+
+   **Fix**: `ITripApprovalRepository.ApproveTrip` and `IAdvancePaymentApprovalRepository.ApproveAsync`
+   now take both explicitly - `long employeeId` (engine gate + legacy-column resolution) and `int uid`
+   (LastModifiedBy audit value only, unchanged meaning). Both service callers now resolve and pass
+   both ids by name instead of coercing one into the other's slot.
+
+2. **Generic-pool approval type.** `ResolveApprovalColumn(type, state)` only understood the three
+   `default_chain` keywords (`"hr"`/`"fin"`/`"report"|"manager"|"rpt"`) baked in at the fixed-role era.
+   `any_one`/`selected_employee_override` configs can have config-approver rows with no such role at
+   all (`TravelSetupRepository.AssignUnmappedSelectedApprovers` slots them into
+   Reporting/Finance/HrManagerEmpId purely positionally) - the FE has no meaningful keyword to send for
+   those, hence `"approver"`, which matched nothing and threw.
+
+   **Fix**: `ResolveApprovalColumn` now takes the acting `employeeId` too, and after the keyword checks
+   miss, falls back to matching `employeeId` against `state.HrManagerEmpId` /
+   `state.FinanceApproverEmpId` / `state.ReportingManagerEmpId` to find which legacy column this
+   approver actually occupies - using the same EmployeeMasterID identity the engine itself already
+   authorized against, not a client-supplied string.
+
+Verified: full build (0 errors) + full test suite (402/402) after.
+
+**Follow-up same day**: live testing against a 5-approver `selected_employee_override` config
+(`1, 2, 7, 8, 9`, all `StageGroupMode = Unanimous`) surfaced the next layer of the same structural
+gap - the legacy mirror table only has 3 approver slots at all
+(`ReportingManagerEmpId`/`FinanceApproverEmpId`/`HrManagerEmpId`); `AssignUnmappedSelectedApprovers`
+silently maps only the first 3 generic approvers and drops the rest. So even with the FK-fallback
+above, a 4th/5th approver (here, employees `8` and `9`) matches no column at all.
+
+Also caught in the same investigation: because `ActionAsync` commits in its own transaction *before*
+`ApproveTrip` opens the transaction that writes the legacy mirror, a failure in the legacy-write half
+(exactly what the original "Invalid approval type" bug caused) left the engine's decision committed
+while the HTTP response reported a 500 - misleading a retry into a (correct, but confusing) 403
+`NotAuthorizedApproverException`, since that approver's step was no longer pending. Not a bug in
+itself (the two transactions are deliberately separate - see the method's existing comment on why),
+but worth knowing: a failed `/Approve` response doesn't always mean nothing happened.
+
+**Decision (user, 2026-10-07)**: when no legacy column matches, skip the legacy mirror write for that
+approver entirely rather than throwing - `ActionAsync` already recorded their decision on the
+authoritative engine instance/step; the legacy columns remain a best-effort mirror for the first 3
+approvers only. `ResolveApprovalColumn` now returns `string?` (`null` = nothing to mirror) instead of
+throwing `ArgumentException`, and `ApproveTrip` skips both the column-update and the
+`TravelApprovalWorkflow.ResolveOverallStatusId` recompute when it gets `null`. Build (0 errors) + full
+test suite (402/402) verified again after.
+
+## Phase 15 - Empty Trip Approval list + per-approver status stuck on "Pending" (2026-10-07)
+
+Two more bugs found continuing the same live test (5-approver `selected_employee_override` config):
+
+**15a. `GetAllTripApprovalRequests` returned an empty list for every user, unconditionally.**
+Root cause: `TravelSetupRepository.EnsureFormDocAsync` (the method that auto-creates the
+`HR_FormDocMaster` row for "Trip Request Approval"/"Advance Payment Approval" the first time Travel
+is used, unlike every other module - which seeds its row via a dedicated migration with `ModuleKey`
+set up front, e.g. `Migration_ApprovalEngine_20260928.sql`) never included `ModuleKey` in its INSERT.
+`TripApprovalService.ListAllTripApprovals`'s visibility filter resolves its FormDocId via
+`ApprovalRepository.ResolveFormDocIdAsync(ModuleKey, FormName)` - with `ModuleKey` null on the
+auto-created row, that lookup always returns `null`, so `pendingIds` is always empty and the list is
+empty for literally everyone, regardless of who's logged in or what's actually pending.
+
+Fix: `EnsureFormDocAsync`'s INSERT now sets `ModuleKey = ApprovalModuleKeys.TravelManagement`, matching
+every other module's convention. A row already auto-created with a NULL `ModuleKey` before this fix
+won't self-heal (`EnsureFormDocAsync` no-ops once the row exists) - added
+`Migration_BackfillTravelFormDocModuleKey_20261007.sql` to backfill any existing NULL `ModuleKey` row
+for these two FormNames. **This migration must be run before re-testing the list.**
+
+**15b. Per-approver status on the Trip Approval detail/edit screen stuck on "Pending" after
+approving.** `ListApproveByIdDto.BuildSelectedApproverSteps()` (the `selected_employee_override`
+branch of the `Approvals` computed property the FE's `approvalLists` comes from) sourced every
+approver's displayed status from the same 3 legacy booleans as the column-resolution bug above - so
+a 4th/5th approver's row could never show anything but "Pending" (no boolean represents them at all),
+and even a mapped approver's row only updates if the legacy write succeeded.
+
+Fix: `ListApproveByIdDto` gained an `EngineSteps` field
+(`List<ApprovalStepTimelineModel>?`), populated by a new `TripApprovalRepository.
+EnrichEngineStepsAsync` (resolves the instance via `GetInstanceIdAsync`, then reads
+`GetInstanceTimelineAsync`) called alongside the existing `EnrichApprovalConfigAsync` in
+`ListTripApprovalDetails`. `BuildSelectedApproverSteps` now reads status/name straight from
+`EngineSteps` (the authoritative `HR_ApprovalStep` rows) when present, falling back to the old
+3-boolean recompute only for pre-migration rows with no instance at all.
+
+Deliberately **not done in this pass**: the trip's own overall `Status`/`StatusName` (shown on the
+list screen, still computed by `TravelApprovalWorkflow.ResolveOverallStatusId` from the same 3
+booleans) was not switched to read off the engine's `OverallStatusId`/`ActionAsync` result - flagged
+as the next natural step in the "remove complexity" simplification discussed the same day, not done
+yet since 15a/15b were the concrete blockers reported.
+
+Verified: full build (0 errors) + full test suite (402/402) after.
+
+## Phase 16 - Overall trip Status prematurely flipped to "Approved" (2026-10-07)
+
+Continuing the same live test: once 3 of 5 `selected_employee_override` approvers decided, the trip's
+overall `HR_TM_TripRequestApproval.Status` flipped to "Approved" and blocked every further action
+(`TripApprovalService.ApproveTrip`'s own pre-check reads that same column and returns "already
+completed" for anyone else trying to act) - even though the true engine instance (Unanimous, 5
+required approvers) was still genuinely 2 decisions short.
+
+Root cause: exactly the gap flagged (not yet fixed) at the end of Phase 15 -
+`TravelApprovalWorkflow.ResolveOverallStatusId` only ever looks at the 3 legacy boolean columns, so it
+can only ever see the first 3 slotted approvers, never a 4th/5th.
+
+Fix: `TripApprovalRepository.ApproveTrip` now sets the legacy `Status` column directly from
+`ActionAsync`'s own `ApprovalActionResultModel.OverallStatus` whenever an engine instance exists,
+instead of recomputing it from the 3 booleans. The boolean-based recompute is now reached only as a
+fallback for rows with no instance at all (pre-migration). This also decouples the status update from
+`columnToUpdate` being non-null - a 4th/5th approver's decision (no legacy column to flip) can still
+correctly move the overall status forward, which the old code structurally could not do (the whole
+status-recompute block was nested inside the `columnToUpdate != null` branch).
+
+Verified: full build (0 errors) + full test suite (402/402) after. Any trip whose `Status` was already
+corrupted to "Approved" by the old bug before this fix needs a one-off manual `UPDATE` back to Pending
+to unstick it - this fix only prevents it going forward, it doesn't retroactively repair stale rows.
+
+## Phase 17 - Generalized the Approval Engine: any mode can have N dynamically-typed approvers, not
+## just `selected_employee_override` (2026-10-07)
+
+User-driven architectural change, explicitly requested to "skip any and all legacy code": the engine
+had two hardcoded approver "types" baked into `HR_ApprovalConfig` itself -
+`isFinanceApproverRequired`/`financeApproverId` and `isHrRequired`/`hrApproverId`, each a single fixed
+employee, used only by `default_chain` mode. Every other mode already drew its approver pool from the
+generic `HR_ApprovalConfigApprover` table (arbitrary count, free-text `ApprovalType`/`Designation`) -
+this phase extends that same mechanism to `default_chain`, so **every** mode now supports an arbitrary
+number of approvers, each with any free-text type ("Logistics Approver", "Legal Approver", not limited
+to "HR"/"Finance").
+
+**Reporting Manager stays untouched and special-cased** (`HR_ApprovalConfig.IsReportingMgrRequired`) -
+by design, it is always resolved dynamically from the requester's own `ReportingPersonID`, never a
+manually picked employee, so it was never a candidate for this generalization.
+
+**Schema**: `Migration_AddApprovalConfigApproverStageOrder_20261007.sql` adds
+`HR_ApprovalConfigApprover.StageOrder` (`INT NOT NULL DEFAULT 0`). Only meaningful for
+`default_chain`: rows sharing a `StageOrder` run together as one Unanimous stage; stages advance in
+ascending `StageOrder` order, after the Reporting Manager stage (if any). Every other mode ignores it
+(always single-stage) - decided via `AskUserQuestion` (explicit order field, not insertion order, so
+an admin can reorder without re-adding rows).
+
+**Engine (`ApprovalRepository.BuildStepsAsync`)**: the `default_chain` branch no longer reads
+`config.IsHrRequired`/`HrApproverId`/`IsFinanceApproverRequired`/`FinanceApproverId` at all - it now
+calls the same `GetConfigApproversAsync` every other mode uses, groups the result by `StageOrder`
+(`GroupBy(a => a.StageOrder).OrderBy(g => g.Key)`), and emits one `Unanimous` stage per group, stacked
+after the optional RM stage. `ApprovalConfigRow`/`ResolveConfigSql` had the now-unused
+Finance/HR columns removed entirely (clean cut at the engine's only read site).
+
+**Decision on the old `HR_ApprovalConfig` columns** (`AskUserQuestion`, user chose "stop using them in
+code, leave columns in DB for now"): the physical columns are untouched - they're still read directly
+by Travel Management's own **not-yet-engine-migrated** legacy screens
+(`ApproveTravelExpenseRepository`, `TravelPaymentRepository`, `TravelSettlementRepository`,
+`TravelSetupRepository.BuildApprovalSeedAsync`'s legacy-mirror seeding), which key off their *own*,
+separate `HR_ApprovalConfig` rows (different `FormDocNo` than "Trip Request Approval"/"Advance Payment
+Approval") and are entirely unaffected by this change - confirmed by checking that
+`TravelConfigRepository` is the only place in the codebase that ever writes `HR_ApprovalConfig`, i.e.
+the single shared admin config surface for every module.
+
+**Admin config write path (`TravelConfigRepository.SyncTravelConfigApproversAsync`)**: removed the
+mode-gate that only ever persisted `HR_ApprovalConfigApprover` rows for
+`any_one`/`selected_employee_override`/`first_decision_wins` - `default_chain` now persists its list
+the same way. `StageOrder` flows through the INSERT. `TravelConfigService.ValidateTravelConfigPayload`
+extended to also employee-id-validate `default_chain`'s `selectedApprovers` (same check already applied
+to `any_one`/`first_decision_wins`). The old Finance/HR single-id validation block is left in place
+(harmless no-op once those flags are simply never set true by an updated frontend).
+
+**Display (`ListApproveByIdDto`)**: `_BuildApprovals()` now prefers `EngineSteps` (the authoritative
+`HR_ApprovalStep` data, added in Phase 15b) for **every** mode once an instance exists, not just
+`selected_employee_override` - `default_chain`'s old fixed "3 role" display (`BuildThreeRoleSteps`,
+reading `ReportingManagerEmpId`/`FinanceApproverEmpId`/`HrManagerEmpId`) would otherwise have shown
+nothing for a config's new dynamic (non-RM/HR/Finance-keyword) approvers, since Travel's legacy mirror
+only ever maps the first 3 generic approvers into those 3 columns (Phase 14's known gap). The
+old per-mode boolean-based builders remain only as the fallback for rows with no engine instance at
+all (pre-migration).
+
+**Explicitly out of scope this pass** (flagged, not done): the Angular `admin/hr-config/form` screen
+itself - this phase is backend-only; see the FE contract doc (`Approval-Engine-API-Contract.md` §7.2)
+for the exact `selectedApprovers`/`stageOrder` shape the frontend needs to build against, including
+retiring the dedicated Finance-approver/HR-approver pickers for `default_chain` in favor of a writable/
+freesolo approver-type input alongside the employee picker.
+
+Verified: full build (0 errors) + full test suite (402/402) after.
+
+## Phase 18 - Advance Payment Approval given the same GetPending-based authorization Trip Approval got (2026-10-07)
+
+Reported by the user after live-testing `AdvancePaymentApprovalController`: "it seems that everyone can
+view/approve things here." Root cause: the Phase 15/16 GetPending-based fix was applied to
+`TripApprovalService` only - `AdvancePaymentApprovalService` never got it, and structurally couldn't
+have (its constructor had no `IApprovalRepository` at all). It still used the pre-fix
+`TripApprovalScopeResolver` (list) and `TravelApprovalAccessResolver` (detail/action) checks, both of
+which ask "are you listed anywhere as RM/Finance/HR/config-approver for this row's static config,"
+never "is the engine's current stage actually waiting on you right now."
+
+**`ListAllAsync`**: rewritten to match `TripApprovalService.ListAllTripApprovals` exactly - resolves
+Advance Payment Approval's own `FormDocId` (`TravelFormNames.AdvancePaymentApproval`, not Trip
+Request's), calls `GetPendingAsync(formDocId, viewer.EmployeeMasterId)`, and filters the row set down to
+`TripRequestId`s with a live pending step for the caller. Incidentally also fixes a second bug: the old
+SQL had no `ta.Status` predicate at all, so an already-Approved/Rejected row never left anyone's list.
+
+**`GetByIdAsync`**: `CanProcessApproval` is now computed by a new `CanCurrentlyActAsync` helper - if an
+Approval Engine instance exists for this row's `(FormDocId, TripRequestId)`, it checks
+`GetPendingAsync` the same way the list does (true engine-stage gate); only pre-cutover rows with no
+instance at all fall back to the old static `CanProcessApprovalRow` check. `CanViewApprovalRow` (the
+coarser "are you assigned at all, for read access") is deliberately left alone - read access staying
+permissive to anyone ever assigned is fine, only the write/action gate needed to become stage-aware.
+
+**`ApproveAsync`**: added the two exception-to-status-code mappings `TripApprovalService.ApproveTrip`
+already had and this method was missing - `NotAuthorizedApproverException` -> 403,
+`InstanceAlreadyClosedException` -> 409. Without these, an out-of-turn approval correctly rejected by
+the engine's own `ActionAsync` (keyed on `EmployeeId` + `CurrentStageOrder`, exactly like
+`/api/Approval/Action`) surfaced as a generic 500 instead. `CanSubmitApprovalAction`'s pre-check was
+kept, not removed (unlike Trip Approval, which has none) - it's the only authorization check at all for
+rows with no engine instance yet (pre-cutover legacy data has no stage gate to fall back to), so
+removing it would leave that path with zero server-side checks.
+
+**Clarified for the frontend (not a code change)**: the engine's authorization boundary
+(`ApprovalRepository.ActionAsync`) has never keyed off the `approvalType` string - it matches purely on
+`ApproverEmployeeId` against the instance's current-stage pending step, identical in mechanism to
+`/api/Approval/Action`. `approvalType` is only ever used downstream of that gate, to resolve which
+legacy mirror column (`HrApproval`/`FinanceApproval`/`ClientApproval`) to write for display -
+non-authoritative. No `approvalStepId` is needed or read by any endpoint (`ApproveTripRequestDto` has no
+such field); `EmployeeId` + `CurrentStageOrder` already fully disambiguates. Also checked: no backend
+code path resolves a missing Reporting Manager to the requester's own id -
+`ApprovalRepository.BuildStepsAsync` throws `NoReportingManagerException` on a null RM for
+`default_chain`/`any_one`. The self-approval case observed in testing was a
+same-person-as-both-requester-and-configured-approver data/config overlap, not an RM fallback; whether
+to add a general self-approval guard (excluding the requester from their own approver pool, for every
+mode and every role, across all 9 migrated modules) is an open product question, not yet decided.
+
+Verified: full build (0 errors) + full test suite (402/402) after.
+
+## Phase 19 - Travel Expense Approval wired onto the Approval Engine / HR Config (2026-10-08,
+user-requested follow-up: "we need this in our global hr-config approvers")
+
+Scoped per the user's own finding while live-testing: `ApproveTravelExpenseRepository` had no config
+slot of its own at all - its `HR_ApprovalConfig` lookup (`ExpenseTravelConfigJoinSql`,
+`BuildApprovalStepsAsync`) was keyed off `a.FormDocId`, where `a` is the trip's own
+`HR_TM_TripRequestApproval` row, which is *always* the **Trip Request Approval** FormDoc (confirmed:
+no "Travel Expense Approval" FormDoc existed anywhere in the codebase). So this screen was silently
+reusing Trip Request Approval's config row - an admin configuring a dedicated expense-approval entry
+in HR Config would never have been read by this screen at all. This was Phase 8's own explicit
+carve-out ("Explicitly out of scope: Travel Expense approval... needs real design work, not a
+mechanical swap") finally being done.
+
+**Scope for this pass** (matching how Phase 8 itself was split - wiring now, visibility rewrite later):
+1. A dedicated FormDoc + engine wiring so the screen has its own HR Config slot and the engine becomes
+   the real authorization boundary for the Approve/Reject action.
+2. **Explicitly deferred, not done this pass**: rewriting `GetSubmittedEmployees`/
+   `GetSubmittedExpenseGrid` onto strict `GetPending`-based visibility (Phase 15/16/18's "single most
+   relearned lesson"). Today's `ApproverViewerWhereSql` (legacy trip-row columns + a hand-rolled
+   `HR_ApprovalConfigApprover` `EXISTS`) stays as the list filter for now - it's a *display* filter,
+   not an authorization boundary, and switching it to `GetPending` now would hide every currently
+   in-flight expense submission (none has an engine instance yet) until resubmitted. Flagged as the
+   natural next follow-up, not silently done - same reasoning Phase 8 used to defer it the first time.
+
+**New FormDoc**: `TravelFormNames.ExpenseApproval = "Travel Expense Approval"`
+(`SolutionOne_Core/TravelManagementModels/TravelSetup/TravelFormNames.cs`), self-seeded via
+`TravelSetupRepository.EnsureTravelFormDocsAsync` alongside the other two Travel FormDocs (Travel
+Management's own established runtime-seeding convention - no SQL migration file needed, unlike every
+other module's `Migration_*ApprovalFormDoc_*.sql`). Seeded on the next trip-create/validate call, so it
+exists in HR Config (`admin/hr-config/form`) well before any expense is ever submitted against it.
+
+**Submission side** (`TripExpenseSubmitRepository.FinalSubmitTripExpenseToAuthorityAsync`):
+`TransactionRecordId` is `TripExpenseSubmitId` - not `TripRequestApprovalId` and not `TripRequestId` -
+since this is its own independent approval track, finalized once per (TripRequestApprovalId,
+EmployeeId) submission, distinct from the Trip Request/Advance Payment instances already keyed off the
+trip itself. Captured via `OUTPUT INSERTED.TripExpenseSubmitId` on the existing `UPDATE ... SET
+IsSubmit = 1` statement (previously a plain `ExecuteAsync`). `CreateInstance` runs as its own, separate,
+already-completed step *after* this method's own commit (company/branch resolved via a small follow-up
+query joining `HR_TM_TripRequestApproval` -> `HR_TM_TripRequest`) - non-fatal, logged only, identical
+principle to `TripRequestRepository.TryCreateEngineInstanceAsync`.
+
+**Action side** (`ApproveTravelExpenseRepository.SaveExpenseApprovalAsync`): this method previously
+opened its own transaction (`_context.BeginTransactionAsync()`) as its *very first* line, before even
+loading `meta`/steps - had to be restructured so all of that resolution (plus the existing
+isAdmin/`step.ApproverEmployeeId` authorization check) now happens *before* the transaction opens, so
+the engine's `ActionAsync` call (which manages its own transaction on the same scoped `IDapperContext`)
+never nests inside it. `EmployeeId` passed to `ActionAsync` is `approverEmployeeIdForSave` (the step's
+own resolved approver), not the raw caller id - this is what already made the existing `isAdmin`
+override work for the legacy mirror write, and matches the engine's own documented convention (Comp-Off/
+Attendance Adjustment/FNF) for admin-override identity. `NotAuthorizedApproverException`/
+`InstanceAlreadyClosedException` are left to propagate uncaught out of the repository (nothing is
+written yet at that point, so there is nothing to roll back) and are now mapped in
+`ApproveTravelExpenseService.SaveExpenseApprovalAsync` to 403/409, matching every other migrated
+module's service-layer contract.
+
+**`HR_TM_TripExpenseSubmit.SubmitStatus` is now engine-driven once an instance exists**: previously only
+ever flipped to `approved`/`submitted` by re-running the bespoke `BuildApprovalStepsAsync` +
+`HR_TM_TripExpenseSubmitApprovalLine` computation after every save (and had no way to ever reach
+`rejected` at all, despite the `SubmitStatus` CHECK constraint allowing it). Now, when an engine instance
+exists, `engineResult.OverallStatus` (Approved/Rejected/Pending) is authoritative and drives
+`submitted`/`approved`/`rejected` directly; the legacy recomputation is kept only as the fallback for
+pre-migration submissions with no instance. `UpdateTripExpenseSubmitStatusAsync` signature changed from
+`bool allStepsApproved` to the resolved `string submitStatus` to carry the new `rejected` case.
+
+**Dual-write, not non-authoritative mirror** - same architecture as Phase 8's Trip Request/Advance
+Payment, not Leave's `HR_LeaveAppAuthLeavel` treatment: `HR_TM_TripExpenseSubmitApprovalLine` is not an
+independent, battle-tested workflow engine, it's a thin `MERGE`-upserted mirror over the *same*
+`HR_ApprovalConfig`/`HR_ApprovalConfigApprover` tables the generic engine itself reads - architecturally
+identical in kind to Trip/Advance Payment, so the engine becomes the real authorization boundary and the
+legacy table continues to be written purely for the existing display/detail screen.
+
+**Known, accepted limitation (not fixed this pass, matches Phase 17's own carve-out)**: the bespoke
+`BuildApprovalStepsAsync`'s `default_chain` branch still only builds 3 fixed named roles (Reporting
+Manager/Finance/HR, from `IsReportingMgrRequired`/`isFinanceApproverRequired`/`isHrRequired` + single
+`FinanceApproverId`/`HrApproverId` columns) and never calls `GetConfigApproversAsync` for that mode
+(unlike `any_one`/`selected_employee_override`, which already do). The engine itself fully supports
+arbitrary N approvers with `StageOrder` grouping under `default_chain` (Phase 17) - so if an admin
+configures, say, two Finance approvers for "Travel Expense Approval" under `default_chain`, the engine's
+`ActionAsync` will correctly require both, but this screen's own step *display* and
+`payload.ApprovalType` matching will still only show/accept the single legacy "Finance Approval Manager"
+slot. Reconciling the bespoke display with the engine's `GetInstanceTimelineAsync` (same fix already
+applied to `ListApproveByIdDto._BuildApprovals` in Phase 17) needs a frontend contract change and is
+explicitly out of scope here, matching Phase 17's own "explicitly out of scope this pass" carve-out for
+this exact screen.
+
+**Behavior change worth flagging explicitly** (not hidden): today's bespoke `default_chain` steps
+(Reporting Manager/Finance/HR) are fully parallel - any can decide in any order, nothing blocks on
+another. The engine's `default_chain` always resolves Reporting Manager at `StageOrder` 0 strictly
+before any configured-approver stage, so whatever mode gets configured for "Travel Expense Approval" in
+HR Config, the Reporting Manager stage will now gate the rest. This brings the Expense screen in line
+with how Trip Request Approval and Advance Payment Approval already behave (both migrated under the
+same `default_chain` semantics in Phase 8), rather than preserving Expense's own previously-independent
+parallel rule.
+
+### Status
+- [x] Dedicated `TravelFormNames.ExpenseApproval` FormDoc, self-seeded
+- [x] `CreateInstance` wired on final submit (`TripExpenseSubmitRepository`), non-fatal, own transaction
+- [x] `Action` gate wired on `SaveExpenseApprovalAsync`, resequenced outside the module's own transaction
+- [x] `NotAuthorizedApproverException`/`InstanceAlreadyClosedException` mapped to 403/409 in the service
+- [x] `SubmitStatus` now reaches `rejected` (previously unreachable) when the engine says so
+- [x] Full build (0 errors) + full test suite (402/402) verified after
+- [ ] Not manually tested against a real expense submission end-to-end (no DB access from this session)
+- [ ] `GetSubmittedEmployees`/`GetSubmittedExpenseGrid` visibility - still legacy `ApproverViewerWhereSql`,
+      not `GetPending` - explicit separate follow-up (see scope note above)
+- [ ] Bespoke `default_chain` step display/`ApprovalType` matching still capped at 3 fixed roles vs the
+      engine's own arbitrary-N support - explicit separate follow-up, same carve-out as Phase 17
+
+### Addendum (2026-10-08): backfill for pre-existing submissions, user added the FormDoc from the frontend
+
+User configured the FormDoc via the frontend's own form-doc-create screen before the self-seed ever ran
+(`Id=10007`, `FormName`/`ModuleKey` exactly matching `TravelFormNames.ExpenseApproval`/
+`ApprovalModuleKeys.TravelManagement`) - confirmed this resolves correctly via `ResolveFormDocIdAsync`
+regardless of which path created the row (self-seed's own `GetFormDocAsync` check would have found it
+and skipped re-inserting, so no duplicate-row risk either way).
+
+Added `IApproveTravelExpenseRepository.BackfillApprovalInstancesAsync` (`POST
+/api/ApproveTravelExpense/BackfillApprovalInstances`, `Actions.Approve` permission) for
+`HR_TM_TripExpenseSubmit` rows finally submitted (`IsSubmit = 1`) before this FormDoc/engine wiring
+existed:
+
+- Finds submitted rows with no `HR_ApprovalInstance` yet for this FormDocId, calls the real
+  `CreateInstanceAsync` for each (so instances honor whatever mode/approvers are configured today -
+  `NoApprovalConfigException`/`NoReportingManagerException`/`NoApproversResolvedException` are caught
+  per-row and reported as skipped, never abort the batch).
+- Replays prior decisions by **`ApproverEmployeeId`**, not by matching the legacy free-text
+  `ApprovalType` to an engine `StageKind` - deliberately, since Phase 17 moved `default_chain`'s
+  Finance/HR approver resolution onto `HR_ApprovalConfigApprover`, which can differ from the single
+  legacy `FinanceApproverId`/`HrApproverId` columns `BuildApprovalStepsAsync` still reads for this
+  screen's own display. Repeatedly calls the real `ActionAsync` for each employee who has an
+  `IsApproved = 1` row in `HR_TM_TripExpenseSubmitApprovalLine`, swallowing
+  `NotAuthorizedApproverException` as "not their stage yet, retry next pass" and stopping on
+  `InstanceAlreadyClosedException` - this reuses the engine's own stage-advancement logic instead of
+  re-deriving it by hand, so it stays correct regardless of mode.
+- **Only ever replays `Approved`, never `Rejected`** - `HR_TM_TripExpenseSubmitApprovalLine` cannot
+  distinguish "explicitly rejected" from "never decided" (both are `IsApproved = 0`; this is the exact
+  gap fixed going forward in the main Phase 19 work above). A row whose legacy approvers don't fully
+  cover what the live HR Config now requires is left genuinely `Pending` at whichever stage is still
+  outstanding - the correct outcome (ask the new/different approver), not a bug.
+- Idempotent/safe to re-run: already-covered rows are excluded by the eligibility query every time.
+
+Verified: full build (0 errors) + full test suite (402/402) after.
+
+## Phase 20 - Hardcoded "Approved = 1" literal, found and fixed across 4 files (2026-10-08)
+
+Unrelated to the Approval Engine migration itself, but the same root cause bit four different Travel
+Management screens: `GetApprovalStatusIdsAsync` (`TravelSetupRepository`) resolves "Approved" **by
+matching the `Status` text** in `HR_ApprovalStatusMaster` (falling back to literal `1` only if no name
+match is found) - `HR_ApprovalStatusMaster` was itself renamed from the legacy `HR_TM_StatusMaster`
+(Phase 2), so its real row IDs depend on however that legacy table was originally seeded. **In this
+live DB, "Approved" is actually `Id = 4`, not `1`.** Everywhere that correctly calls
+`GetApprovalStatusIdsAsync()` and compares against `@ApprovedStatusId` was unaffected; everywhere that
+hardcoded the literal `1` directly in SQL silently matched the wrong status (or nothing) and returned
+empty results with no error - the user's first three reports in this conversation were each this exact
+bug in a different file.
+
+Found and fixed, in the order reported:
+1. `TravelPaymentRepository.GetAdvancePaymentGrid` + the `SaveTravelAdvanceLines` eligibility check -
+   "No advance trips found for this branch" despite an approved advance payment existing.
+2. `TripExpenseSubmitRepository.GetPageDataAsync` + `TripBelongsToEmployeeAsync` - `GetPageData`
+   returning empty `approvedTrips` despite the trip being approved (the latter also silently gated
+   `FinalSubmitTripExpenseToAuthorityAsync`/`SaveTripExpenseSubmitAsync`, not just the page load).
+3. `TravelSettlementRepository.GetSettlementGridAsync` (4 occurrences, including inside the
+   `SettlementAdvanceDisbursementGateSql` shared const) + `SaveSettlementAsync`'s eligibility check -
+   "No trips ready for settlement" despite the trip/advance/expense all being approved.
+4. `TravelReportRepository`'s lifecycle report (`BuildLifecycleSql`'s `advSum` OUTER APPLY) - found by
+   a proactive sweep (`grep -rn "\.Status = [123]\b"` across the whole Travel Management repo folder)
+   rather than a user report, since the first three hits made it clear this was a recurring class of
+   bug, not a one-off.
+
+All four fixed the same way: inject `ITravelSetupRepository`, resolve
+`var statusIds = await _travelSetup.GetApprovalStatusIdsAsync();` once per call, pass
+`statusIds.ApprovedStatusId` as a `@ApprovedStatusId` SQL parameter everywhere the literal `1` was
+being compared against an **approval-status** column (`ta.Status`/`advTa.Status`/`a.Status` keyed off
+`HR_ApprovalStatusMaster`). Deliberately left untouched: `tr.Status`/`emp.Status`/`a.IsDeleted`-style
+columns, which are unrelated bit "active" flags in a completely different value space, not approval
+statuses - conflating the two would be a new bug, not a fix.
+
+No remaining `.Status = 1`/`= 2`/`= 3` literals against an approval-status column anywhere left in
+`SolutionOne_DataAccessLayer/Repositories/Travel Management/` as of this phase (confirmed via the same
+grep sweep after all four fixes).
+
+Verified: full build (0 errors) + full test suite (402/402) after.
+
+## Phase 21: Approve Travel Expense steps/visibility resolved against the wrong FormDoc's config
+
+After the Phase 19 migration, the user added a fresh `HR_ApprovalConfig` (with its own
+`HR_ApprovalConfigApprover` rows) for the new "Travel Expense Approval" FormDoc via HR Config. The
+engine instance itself (`SaveExpenseApprovalAsync`'s `ResolveFormDocIdAsync`/`CreateInstanceAsync`/
+`ActionAsync` gate) correctly resolves and uses that new config - but the screen's own legacy
+display/authorization builder, `ApproveTravelExpenseRepository.BuildApprovalStepsAsync` (plus its
+sibling fallback `BuildApprovalStepsFromConfigOnlyAsync` and `GetApprovalModeAsync`), still kept
+resolving `HR_ApprovalConfig` by `tc_inner.FormDocNo = ta.FormDocId` - `ta` being
+`HR_TM_TripRequestApproval`, i.e. the **Trip Request Approval's own FormDocId**, not the Travel
+Expense Approval one. So the approval steps shown (and the step used to authorize/record a decision
+when no engine instance exists yet) kept reflecting the old Trip Request Approval's RM/Finance/HR
+config, never the newly-configured Travel Expense Approval one - "the expense approve steps still
+show the previous trip request approve list."
+
+The same wrong-FormDoc scoping existed in `ExpenseTravelConfigJoinSql` (the `OUTER APPLY` shared by
+`GetSubmittedEmployeesAsync` and the expense grid SQL), which resolves `tcAppr` for the
+`ApproverViewerWhereSql` visibility filter (matching `approverViewerEmpId` against
+`HR_ApprovalConfigApprover`) - also keyed off `a.FormDocId` (Trip Request Approval), not Travel
+Expense Approval. A newly-configured Travel Expense Approval approver who wasn't also part of the
+trip-level config would not see the submitted expense grid at all under their own
+`approverViewerEmpId`.
+
+**Fix**: resolve `expenseApprovalFormDocId` once via
+`_approvalRepository.ResolveFormDocIdAsync(ApprovalModuleKeys.TravelManagement, TravelFormNames.ExpenseApproval)`
+in each of the four affected spots (`BuildApprovalStepsAsync`, `BuildApprovalStepsFromConfigOnlyAsync`,
+`GetApprovalModeAsync`, `GetSubmittedEmployeesAsync`/`GetSubmittedExpenseGridAsync` via
+`ExpenseTravelConfigJoinSql`), then changed every `tc_inner.FormDocNo = ta.FormDocId` /
+`tcAppr.FormDocNo = a.FormDocId` to `= COALESCE(@expenseApprovalFormDocId, ta.FormDocId)` /
+`= COALESCE(@expenseApprovalFormDocId, a.FormDocId)`. The `COALESCE` falls back to the Trip Request
+Approval's own FormDocId only when "Travel Expense Approval" has no `HR_FormDocMaster` row at all yet
+(pre-migration environments), preserving old behavior there.
+
+Verified: full build (0 errors) + full test suite (402/402) after.
+
+## Phase 22: Approve Travel Expense - GetPending-based strict visibility (deferred item from Phase 19)
+
+Phase 19 explicitly deferred the "GetPending-based strict visibility rewrite" for this screen as
+future work. An employee unrelated to a given trip was able to see it in
+`GetSubmittedEmployees`/`GetSubmittedExpenseGrid`/`GetEmployeeExpenseApprovalDetail`, because
+visibility was governed only by the legacy `ApproverViewerWhereSql`/`ExpenseTravelConfigJoinSql`
+membership check (RM/Finance/HR legacy columns, `HR_ApprovalConfigApprover` rows scoped to whatever
+FormDoc Phase 21 resolves) - a static config-membership test, never the live `HR_ApprovalStep` state,
+so it can match someone the engine itself would never consider a pending approver for that specific
+submission.
+
+**Fix**: new `ApproveTravelExpenseRepository.ResolveEngineBlockedSubmitIdsAsync(candidateSubmitIds,
+approverViewerEmpId)` - once a "Travel Expense Approval" `HR_ApprovalInstance` exists for a submission,
+the viewer must have an actual pending `HR_ApprovalStep` for it (via `GetPendingAsync`, same mechanism
+every other approval queue uses - see "List/queue visibility" in the migration playbook); otherwise
+the row is blocked regardless of what the legacy config-membership check matched. A submission with
+**no instance yet** falls through unblocked (non-fatal dual-path, same principle as
+`SaveExpenseApprovalAsync`). Admin callers (`approverViewerEmpId == null`) are untouched - they still
+see everything, unchanged from before.
+
+Applied centrally in `GetSubmittedExpenseGridAsync` (repo), which `GetEmployeeExpenseApprovalDetailAsync`
+(repo) already reuses internally, so the detail screen inherits the fix for free - returns 404 ("No
+submitted expense found for this employee") rather than leaking existence once all of an employee's
+trips are blocked. `GetSubmittedEmployeesAsync` (service) separately queries its own employee list via
+`IApproveTravelExpenseRepository.GetSubmittedEmployeesAsync` (still only legacy-filtered, no per-
+submission granularity to check against the engine) - the service now intersects that list against the
+grid's (post-engine-filter) employee set, unless the grid load itself failed, so the stricter check
+can't be bypassed via that second, separately-queried path.
+
+**Known limitation carried forward from this fix**: `ResolveEngineBlockedSubmitIdsAsync` only has
+teeth once an `HR_ApprovalInstance` exists for a submission. A submission finally-submitted before
+"Travel Expense Approval" had any `HR_ApprovalConfig` at all (exactly the state the Phase 19 Addendum's
+backfill was built for) has no instance yet, so its visibility is still governed by the legacy
+config-membership check alone, unfixed by this phase. Running `POST
+/api/ApproveTravelExpense/BackfillApprovalInstances` now that a config exists creates the missing
+instance (and replays any prior `IsApproved = 1` decisions), after which this phase's strict check
+takes over for that submission too.
+
+Verified: full build (0 errors) + full test suite (402/402) after.
+
+## Phase 23: Approve Travel Expense admin bypass ignored the `approverViewerEmpId` override
+
+After Phase 22, an employee with an "admin" role could still see every submission regardless of
+`?approverViewerEmpId=<id>`. Root cause wasn't the new engine-based filter (confirmed working) - it was
+`ApproveTravelExpenseController.ResolveApproverViewerEmpId` checking `ResolveIsAdmin(user)` **before**
+ever looking at the query override:
+
+```csharp
+if (ResolveIsAdmin(user)) return null;   // old order - override never reached for an admin role
+```
+
+`ResolveIsAdmin` → `TravelRoleScopePolicy.IsTravelAdmin` → `IsCompanyWideRole` treats any role name
+containing `"admin"`/`"hr"`/`"system"`/etc. as company-wide, forcing `null` (no filter, see
+everything) - with every current test account literally having role "admin" (confirmed by the user:
+"admin only. All are admins for now"), the `approverViewerEmpId` query parameter had been a permanent
+no-op for the entire session, regardless of what Phase 22 fixed underneath it.
+
+**Fix**: reordered so an explicit `approverViewerEmpId` override always wins, admin or not - this is
+what lets an Admin-role account deliberately impersonate a specific employee's view (clearly this
+parameter's intended purpose, used throughout this file's manual testing). An admin calling **without**
+an override still defaults to seeing everything, unchanged. Non-admin callers are unaffected either way
+(their own JWT employee claim already took priority in practice, since `ResolveIsAdmin` was `false` for
+them).
+
+This was purely a controller-level identity-resolution bug, not a flaw in Phase 21/22's filtering
+logic - once the real intended employee id reaches the service/repository layer, the engine-based
+visibility check already in place works correctly.
+
+Verified: full build (0 errors) + full test suite (402/402) after.
+
+## Phase 24: GetEmployeeExpenseApprovalDetail - 404 to 200 for the empty case
+
+`ApproveTravelExpenseService.GetEmployeeExpenseApprovalDetailAsync` returned HTTP 404 when the
+repository found no visible trip for the requested employee/viewer - correct status-code semantics,
+but Phase 22's stricter engine-pending filter means this "nothing visible" case now happens routinely
+(any employee the viewer has no pending step for), and the FE was toasting it as an error rather than
+rendering an empty state.
+
+**Fix**: this case now returns 200 OK with `IsSuccess = true`, `Data = null`, same message text ("No
+submitted expense found for this employee"). Not a visibility/authorization change - the exact same
+set of callers see the exact same absence of data as before, only the HTTP status/toast behavior
+changes.
+
+Verified: full build (0 errors) + full test suite (402/402) after.
+
+## Phase 25: Fallback Reporting Manager (engine-wide)
+
+Implements `hrmsystemfe/docs/specs/Fallback-Reporting-Manager-Backend-Spec.md`. Scoping confirmed with
+the user before implementing (both spec's own open questions): apply engine-wide (every module sharing
+`ApprovalRepository.BuildStepsAsync`), config-level field only - no company-wide default for now.
+
+**Corrections made to the spec's stale assumptions** (verified against current code before writing
+anything): the table is `HR_ApprovalConfig`, not `HR_TravelConfig` (renamed in an earlier phase - see
+Phase/Migration `Migration_ApprovalEngine_20260928.sql`). The spec's claimed "resolves to requester's
+own id" self-approval bug does **not** reproduce in the current generic engine -
+`ApprovalRepository.GetReportingManagerIdAsync` already does `NULLIF(ReportingPersonID, 0)` and
+`BuildStepsAsync` already throws `NoReportingManagerException` on null, which is the spec's own
+desired end state, not the bug. Treated this phase as adding the new fallback capability, not chasing
+a stale repro.
+
+**Schema** (`SqlScripts/Migration_FallbackReportingManager_20261008.sql`, idempotent):
+- `HR_ApprovalConfig.FallbackApproverEmpId` (nullable `BIGINT`, no FK - matches `FinanceApproverId`/
+  `HrApproverId` on the same table, which also have none).
+- `HR_ApprovalStep.IsFallbackApprover` (`BIT NOT NULL DEFAULT 0`).
+
+**Engine resolution** (`ApprovalRepository.cs`): new `ResolveReportingManagerAsync(requestorEmployeeId,
+fallbackApproverEmpId)` - tries the real Reporting Manager first, substitutes the configured fallback
+only when that's null, returns `(null, false)` when neither resolves (unchanged downstream: still
+`NoReportingManagerException` for `default_chain`/`any_one`, still a silently-omitted step for
+`first_decision_wins` - only the *input* to resolution changed, not any failure mode). Wired into all
+three modes that build a Reporting Manager step. `ApprovalConfigRow`/`ResolveConfigSql` carry
+`FallbackApproverEmpId`; `StepInsert`/`InsertStepSql` carry `IsFallbackApprover`;
+`GetInstanceTimelineAsync`/`ApprovalStepTimelineModel` surface it. Engine-wide by construction - every
+module calling `CreateInstanceAsync` shares this one resolution point, confirmed via the 13 modules on
+this engine (Travel Management x3, Recruitment, Assets, Material Requisition, Income Tax, Attendance
+Adjustment, Comp-Off, FNF, Leave, Loan EMI, Loan Request) - no per-module wiring needed.
+
+**Config CRUD** (`TravelConfigRepository.cs` + `AddTravelConfigDto`/`UpdateTravelConfigDto`/
+`ListTravelConfigDto`): `fallbackApproverId` accepted on insert/update, `fallbackApproverId` +
+resolved `fallbackApproverName` returned on `GetAll` (matches `financeApproverName`/`hrAdminName`'s
+existing pattern); `GetById` returns the id only, matching that endpoint's existing
+Finance/HR-approver-name omission. No extra validation added (`ValidateTravelConfigPayload` doesn't
+verify Finance/HR approver ids exist either - fallback approver follows the same, already-established
+convention: optional, unvalidated against `HR_EmployeeMaster`).
+
+**Travel Management's legacy 3-column mirror** (`TravelSetupRepository.BuildApprovalSeedAsync`): found
+and fixed a related, smaller, pre-existing bug while here - this method's Reporting Manager lookup had
+no `NULLIF(ReportingPersonID, 0)` guard (unlike the generic engine's own lookup), so an employee with
+no manager would have stored a bogus `ReportingManagerEmpId` of `0` instead of null on this display
+mirror. Fixed alongside wiring in the same fallback substitution, so this legacy display column stays
+consistent with what the real `HR_ApprovalStep` resolves - without this, the UI could show a blank/
+wrong Reporting Manager name while the engine was correctly using the fallback approver underneath.
+
+**Creation-time gate** (`TravelSetupRepository.ValidateFormAndConfigAsync`, per spec §4): now only
+hard-blocks (`Errors`, `IsReady = false`) on a missing Reporting Manager when no fallback approver is
+configured; otherwise adds a non-blocking entry to the existing `Warnings` list (no new DTO field
+needed - `TravelSetupValidationDto.Warnings` already existed, unused for this case until now).
+
+**Decide endpoint** (spec §5): no code change - an instance that failed to create (no RM, no
+fallback) never has a matching `HR_ApprovalInstance`/`HR_ApprovalStep` row in the first place, so a
+decide call against it already falls through to "instance not found"/pending-approver-mismatch
+handling that existed before this phase. Deliberately did **not** introduce a nullable
+`ApproverEmployeeId`/"unresolved step" concept on `HR_ApprovalStep` (which the spec's §2 pseudocode
+hints at but doesn't strictly require) - that would mean touching null-handling in `ActionAsync`/
+`GetPendingAsync`/every other `HR_ApprovalStep` consumer for a behavior (hard-fail instance creation
+when truly unresolvable) that was already correct and is now only reached strictly less often.
+
+Also updated `hrmsystemfe/docs/specs/Approval-Engine-API-Contract.md` (§18) with the new
+`fallbackApproverId`/`fallbackApproverName`/`isFallbackApprover` fields and the corrected
+`HR_ApprovalConfig` table name.
+
+Verified: full build (0 errors) + full test suite (402/402) after.
+
+
+## Phase 26: Super-admin role switch, Approval admin override, group-based approver selectors (2026-10-09)
+
+Implements `hrmsystemfe/docs/specs/Approval-Group-Approver-Selector-Backend-Spec.md`, plus two
+decisions made while scoping it with the user. Frontend-facing contract:
+`Specs/Approval-Admin-Override-And-Group-Selectors-API-Contract.md`.
+
+**Decisions (user-confirmed 2026-10-09)**
+1. **One source of truth for roles**: `HR_UserRoles` + `HR_RolesMaster` only. Department/designation
+   from `HR_EmployeeMaster` only. Approvers from `HR_ApprovalConfigApprover` only. The legacy
+   `HR_UserMaster.Role` string / `UserRole` token claim is no longer read by anything new (the ~10
+   existing hand-rolled `IsAdmin` helpers are NOT migrated yet - separate batches, per user).
+2. **"Admin" is a role flag, not a role name**: `HR_RolesMaster.IsSuperAdmin`. Holders get every
+   menu x action (`PermissionResolver`, user overrides cannot revoke) and `ICurrentUserAccess.IsAdmin`.
+   Splitting Admin vs HR Admin later = untick the flag on a role.
+3. **Approval admin override** = a per-company DB setting (`HR_SystemSetting`, key
+   `Approval.AdminOverride`, default OFF = unchanged behaviour). When ON, an admin sees every pending
+   approval of the company (`GetPending`/`GetTeamRequests`) and may decide any of them; one admin
+   decision closes the stage. Only admins can flip it.
+4. **Group selectors**: multi-select (one config row per selected role/department/designation).
+   A stage containing a group selector is `AnyOne`. "Select all" is a frontend convenience - the
+   backend stores explicit rows.
+
+**Schema** (idempotent, NOT yet run against any DB): `Migration_AdminOverride_20261009.sql`
+(`HR_RolesMaster.IsSuperAdmin` - ADMIN role backfilled to 1, `HR_SystemSetting`,
+`HR_ApprovalStep.ActionedByEmployeeId`), `Migration_ApprovalConfigApproverSelector_20261009.sql`
+(`SelectorType`/`SelectorId`, `EmployeeId` nullable, unique index rebuilt). `HR_RolesMaster` and
+`HR_ApprovalConfigApprover` are this backend's own tables, so ALTERing them respects
+[[schema_shared_legacy_tables]].
+
+**Code**: `ICurrentUserAccess`/`CurrentUserAccess` (per-request, always-fresh role read);
+`ISystemSettingService` + `SystemSettingController` (`GET/PUT api/SystemSetting/ApprovalAdminOverride`,
+admin-only, 1-minute cache); `RbacManagementController` `PUT roles/{id}/super-admin` (lock-out guard:
+the last super-admin holder can't be switched off) and `IsSuperAdmin` on role create/list;
+`IApproverSelectorResolver` (the one definition of group membership; active employees
+`HR_EmployeeMaster.Status = 1`, login = `HR_UserMaster.Status = 1`); `ApprovalRepository`
+`ResolveConfigApproversAsync` expands selectors at `CreateInstance` time (excludes requester,
+de-duplicates per stage, throws `NoApproversResolvedException` if a stage resolves to nobody rather
+than silently dropping it); `ApprovalController.ResolveSelector` (admin-only preview);
+`TravelConfigService` validates selector rows.
+
+**Behaviour changes worth knowing**
+- RBAC `groups/users` and `groups/assign-roles` now 400 on an unknown `groupType` (used to silently
+  mean "department" - for assign-roles that bulk-assigned roles to the wrong people). `role` added to
+  `groups/users`.
+- A step decided under override carries `ActionedByEmployeeId`; the timeline returns
+  `actionedByEmployeeId`/`actionedByName`/`isAdminOverride`.
+- (Superseded by Phase 27: Travel Management now supports group selectors and the override too.)
+
+**Known gaps / not done**: `TravelConfigService`/HR-Config save endpoints still have no role check
+(pre-existing; not changed). `ApprovalRepository` SQL (override paths, selector expansion SQL, both
+migrations) has no automated test - no SQL Server in the test project; only the pure rules and the
+service layer are covered. Verified: full build (0 errors) + full test suite (467/467, 65 new).
+
+
+## Phase 27: Group selectors + admin override extended to Travel Management (2026-10-09)
+
+Travel already created real engine instances (Trip Request, Advance Payment, Expense), so group
+expansion worked at `CreateInstance` time; what blocked it was legacy code around the engine. Decisions
+(user): Travel *expense* admin behaviour moves under the same switch (`Approval.AdminOverride` +
+`IsSuperAdmin`) instead of `TravelRoleScopePolicy.IsTravelAdmin` role names; Settlement/Payment are
+visible to everyone configured for finance work (finance-labelled group selectors), not one person.
+
+- **Removed** the Phase 26 save-time block that rejected group selectors for Travel form docs.
+- **`IApprovalAdminOverride`** (extracted from `ApprovalService`): the one check; Trip/Advance/Expense
+  services call it and pass `adminOverrideCompanyId` to `ApproveTrip`/`ApproveAsync`/
+  `SaveExpenseApprovalAsync`/`GetPendingAsync` (those use `_approvalRepository` directly, bypassing
+  `ApprovalService`).
+- **Engine-approver awareness**: `IApprovalRepository.IsApproverOnInstanceAsync`. Advance's detail
+  view and approve pre-check (`TravelApprovalAccessResolver`, previously role-name admin or legacy
+  assigned-approver columns) now also accept anyone holding a step on the instance. The resolver
+  takes `adminOverride` instead of reading role names.
+- **Expense**: `SaveExpenseApprovalAsync` - when an engine instance exists the engine is authoritative
+  and the legacy mirror-step checks no longer run (they rejected group-resolved approvers); mirror steps
+  only supply the display label. Admin no longer acts "as" the step's assigned approver; the engine
+  stamps `ActionedByEmployeeId`. Expense list SQL lets engine step-holders through the legacy membership
+  filter. Detail steps gain group steps (`isGroupApprover`, `groupName`, `canCurrentUserAct`).
+- **Readiness** (`ValidateFormAndConfigAsync`) counts all approver rows, so group-only configs no
+  longer read as "no approver selected".
+- **Settlement / Advance Payment** lists: "responsible person" fallback now ignores group rows
+  (`EmployeeId IS NOT NULL`), and additionally shows the trip to any viewer in a finance-labelled
+  (`ApprovalType` contains "fin") role/department/designation selector of the config
+  (`ApproverSelectorSql.ViewerInFinanceGroup`). Saves already upsert per trip, so several finance users
+  opening the same trip doesn't create duplicate rows (last write wins; no claim/lock added).
+
+**Not changed (still role-name based, `TravelRoleScopePolicy.IsTravelAdmin`)**: Settlement/Payment
+controllers' admin = see-all, trip request list scope, travel reports, `TripApprovalScopeResolver`.
+Only approval-related admin behaviour moved under the switch. **Untested against a database** - the new
+SQL (expense membership clause, finance-group fragment, group-step query, `IsApproverOnInstanceAsync`)
+is reviewed, not executed. Verified: build + 475/475 tests (8 new in `TravelApprovalOverrideTests`).
+
+
+## Phase 28: Service-layer permission enforcement (pilot: RBAC + HR Config) and removal of the APPROVE action (2026-10-09)
+
+Audit that triggered this: `[Permission]` (controller filter) covered 13 of ~1,000 endpoints (474 mutating),
+all on 3 Travel controllers; 17 more were commented out. Everything else was `[Authorize]` only - a role
+without CREATE/UPDATE/DELETE was a UI courtesy. Worst case: every RBAC admin endpoint (assign roles to a
+user, assign permissions to a role, user overrides, group role assignment) was open to any logged-in user.
+
+**Decisions (user, 2026-10-09)**: delete the `APPROVE` action (the approval engine, not a role permission,
+decides who approves); enforce CREATE/UPDATE/DELETE at the **service layer**, not repositories (they are
+called by system flows with no user behind them); no audit/log-only phase; pilot RBAC + approval
+configuration (HR Config) first, then the rest module by module. All current users are admins, so nothing
+locks out during testing.
+
+- **Migration** `Migration_RemoveApproveAction_20261009.sql`: deletes `HR_UserPermissions` ->
+  `HR_RolePermissions` -> `HR_MenuActions` rows for APPROVE. Removed `Actions.Approve`; the two
+  `[Permission(..., Approve)]` on `ApproveTravelExpenseController`: `SaveExpenseApproval` now has none
+  (engine gate), `BackfillApprovalInstances` (bulk admin op) is `Update`.
+- **Mechanism**: `[RequiresPermission(module, action)]` on service-INTERFACE methods;
+  `PermissionGuardProxy<T>` (DispatchProxy decorator) enforces it via `IPermissionChecker`; register with
+  `AddPermissionGuarded<TService, TImpl>()` (the impl itself is not registered, so nothing can bypass it).
+  Denied -> 403 `ResponseModel`/`ResponseModel<T>`; other return types throw `PermissionDeniedException`.
+  Unmarked methods are open (self-service stays available). Marked non-async methods fail fast at resolve.
+- **Checker**: super-admin always passes (even for a module with no menu row); otherwise role grants +
+  per-user overrides, case-insensitive, same cache key as `PermissionFilter` (shared eviction). A module is
+  its `HR_MenuItems.MainMenu` code OR `NavigateUrl` (`Modules.RoleAdministration = "/admin/rbac"`,
+  `Modules.HrConfig = "/admin/hr-config"`).
+- **Pilot marks**: `IRbacManagementService` create/delete/assign/set/remove methods; `ITravelConfigService`
+  insert/update/delete/create-form-doc/update-menu-link. Reads are open (lookup lists feed other screens).
+  `EveryWriteMethodOnAPilotService_IsMarkedRequiresPermission` fails if a new write method is added unmarked.
+- **Internal callers**: `PermissionGuardBypass.Begin()` (AsyncLocal scope) used by `UserService` and
+  `CandidateTransitionService` when they assign roles during user creation / candidate transition.
+- **Escalation rule** (applies even inside a bypass): only an admin may assign a super-admin role
+  (`AssignRolesToUser`, `AssignRolesToGroup`) - holding RBAC UPDATE is not a way to mint admins.
+- **Bug fixed on the way**: `PermissionRepository.GetUserPermissionOverridesAsync` selected only
+  UserId/MenuID/ActionID, so `MenuCode`/`ActionCode`/`IsRevoked` were never populated and every per-user
+  override resolved to a junk `":"` entry - overrides had no effect. It now returns the codes and honours
+  `IsGranted`/`IsRevoked` and the effective window. Behaviour change: existing overrides start working.
+  Also: `SetRoleSuperAdminAsync` now evicts holders' cached permission sets.
+
+**Not done yet**: every other module (rollout plan: one module at a time, annotate the service interface,
+switch its DI line to `AddPermissionGuarded`, add its menu/route constant). `PermissionFilter` on
+controllers is unchanged. Untested against a DB: the migration, `AnySuperAdminRoleAsync`, the override query.
+Verified: build + 504 tests (29 new).
+
+
+## Phase 29: Service-layer permission enforcement rolled out to Travel Management (2026-10-09)
+
+Same mechanism as Phase 28. No Travel service has an internal service-to-service caller, so no
+`PermissionGuardBypass` was needed. DI: nine Travel services moved to `AddPermissionGuarded`
+(`ITripExpenseSubmitService` was registered twice; now once).
+
+| Service | Marked methods (module -> action) |
+|---|---|
+| `ITripRequestService` | `InsertTripRequest`, `InsertTripRequestRange` -> Create; `UpdateTripRequestRange` -> Update; `DeleteTripRequest` -> Delete (`/travel-management/trip-request`) |
+| `ITripApprovalService` | `UpdateTripApproval` -> Update; `DeleteTripApproval` -> Delete (`/travel-management/trip-approval`) |
+| `ITravelPolicyService` | Insert / Update / Delete (`/travel-management/travel-policy`) |
+| `ITravelPaymentService` | `DeleteTravelPayment` -> Delete (`Advance Payment`) |
+| `ITravelSettlementService` | `SaveSettlementAsync` -> Update (`Expense Settlement`) |
+| `ITripExpenseSubmitService` | `SubmitTripExpenseAsync` -> Create; `SaveTripExpenseDisplayStatusAsync`, `FinalSubmitTripExpenseToAuthorityAsync` -> Update (`/travel-management/trip-expense-submit`) |
+| `IApproveTravelExpenseService` | `BackfillApprovalInstancesAsync` -> Update (`Approve Expense`) |
+| `ITravelConfigService` | already guarded in Phase 28 (`/admin/hr-config`) |
+
+**Deliberately unmarked**: `ApproveTrip`, `ApproveAsync` (advance), `SaveExpenseApprovalAsync` - approval
+decisions belong to the Approval Engine; `SaveTravelPayment` - one method behind both the Create ("insert")
+and Update ("update") endpoints, which keep their controller-level `[Permission]`. A test lists these and
+fails if any other write-looking Travel method is added unmarked, and checks approvals are never marked.
+The module constants for the three screens that already had a controller `[Permission]` keep their
+MainMenu-code form so the service mark and the controller attribute always agree; the others use routes.
+
+**Not guarded**: reads, `ITripExpenseDocumentUploadService` (generic `ICommonDocumentUploadService<,,>`
+shared by other modules - uploading/deleting expense documents needs a module-aware approach, left for the
+document-upload pass), `TravelDashboard`/`TravelReport` (reads). **Self-service note**: employees creating
+trip requests / submitting expenses now need CREATE/UPDATE on those menus via their role - the "Employee"
+role(s) must be granted them before non-admin users go live. Verified: build + 524 tests (20 new).
+
+
+## Phase 30: Role membership visibility for the RBAC "View Members" buttons (2026-10-10)
+
+Implements `hrmsystemfe/docs/specs/RBAC-Group-Role-Membership-Visibility-Backend-Spec.md`. Read-only.
+- `GET RbacManagement/roles` now returns `roleCode` and `userCount` (`RoleListItemDto`; the repository takes
+  the caller's company). `userCount` = distinct employees of that company holding the role through an
+  active login (`um.Status = 1`) who are themselves active (`em.Status = 1`).
+- `groups/users?groupType=role` (added in Phase 26 without any status filter) now applies the same
+  active-employee + active-login predicate, so the count and the popup list always agree. Unknown role id
+  = `200 []`.
+- **Spec correction**: the spec says department/designation `userCount` and member lists are already
+  "scoped to employees with an active login". They are not - those queries only require a linked
+  `HR_UserMaster` row (no `Status` filter on either table). Left unchanged per the spec's §4; aligning them
+  is a one-line filter each if wanted. Roles therefore count slightly more strictly than departments.
+Verified: build + 527 tests (3 new). SQL untested against a DB.
+
+
+## Phase 31: RBAC Menu Groups (2026-10-10)
+
+Implements `hrmsystemfe/docs/specs/RBAC-Menu-Groups-Backend-Spec.md`: two tables, four endpoints, no side
+effects. `Migration_RbacScreenGroups_20261010.sql`; own `IMenuGroupRepository`/`IMenuGroupService`/
+`MenuGroupController` (the RBAC repository was already past the 500-line guideline), same
+`api/RbacManagement/menu-groups` URLs. Writes are `[RequiresPermission]` on `/admin/rbac` (Create/Update/
+Delete) via `AddPermissionGuarded`, the list is open.
+
+**Spec corrections resolved**: `HR_MenuItems` key is `MenuID` BIGINT, so `HR_MenuGroupItems.MenuId` is BIGINT
+(the sketch said INT); roles are global (no company column) so groups are global - no `CompanyId`, unique on
+`GroupName`; FK to `HR_MenuItems` is `ON DELETE CASCADE` so menu cleanup is never blocked by a label; the
+frontend's `ApiService.delete()` sends **POST**, so `.../{id}/delete` is `[HttpPost]` (`[HttpDelete]` also
+accepted). Update/delete of an unknown group = 404; name uniqueness is case-insensitive with a race-safe
+unique-constraint fallback to 400. Verified: build + 546 tests (19 new). SQL untested against a DB.
+
+**Phase 31 follow-up (2026-10-10)**: running the first version on the dev DB failed (Msg 1778) because
+`HR_MenuGroups` already existed with a non-INT `GroupID`, so the INT `GroupId` FK on the items table could not
+match; the script also tried to index the items table that had failed to create. Fixed: the migration now
+adapts to existing tables (creates `HR_MenuGroupItems.GroupId` with the SAME type as `HR_MenuGroups`' primary
+key, read from the catalog; adds missing audit columns; rebuilds an existing items table whose id types
+differ; only indexes when the table exists), and the group id is `long` end to end (DTO, repository, service,
+`{groupId:long}` routes) so either BIGINT or INT in the database works. New tables created by the script now
+use BIGINT ids.
+
+**Phase 31 correction (2026-10-10) - table names**: `HR_MenuGroups` is NOT free to use: it is the
+left-navigation folder tree (`vw_HR_MenuGroupTree`), shared with the sibling `hr_payroll` project - a
+legacy-shared table ([[schema_shared_legacy_tables]]). The earlier drafts of this feature were written
+against that name (the last one even "adapted" to it by adding columns/an index when it existed). The
+feature now owns two brand-new tables, `HR_RbacScreenGroups` / `HR_RbacScreenGroupItems`
+(`Migration_RbacScreenGroups_20261010.sql`, plain create-if-missing, touches nothing else); the API and UI
+keep the spec's "menu groups" naming. `Check_MenuGroupsFirstAttempt_20261010.sql` is a READ-ONLY script to
+see whether the earlier drafts left anything behind on a database they were run against (columns
+`CreatedBy`/`ModifiedBy`/`ModifiedDate` or index `UX_HR_MenuGroups_GroupName` on `HR_MenuGroups`, or a
+`HR_MenuGroupItems` table); its DROPs are commented out for you to apply deliberately.
+
+**Phase 31 follow-up (2026-10-10, 405 on menu-group update)**: the frontend's `ApiService.put()` (and
+`delete()`) send POST, so the PUT-only routes returned 405 - visible in the log as a preflight with
+`Access-Control-Request-Method: POST` on `/menu-groups/1`. The three PUT routes added this session (menu-group
+update, `roles/{id}/super-admin`, `SystemSetting/ApprovalAdminOverride`) now also accept POST; a reflection test
+fails if a PUT route is added without a matching POST. The super-admin toggle and override switch had the same
+latent 405 and are fixed too. Verified: build + 550 tests.
+    48 SolutionOne_BusinessLogicLayer/Services/Approval/Implementation/ApprovalAdminOverride.cs
+    47 SolutionOne_BusinessLogicLayer/Services/Approval/Implementation/ApprovalOverridePreviewService.cs
+    59 SolutionOne_BusinessLogicLayer/Services/Approval/Implementation/ApprovalRouteService.cs
+   273 SolutionOne_BusinessLogicLayer/Services/Approval/Implementation/ApprovalService.cs
+    68 SolutionOne_BusinessLogicLayer/Services/Approval/Implementation/ApproverCandidateService.cs
+   748 SolutionOne_DataAccessLayer/Repositories/Approval/Implementation/ApprovalRepository.cs
+   163 SolutionOne_DataAccessLayer/Repositories/Approval/Implementation/ApprovalRouteRepository.cs
+    36 SolutionOne_DataAccessLayer/Repositories/Approval/Implementation/ApproverCandidateRepository.cs
+    96 SolutionOne_DataAccessLayer/Repositories/Approval/Implementation/ApproverSelectorResolver.cs
+    47 SolutionOne_DataAccessLayer/Repositories/Approval/Implementation/ApproverSelectorSql.cs
+    29 SolutionOne_Core/ApprovalModels/ApprovalActionModel.cs
+   117 SolutionOne_Core/ApprovalModels/ApprovalRouteInstanceBuilder.cs
+   208 SolutionOne_Core/ApprovalModels/ApprovalRouteModels.cs
+   317 SolutionOne_Core/ApprovalModels/ApprovalRoutePlanner.cs
+    53 SolutionOne_Core/ApprovalModels/ApprovalRouteWording.cs
+    52 SolutionOne_Core/ApprovalModels/ApprovalStatusResolver.cs
+    33 SolutionOne_Core/ApprovalModels/ApprovalStepTimelineModel.cs
+   161 SolutionOne_Core/ApprovalModels/ApprovalWorkflow.cs
+    12 SolutionOne_Core/ApprovalModels/ApproverCandidateModel.cs
+   107 SolutionOne_Core/ApprovalModels/ApproverSelectorModels.cs
+    16 SolutionOne_Core/ApprovalModels/CreateApprovalInstanceModel.cs
+    33 SolutionOne_Core/ApprovalModels/PendingApprovalModel.cs
+    46 SolutionOne_Core/ApprovalModels/PendingApproverText.cs
+  2769 total

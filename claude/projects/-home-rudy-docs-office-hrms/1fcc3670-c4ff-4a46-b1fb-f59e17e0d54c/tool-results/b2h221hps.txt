@@ -1,0 +1,700 @@
+     1	using System;
+     2	using System.Collections.Generic;
+     3	using System.Data;
+     4	using System.Data.SqlClient;
+     5	
+     6	/// <summary>
+     7	/// The MONEY half of Full &amp; Final settlement: what the leaver is owed, and how it
+     8	/// reaches a payslip.
+     9	///
+    10	/// Every rule that could differ between clients lives in <c>HR_FNFConfig</c> (per
+    11	/// company) — the per-day rate basis, the gratuity formula, the encashment cap, and
+    12	/// which salary head each component is paid through. Nothing here is hard-coded to one
+    13	/// country's law, because this installation is the Africa statutory pack while others
+    14	/// are India.
+    15	///
+    16	/// HOW THE MONEY REACHES PAYROLL — the important part.
+    17	/// It does NOT get its own payment run. <c>HR_CaculateSalaryTempTable</c> (the proc
+    18	/// SalaryGenerate builds every payslip line from) already reads
+    19	/// <c>HR_SalaryAdditionalHead</c> as a per-employee, per-head, per-month amount
+    20	/// override. So approving a settlement writes one row there per component, and the
+    21	/// existing payroll run picks them up with no change to SalaryGenerate at all. That
+    22	/// also means the settlement flows correctly into PAYE, the salary register and every
+    23	/// existing report for free.
+    24	///
+    25	/// Four rules fall out of that override, and getting any of them wrong is silent:
+    26	///   1. It OVERRIDES the amount, it does not add to it — so a component must use its
+    27	///      OWN head, never a shared one like ADVANCE.
+    28	///   2. The head must already exist on the employee in HR_EmployeeWiseSalaryHead: that
+    29	///      table drives the proc and the override is only a LEFT JOIN onto it. This
+    30	///      service therefore ENSURES the row exists rather than trusting setup.
+    31	///   3. Category and Branch are part of the join, so the row must carry the values the
+    32	///      employee has now.
+    33	///   4. AmountCalculation comes from the employee-wise row, and CalculateHeads() only
+    34	///      exempts 'Manual' and 'FixPerMonthDay' from pro-rata. A gratuity head left on a
+    35	///      normal type would be scaled by TotalPayDays / MonthDays — 500,000 for someone
+    36	///      leaving on the 10th of a 31-day month silently becomes 161,290.
+    37	///
+    38	/// No System.Web dependency, so this compiles standalone with csc.exe and can be driven
+    39	/// against the live database inside a rolled-back transaction.
+    40	/// </summary>
+    41	public static class FNFSettlementService
+    42	{
+    43	    // Component types, matching HR_FNFSettlementDetail.ComponentType.
+    44	    public const string CompFinalSalary     = "FinalSalary";
+    45	    public const string CompLeaveEncashment = "LeaveEncashment";
+    46	    public const string CompGratuity        = "Gratuity";
+    47	    public const string CompNoticePay       = "NoticePay";
+    48	    public const string CompNoticeRecovery  = "NoticeRecovery";
+    49	    public const string CompLoanRecovery    = "LoanRecovery";
+    50	    public const string CompAssetRecovery   = "AssetRecovery";
+    51	    public const string CompOtherRecovery   = "OtherRecovery";
+    52	
+    53	    public const string Add = "Add";
+    54	    public const string Deduct = "Deduct";
+    55	
+    56	    /// <summary>
+    57	    /// The final month's salary is shown on the statement so the net figure means what
+    58	    /// the employee expects, but it is PAID BY PAYROLL ITSELF — pushing it as an
+    59	    /// additional head would pay it twice. This is the one component the push skips.
+    60	    /// </summary>
+    61	    public static bool IsPushable(string componentType)
+    62	    {
+    63	        return !string.Equals(componentType, CompFinalSalary, StringComparison.OrdinalIgnoreCase);
+    64	    }
+    65	
+    66	    // =========================================================================
+    67	    //  Configuration
+    68	    // =========================================================================
+    69	
+    70	    public sealed class Config
+    71	    {
+    72	        public long CompanyMasterID;
+    73	        public bool GratuityEnabled;
+    74	        public decimal GratuityEligibleYears;
+    75	        public decimal GratuityDaysPerYear;
+    76	        public decimal GratuityDivisor;
+    77	        public string GratuityBase;              // Basic | Basic+DA | Gross
+    78	        public string PerDayRateBase;            // Basic | Gross | CTC
+    79	        public string PerDayRateDivisorType;     // Fixed | MonthDays | WorkingDays
+    80	        public decimal PerDayRateDivisorValue;
+    81	        public decimal? EncashmentCapDays;
+    82	        public bool RecoverAssetsOnExit;
+    83	        public bool SuppressLoanEMIOnSettlement;
+    84	        public int ComplianceWindowDays;
+    85	
+    86	        public long? GratuityHeadID;
+    87	        public long? LeaveEncashHeadID;
+    88	        public long? NoticePayHeadID;
+    89	        public long? NoticeRecoveryHeadID;
+    90	        public long? AssetRecoveryHeadID;
+    91	        public long? LoanRecoveryHeadID;
+    92	
+    93	        public long? HeadFor(string componentType)
+    94	        {
+    95	            switch (componentType)
+    96	            {
+    97	                case CompGratuity:        return GratuityHeadID;
+    98	                case CompLeaveEncashment: return LeaveEncashHeadID;
+    99	                case CompNoticePay:       return NoticePayHeadID;
+   100	                case CompNoticeRecovery:  return NoticeRecoveryHeadID;
+   101	                case CompAssetRecovery:   return AssetRecoveryHeadID;
+   102	                case CompLoanRecovery:    return LoanRecoveryHeadID;
+   103	                case CompOtherRecovery:   return AssetRecoveryHeadID;   // no head of its own
+   104	                default:                  return null;
+   105	            }
+   106	        }
+   107	    }
+   108	
+   109	    public static Config LoadConfig(SqlConnection conn, SqlTransaction tx, long companyId)
+   110	    {
+   111	        const string sql = @"
+   112	            SELECT * FROM dbo.HR_FNFConfig WHERE CompanyMasterID = @CompanyID AND Status = 1";
+   113	
+   114	        using (var cmd = new SqlCommand(sql, conn, tx))
+   115	        {
+   116	            cmd.Parameters.AddWithValue("@CompanyID", companyId);
+   117	            var dt = new DataTable();
+   118	            using (var da = new SqlDataAdapter(cmd)) da.Fill(dt);
+   119	
+   120	            if (dt.Rows.Count == 0)
+   121	                throw new InvalidOperationException(
+   122	                    "No F&F configuration exists for company " + companyId +
+   123	                    ". Migration 110 seeds one row per company - check HR_FNFConfig.");
+   124	
+   125	            DataRow r = dt.Rows[0];
+   126	            return new Config
+   127	            {
+   128	                CompanyMasterID             = companyId,
+   129	                GratuityEnabled             = Bool(r, "GratuityEnabled"),
+   130	                GratuityEligibleYears       = Dec(r, "GratuityEligibleYears", 5m),
+   131	                GratuityDaysPerYear         = Dec(r, "GratuityDaysPerYear", 15m),
+   132	                GratuityDivisor             = Dec(r, "GratuityDivisor", 26m),
+   133	                GratuityBase                = Str(r, "GratuityBase", "Basic"),
+   134	                PerDayRateBase              = Str(r, "PerDayRateBase", "Basic"),
+   135	                PerDayRateDivisorType       = Str(r, "PerDayRateDivisorType", "Fixed"),
+   136	                PerDayRateDivisorValue      = Dec(r, "PerDayRateDivisorValue", 26m),
+   137	                EncashmentCapDays           = NullableDec(r, "EncashmentCapDays"),
+   138	                RecoverAssetsOnExit         = Bool(r, "RecoverAssetsOnExit"),
+   139	                SuppressLoanEMIOnSettlement = Bool(r, "SuppressLoanEMIOnSettlement"),
+   140	                ComplianceWindowDays        = (int)Dec(r, "ComplianceWindowDays", 90m),
+   141	                GratuityHeadID              = NullableLong(r, "GratuityHeadID"),
+   142	                LeaveEncashHeadID           = NullableLong(r, "LeaveEncashHeadID"),
+   143	                NoticePayHeadID             = NullableLong(r, "NoticePayHeadID"),
+   144	                NoticeRecoveryHeadID        = NullableLong(r, "NoticeRecoveryHeadID"),
+   145	                AssetRecoveryHeadID         = NullableLong(r, "AssetRecoveryHeadID"),
+   146	                LoanRecoveryHeadID          = NullableLong(r, "LoanRecoveryHeadID"),
+   147	            };
+   148	        }
+   149	    }
+   150	
+   151	    // =========================================================================
+   152	    //  The calculation
+   153	    // =========================================================================
+   154	
+   155	    /// <summary>What one settlement line works out to, plus how it was worked out.</summary>
+   156	    public sealed class Component
+   157	    {
+   158	        public string ComponentType;
+   159	        public string AddDeduct;
+   160	        public decimal? Days;
+   161	        public decimal? Rate;
+   162	        public decimal Amount;
+   163	        public string Remarks;
+   164	        public long? SalaryHeadMasterID;
+   165	        public int SortOrder;
+   166	    }
+   167	
+   168	    public sealed class Result
+   169	    {
+   170	        public List<Component> Components = new List<Component>();
+   171	        public decimal TotalEarnings;
+   172	        public decimal TotalDeductions;
+   173	        public decimal NetPayable;
+   174	        public decimal PerDayRate;
+   175	        public string PerDayRateBasis;
+   176	        /// <summary>Things the user must know about, in plain words. Shown on the screen
+   177	        /// rather than swallowed, because a settlement that quietly skipped gratuity looks
+   178	        /// identical to one where gratuity is genuinely zero.</summary>
+   179	        public List<string> Notes = new List<string>();
+   180	    }
+   181	
+   182	    /// <summary>
+   183	    /// Computes every component, REPLACES the auto-generated detail rows and updates the
+   184	    /// header totals. Manually added rows (IsAuto = 0) are left alone — someone typed
+   185	    /// those, and a recalculation must not throw away a human's figure.
+   186	    ///
+   187	    /// Caller owns the transaction.
+   188	    /// </summary>
+   189	    public static Result Calculate(SqlConnection conn, SqlTransaction tx, long caseId,
+   190	                                   int userId, bool persist)
+   191	    {
+   192	        DataRow head = LoadCaseRow(conn, tx, caseId);
+   193	        if (head == null)
+   194	            throw new InvalidOperationException("F&F case " + caseId + " was not found.");
+   195	
+   196	        long companyId = Convert.ToInt64(head["CompanyMasterID"]);
+   197	        long employeeId = Convert.ToInt64(head["EmployeeMasterID"]);
+   198	        Config cfg = LoadConfig(conn, tx, companyId);
+   199	
+   200	        var result = new Result();
+   201	
+   202	        // --- salary structure -------------------------------------------------
+   203	        decimal basic, gross, ctc;
+   204	        LoadSalaryStructure(conn, tx, employeeId, out basic, out gross, out ctc);
+   205	        if (basic == 0 && gross == 0 && ctc == 0)
+   206	            result.Notes.Add("This employee has no basic salary record, so every rate-based "
+   207	                           + "component works out to zero.");
+   208	
+   209	        // --- per-day rate -----------------------------------------------------
+   210	        decimal rateBase = PickBase(cfg.PerDayRateBase, basic, gross, ctc);
+   211	        string divisorNote;
+   212	        decimal divisor = ResolveDivisor(conn, tx, cfg, head, out divisorNote);
+   213	        if (divisorNote != null) result.Notes.Add(divisorNote);
+   214	
+   215	        result.PerDayRate = divisor > 0 ? Round2(rateBase / divisor) : 0m;
+   216	        result.PerDayRateBasis = cfg.PerDayRateBase + " / " +
+   217	            (cfg.PerDayRateDivisorType == "Fixed"
+   218	                ? cfg.PerDayRateDivisorValue.ToString("0.##")
+   219	                : cfg.PerDayRateDivisorType + " (" + divisor.ToString("0.##") + ")");
+   220	
+   221	        // --- final month salary, for the statement only ------------------------
+   222	        AddFinalSalary(conn, tx, head, result);
+   223	
+   224	        // --- leave encashment --------------------------------------------------
+   225	        AddLeaveEncashment(conn, tx, cfg, employeeId, result);
+   226	
+   227	        // --- gratuity ----------------------------------------------------------
+   228	        AddGratuity(cfg, head, basic, gross, ctc, result);
+   229	
+   230	        // --- notice shortfall recovery -----------------------------------------
+   231	        AddNoticeRecovery(cfg, head, result);
+   232	
+   233	        // --- clearance recoveries ----------------------------------------------
+   234	        AddClearanceRecoveries(conn, tx, cfg, caseId, result);
+   235	
+   236	        // --- totals -------------------------------------------------------------
+   237	        foreach (Component c in result.Components)
+   238	        {
+   239	            if (c.AddDeduct == Add) result.TotalEarnings += c.Amount;
+   240	            else result.TotalDeductions += c.Amount;
+   241	        }
+   242	        result.NetPayable = result.TotalEarnings - result.TotalDeductions;
+   243	
+   244	        if (result.NetPayable < 0)
+   245	            result.Notes.Add("Deductions exceed earnings, so this settlement is RECOVERABLE "
+   246	                           + "from the employee rather than payable to them.");
+   247	
+   248	        if (persist) Persist(conn, tx, caseId, userId, result);
+   249	
+   250	        return result;
+   251	    }
+   252	
+   253	    private static DataRow LoadCaseRow(SqlConnection conn, SqlTransaction tx, long caseId)
+   254	    {
+   255	        using (var cmd = new SqlCommand(
+   256	            "SELECT * FROM dbo.HR_FNFSettlement WHERE FNFSettlementID = @Id AND Status = 1", conn, tx))
+   257	        {
+   258	            cmd.Parameters.AddWithValue("@Id", caseId);
+   259	            var dt = new DataTable();
+   260	            using (var da = new SqlDataAdapter(cmd)) da.Fill(dt);
+   261	            return dt.Rows.Count > 0 ? dt.Rows[0] : null;
+   262	        }
+   263	    }
+   264	
+   265	    /// <summary>Latest basic-salary record. Newest FromDate wins, which is what
+   266	    /// SalaryGenerate's own period join resolves to for a final month.</summary>
+   267	    private static void LoadSalaryStructure(SqlConnection conn, SqlTransaction tx, long employeeId,
+   268	                                            out decimal basic, out decimal gross, out decimal ctc)
+   269	    {
+   270	        basic = gross = ctc = 0m;
+   271	
+   272	        using (var cmd = new SqlCommand(@"
+   273	            SELECT TOP 1 ISNULL(BasicAmount,0), ISNULL(GrossAmount,0), ISNULL(CTCAmount,0)
+   274	            FROM   dbo.HR_EmployeeBasicSalary
+   275	            WHERE  EmployeeMasterID = @Emp
+   276	            ORDER  BY FromDate DESC", conn, tx))
+   277	        {
+   278	            cmd.Parameters.AddWithValue("@Emp", employeeId);
+   279	            using (SqlDataReader rd = cmd.ExecuteReader())
+   280	            {
+   281	                if (rd.Read())
+   282	                {
+   283	                    basic = rd.GetDecimal(0);
+   284	                    gross = rd.GetDecimal(1);
+   285	                    ctc = rd.GetDecimal(2);
+   286	                }
+   287	            }
+   288	        }
+   289	    }
+   290	
+   291	    private static decimal PickBase(string which, decimal basic, decimal gross, decimal ctc)
+   292	    {
+   293	        switch ((which ?? "Basic").Trim().ToLowerInvariant())
+   294	        {
+   295	            case "gross":    return gross;
+   296	            case "ctc":      return ctc;
+   297	            case "basic+da": return basic;   // no separate DA column in this schema
+   298	            default:         return basic;
+   299	        }
+   300	    }
+   301	
+   302	    /// <summary>
+   303	    /// Fixed uses the configured number. MonthDays / WorkingDays read the LAST WORKING
+   304	    /// month's HR_MonthlyAttendance, and fall back to the fixed value with a note when
+   305	    /// there is no such row — a divisor of zero would make every rate-based component
+   306	    /// zero without saying why.
+   307	    /// </summary>
+   308	    private static decimal ResolveDivisor(SqlConnection conn, SqlTransaction tx, Config cfg,
+   309	                                          DataRow head, out string note)
+   310	    {
+   311	        note = null;
+   312	        string type = (cfg.PerDayRateDivisorType ?? "Fixed").Trim();
+   313	
+   314	        if (string.Equals(type, "Fixed", StringComparison.OrdinalIgnoreCase))
+   315	            return cfg.PerDayRateDivisorValue > 0 ? cfg.PerDayRateDivisorValue : 26m;
+   316	
+   317	        if (head["LastWorkingDate"] == DBNull.Value)
+   318	        {
+   319	            note = "Per-day rate is configured on " + type + ", but this case has no last "
+   320	                 + "working day, so the fixed divisor of " + cfg.PerDayRateDivisorValue
+   321	                 + " was used instead.";
+   322	            return cfg.PerDayRateDivisorValue > 0 ? cfg.PerDayRateDivisorValue : 26m;
+   323	        }
+   324	
+   325	        DateTime lwd = Convert.ToDateTime(head["LastWorkingDate"]);
+   326	        string column = string.Equals(type, "WorkingDays", StringComparison.OrdinalIgnoreCase)
+   327	            ? "WorkingDays" : "MonthDays";
+   328	
+   329	        using (var cmd = new SqlCommand(
+   330	            "SELECT TOP 1 ISNULL(" + column + ", 0) FROM dbo.HR_MonthlyAttendance " +
+   331	            "WHERE EmployeeMasterID = @Emp AND AttendMonth = @M AND AttendYear = @Y", conn, tx))
+   332	        {
+   333	            cmd.Parameters.AddWithValue("@Emp", Convert.ToInt64(head["EmployeeMasterID"]));
+   334	            cmd.Parameters.AddWithValue("@M", lwd.Month);
+   335	            cmd.Parameters.AddWithValue("@Y", lwd.Year);
+   336	
+   337	            object value = cmd.ExecuteScalar();
+   338	            decimal days = (value == null || value == DBNull.Value) ? 0m : Convert.ToDecimal(value);
+   339	
+   340	            if (days <= 0)
+   341	            {
+   342	                note = "Per-day rate is configured on " + type + ", but the final month's "
+   343	                     + "attendance is not confirmed yet, so the fixed divisor of "
+   344	                     + cfg.PerDayRateDivisorValue + " was used instead.";
+   345	                return cfg.PerDayRateDivisorValue > 0 ? cfg.PerDayRateDivisorValue : 26m;
+   346	            }
+   347	
+   348	            return days;
+   349	        }
+   350	    }
+   351	
+   352	    /// <summary>
+   353	    /// The final month's pay, read from the confirmed payroll run. Shown on the statement
+   354	    /// but never pushed — payroll pays it. When the run does not exist yet the line is
+   355	    /// still added at zero with a note, so the reason a net figure looks low is visible
+   356	    /// rather than a mystery.
+   357	    /// </summary>
+   358	    private static void AddFinalSalary(SqlConnection conn, SqlTransaction tx, DataRow head, Result result)
+   359	    {
+   360	        if (head["LastWorkingDate"] == DBNull.Value)
+   361	        {
+   362	            result.Notes.Add("No last working day is set, so the final month's salary could not "
+   363	                           + "be identified.");
+   364	            return;
+   365	        }
+   366	
+   367	        DateTime lwd = Convert.ToDateTime(head["LastWorkingDate"]);
+   368	
+   369	        using (var cmd = new SqlCommand(@"
+   370	            SELECT TOP 1 ISNULL(CalculatedNetPay, 0)
+   371	            FROM   dbo.HR_PayrollSalaryConfirmation
+   372	            WHERE  EmployeeMasterID = @Emp AND PayrollMonth = @M AND PayrollYear = @Y
+   373	            ORDER  BY Oid DESC", conn, tx))
+   374	        {
+   375	            cmd.Parameters.AddWithValue("@Emp", Convert.ToInt64(head["EmployeeMasterID"]));
+   376	            cmd.Parameters.AddWithValue("@M", lwd.Month);
+   377	            cmd.Parameters.AddWithValue("@Y", lwd.Year);
+   378	
+   379	            object value = cmd.ExecuteScalar();
+   380	            decimal net = (value == null || value == DBNull.Value) ? 0m : Convert.ToDecimal(value);
+   381	
+   382	            if (net <= 0)
+   383	            {
+   384	                result.Notes.Add("The final month's salary (" + lwd.ToString("MM/yyyy") + ") is not "
+   385	                               + "confirmed yet, so it shows as zero. Run Confirm Pay and Salary "
+   386	                               + "Generate for that month, then recalculate.");
+   387	            }
+   388	
+   389	            result.Components.Add(new Component
+   390	            {
+   391	                ComponentType = CompFinalSalary,
+   392	                AddDeduct = Add,
+   393	                Amount = Round2(net),
+   394	                Remarks = "Final month salary for " + lwd.ToString("MM/yyyy")
+   395	                        + " (paid by payroll, shown here for the total)",
+   396	                SortOrder = 10,
+   397	            });
+   398	        }
+   399	    }
+   400	
+   401	    /// <summary>
+   402	    /// Encashable leave balance × per-day rate. Only leave types flagged IsEncashable
+   403	    /// count: nothing else in the schema answers that question, and reusing CarryForward
+   404	    /// or IsPaidLeave for it would be wrong — those are different questions.
+   405	    /// </summary>
+   406	    private static void AddLeaveEncashment(SqlConnection conn, SqlTransaction tx, Config cfg,
+   407	                                            long employeeId, Result result)
+   408	    {
+   409	        decimal days = 0m;
+   410	        int types = 0;
+   411	
+   412	        using (var cmd = new SqlCommand(@"
+   413	            SELECT ISNULL(SUM(EWL.Balance), 0), COUNT(*)
+   414	            FROM   dbo.HR_EmployeeWiseLeave EWL
+   415	            INNER  JOIN dbo.HR_LeaveMaster LM ON LM.LeaveMasterID = EWL.LeaveMasterID
+   416	            WHERE  EWL.EmployeeMasterID = @Emp
+   417	              AND  ISNULL(EWL.IsActive, 1) = 1
+   418	              AND  ISNULL(LM.IsEncashable, 0) = 1
+   419	              AND  ISNULL(EWL.Balance, 0) > 0", conn, tx))
+   420	        {
+   421	            cmd.Parameters.AddWithValue("@Emp", employeeId);
+   422	            using (SqlDataReader rd = cmd.ExecuteReader())
+   423	            {
+   424	                if (rd.Read()) { days = rd.GetDecimal(0); types = rd.GetInt32(1); }
+   425	            }
+   426	        }
+   427	
+   428	        if (types == 0)
+   429	        {
+   430	            result.Notes.Add("No leave type is marked encashable, so leave encashment is zero. "
+   431	                           + "Tick Is Encashable on the leave types that convert to money in "
+   432	                           + "Leave Master.");
+   433	            return;
+   434	        }
+   435	
+   436	        string capNote = string.Empty;
+   437	        if (cfg.EncashmentCapDays.HasValue && days > cfg.EncashmentCapDays.Value)
+   438	        {
+   439	            capNote = " (capped from " + days.ToString("0.##") + " by the "
+   440	                    + cfg.EncashmentCapDays.Value.ToString("0.##") + "-day limit)";
+   441	            days = cfg.EncashmentCapDays.Value;
+   442	        }
+   443	
+   444	        result.Components.Add(new Component
+   445	        {
+   446	            ComponentType = CompLeaveEncashment,
+   447	            AddDeduct = Add,
+   448	            Days = days,
+   449	            Rate = result.PerDayRate,
+   450	            Amount = Round2(days * result.PerDayRate),
+   451	            Remarks = days.ToString("0.##") + " day(s) across " + types + " leave type(s) at "
+   452	                    + result.PerDayRate.ToString("n2") + capNote,
+   453	            SalaryHeadMasterID = cfg.LeaveEncashHeadID,
+   454	            SortOrder = 20,
+   455	        });
+   456	    }
+   457	
+   458	    /// <summary>
+   459	    /// Gratuity = base / divisor × days-per-year × completed years, all four from config.
+   460	    ///
+   461	    /// Disabled by default on every company: a settlement must never quietly pay gratuity
+   462	    /// nobody configured, and the eligibility rule is country-specific.
+   463	    /// </summary>
+   464	    private static void AddGratuity(Config cfg, DataRow head, decimal basic, decimal gross,
+   465	                                     decimal ctc, Result result)
+   466	    {
+   467	        if (!cfg.GratuityEnabled)
+   468	        {
+   469	            result.Notes.Add("Gratuity is switched off for this company, so it is not included. "
+   470	                           + "Turn it on in F&F Configuration once the rule is agreed.");
+   471	            return;
+   472	        }
+   473	
+   474	        if (head["DateOfJoining"] == DBNull.Value || head["LastWorkingDate"] == DBNull.Value)
+   475	        {
+   476	            result.Notes.Add("Gratuity needs both the joining date and the last working day; "
+   477	                           + "one of them is missing, so it is not included.");
+   478	            return;
+   479	        }
+   480	
+   481	        DateTime doj = Convert.ToDateTime(head["DateOfJoining"]);
+   482	        DateTime lwd = Convert.ToDateTime(head["LastWorkingDate"]);
+   483	
+   484	        // Completed years of service. Whole years only - a part year is not a year of
+   485	        // service under any gratuity rule this supports.
+   486	        decimal servedYears = (decimal)((lwd - doj).TotalDays / 365.25);
+   487	        int completedYears = (int)Math.Floor(servedYears);
+   488	
+   489	        if (servedYears < cfg.GratuityEligibleYears)
+   490	        {
+   491	            result.Notes.Add("Service is " + servedYears.ToString("0.0") + " years, below the "
+   492	                           + cfg.GratuityEligibleYears.ToString("0.##")
+   493	                           + "-year gratuity threshold, so gratuity is zero.");
+   494	            return;
+   495	        }
+   496	
+   497	        decimal gratuityBase = PickBase(cfg.GratuityBase, basic, gross, ctc);
+   498	        decimal divisor = cfg.GratuityDivisor > 0 ? cfg.GratuityDivisor : 26m;
+   499	        decimal amount = Round2(gratuityBase / divisor * cfg.GratuityDaysPerYear * completedYears);
+   500	
+   501	        result.Components.Add(new Component
+   502	        {
+   503	            ComponentType = CompGratuity,
+   504	            AddDeduct = Add,
+   505	            Days = cfg.GratuityDaysPerYear * completedYears,
+   506	            Rate = Round2(gratuityBase / divisor),
+   507	            Amount = amount,
+   508	            Remarks = completedYears + " completed year(s) x " + cfg.GratuityDaysPerYear.ToString("0.##")
+   509	                    + " day(s) at " + cfg.GratuityBase + "/" + divisor.ToString("0.##"),
+   510	            SalaryHeadMasterID = cfg.GratuityHeadID,
+   511	            SortOrder = 30,
+   512	        });
+   513	    }
+   514	
+   515	    /// <summary>
+   516	    /// Notice shortfall × per-day rate. Skipped entirely when the required notice is
+   517	    /// unknown: NoticePeriodDays is NULL on almost every employee here, and treating
+   518	    /// "nobody has said" as zero days would silently recover nothing — or, worse, recover
+   519	    /// a full notice period from someone who served it.
+   520	    /// </summary>
+   521	    private static void AddNoticeRecovery(Config cfg, DataRow head, Result result)
+   522	    {
+   523	        if (head["NoticeDaysRequired"] == DBNull.Value)
+   524	        {
+   525	            result.Notes.Add("Notice period is not recorded for this employee, so no notice "
+   526	                           + "recovery was calculated. Set Notice Period Days on the employee "
+   527	                           + "if a shortfall should be recovered.");
+   528	            return;
+   529	        }
+   530	
+   531	        if (head["ResignDate"] == DBNull.Value || head["LastWorkingDate"] == DBNull.Value)
+   532	            return;
+   533	
+   534	        int required = Convert.ToInt32(head["NoticeDaysRequired"]);
+   535	        DateTime resign = Convert.ToDateTime(head["ResignDate"]);
+   536	        DateTime lwd = Convert.ToDateTime(head["LastWorkingDate"]);
+   537	
+   538	        int served = (int)(lwd.Date - resign.Date).TotalDays;
+   539	        if (served < 0) served = 0;
+   540	
+   541	        int shortfall = required - served;
+   542	        if (shortfall <= 0) return;
+   543	
+   544	        result.Components.Add(new Component
+   545	        {
+   546	            ComponentType = CompNoticeRecovery,
+   547	            AddDeduct = Deduct,
+   548	            Days = shortfall,
+   549	            Rate = result.PerDayRate,
+   550	            Amount = Round2(shortfall * result.PerDayRate),
+   551	            Remarks = shortfall + " day(s) short of " + required + " required (" + served + " served)",
+   552	            SalaryHeadMasterID = cfg.NoticeRecoveryHeadID,
+   553	            SortOrder = 40,
+   554	        });
+   555	    }
+   556	
+   557	    /// <summary>
+   558	    /// Confirmed clearance recoveries, grouped so the statement shows one line per kind
+   559	    /// rather than one per asset. Waived rows are excluded — they are kept for the audit
+   560	    /// trail, not for the money.
+   561	    /// </summary>
+   562	    private static void AddClearanceRecoveries(SqlConnection conn, SqlTransaction tx, Config cfg,
+   563	                                                long caseId, Result result)
+   564	    {
+   565	        var rows = new List<object[]>();
+   566	        using (var cmd = new SqlCommand(@"
+   567	            SELECT DuesType, SUM(Amount) AS Amount, COUNT(*) AS Cnt
+   568	            FROM   dbo.HR_FNFRecovery
+   569	            WHERE  FNFSettlementID = @Id AND Status = 1 AND RecoveryStatus = 'Confirmed'
+   570	            GROUP  BY DuesType
+   571	            ORDER  BY DuesType", conn, tx))
+   572	        {
+   573	            cmd.Parameters.AddWithValue("@Id", caseId);
+   574	            using (SqlDataReader rd = cmd.ExecuteReader())
+   575	                while (rd.Read())
+   576	                    rows.Add(new object[] { rd.GetString(0), rd.GetDecimal(1), rd.GetInt32(2) });
+   577	        }
+   578	
+   579	        int sort = 50;
+   580	        bool sawZeroAsset = false;
+   581	
+   582	        foreach (object[] row in rows)
+   583	        {
+   584	            string dues = Convert.ToString(row[0]);
+   585	            decimal amount = Convert.ToDecimal(row[1]);
+   586	            int count = Convert.ToInt32(row[2]);
+   587	
+   588	            string component;
+   589	            if (string.Equals(dues, "Loan", StringComparison.OrdinalIgnoreCase) ||
+   590	                string.Equals(dues, "Advance", StringComparison.OrdinalIgnoreCase))
+   591	                component = CompLoanRecovery;
+   592	            else if (dues.StartsWith("Asset", StringComparison.OrdinalIgnoreCase))
+   593	                component = CompAssetRecovery;
+   594	            else
+   595	                component = CompOtherRecovery;
+   596	
+   597	            if (component == CompAssetRecovery && !cfg.RecoverAssetsOnExit)
+   598	            {
+   599	                result.Notes.Add("Asset recovery is switched off for this company, so "
+   600	                               + dues + " was not deducted.");
+   601	                continue;
+   602	            }
+   603	
+   604	            if (amount <= 0)
+   605	            {
+   606	                // An auto-discovered asset row carries no amount on purpose - what an
+   607	                // unreturned laptop is worth is a human decision.
+   608	                if (component == CompAssetRecovery) sawZeroAsset = true;
+   609	                continue;
+   610	            }
+   611	
+   612	            result.Components.Add(new Component
+   613	            {
+   614	                ComponentType = component,
+   615	                AddDeduct = Deduct,
+   616	                Amount = Round2(amount),
+   617	                Remarks = dues + " (" + count + " line(s)) from clearance reconciliation",
+   618	                SalaryHeadMasterID = cfg.HeadFor(component),
+   619	                SortOrder = sort++,
+   620	            });
+   621	        }
+   622	
+   623	        if (sawZeroAsset)
+   624	            result.Notes.Add("One or more unreturned assets are listed with no amount, so nothing "
+   625	                           + "was deducted for them. Put a value on the Clearance Recovery tab, or "
+   626	                           + "waive the row.");
+   627	    }
+   628	
+   629	    // =========================================================================
+   630	    //  Persist
+   631	    // =========================================================================
+   632	
+   633	    /// <summary>
+   634	    /// Replaces the AUTO detail rows and updates the header totals. Manual rows survive:
+   635	    /// somebody typed those, and a recalculation must not silently discard a human's figure.
+   636	    /// </summary>
+   637	    private static void Persist(SqlConnection conn, SqlTransaction tx, long caseId, int userId, Result result)
+   638	    {
+   639	        using (var cmd = new SqlCommand(
+   640	            "DELETE FROM dbo.HR_FNFSettlementDetail WHERE FNFSettlementID = @Id AND IsAuto = 1", conn, tx))
+   641	        {
+   642	            cmd.Parameters.AddWithValue("@Id", caseId);
+   643	            cmd.ExecuteNonQuery();
+   644	        }
+   645	
+   646	        foreach (Component c in result.Components)
+   647	        {
+   648	            using (var cmd = new SqlCommand(@"
+   649	                INSERT INTO dbo.HR_FNFSettlementDetail
+   650	                    (FNFSettlementID, ComponentType, SalaryHeadMasterID, [Add/Deduct],
+   651	                     Days, Rate, Amount, IsAuto, Remarks, SortOrder)
+   652	                VALUES (@Id, @Type, @Head, @AddDeduct, @Days, @Rate, @Amount, 1, @Remarks, @Sort)", conn, tx))
+   653	            {
+   654	                cmd.Parameters.AddWithValue("@Id", caseId);
+   655	                cmd.Parameters.AddWithValue("@Type", c.ComponentType);
+   656	                cmd.Parameters.AddWithValue("@Head", (object)c.SalaryHeadMasterID ?? DBNull.Value);
+   657	                cmd.Parameters.AddWithValue("@AddDeduct", c.AddDeduct);
+   658	                cmd.Parameters.AddWithValue("@Days", (object)c.Days ?? DBNull.Value);
+   659	                cmd.Parameters.AddWithValue("@Rate", (object)c.Rate ?? DBNull.Value);
+   660	                cmd.Parameters.AddWithValue("@Amount", c.Amount);
+   661	                cmd.Parameters.AddWithValue("@Remarks", (object)c.Remarks ?? DBNull.Value);
+   662	                cmd.Parameters.AddWithValue("@Sort", c.SortOrder);
+   663	                cmd.ExecuteNonQuery();
+   664	            }
+   665	        }
+   666	
+   667	        // Manual rows are part of the totals even though they are not recomputed.
+   668	        decimal manualAdd = 0m, manualDeduct = 0m;
+   669	        using (var cmd = new SqlCommand(@"
+   670	            SELECT ISNULL(SUM(CASE WHEN [Add/Deduct] = 'Add'    THEN Amount ELSE 0 END), 0),
+   671	                   ISNULL(SUM(CASE WHEN [Add/Deduct] = 'Deduct' THEN Amount ELSE 0 END), 0)
+   672	            FROM   dbo.HR_FNFSettlementDetail
+   673	            WHERE  FNFSettlementID = @Id AND IsAuto = 0", conn, tx))
+   674	        {
+   675	            cmd.Parameters.AddWithValue("@Id", caseId);
+   676	            using (SqlDataReader rd = cmd.ExecuteReader())
+   677	                if (rd.Read()) { manualAdd = rd.GetDecimal(0); manualDeduct = rd.GetDecimal(1); }
+   678	        }
+   679	
+   680	        result.TotalEarnings += manualAdd;
+   681	        result.TotalDeductions += manualDeduct;
+   682	        result.NetPayable = result.TotalEarnings - result.TotalDeductions;
+   683	
+   684	        Component encash = result.Components.Find(x => x.ComponentType == CompLeaveEncashment);
+   685	        Component gratuity = result.Components.Find(x => x.ComponentType == CompGratuity);
+   686	
+   687	        using (var cmd = new SqlCommand(@"
+   688	            UPDATE dbo.HR_FNFSettlement
+   689	            SET    PerDayRate         = @Rate,
+   690	                   PerDayRateBasis    = @Basis,
+   691	                   LeaveEncashDays    = @EncashDays,
+   692	                   LeaveEncashAmount  = @EncashAmt,
+   693	                   GratuityAmount     = @Gratuity,
+   694	                   TotalEarnings      = @Earnings,
+   695	                   TotalDeductions    = @Deductions,
+   696	                   NetPayable         = @Net,
+   697	                   ActualCalcStartDate = ISNULL(ActualCalcStartDate, CAST(GETDATE() AS date)),
+   698	                   EditUserMasterID   = @UserID,
+   699	                   EditUserDateTime   = GETDATE()
+   700	            WHERE  FNFSettlementID = @Id", conn, tx))

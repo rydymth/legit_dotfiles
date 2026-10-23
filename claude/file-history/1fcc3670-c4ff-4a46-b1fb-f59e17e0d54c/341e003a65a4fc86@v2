@@ -1,0 +1,176 @@
+/* ============================================================================================
+   Cleanup: duplicate HR_DepartmentMaster / HR_DesignationMaster rows.
+
+   Duplicate = same CompanyMasterID + same name, ignoring case and leading/trailing spaces.
+   Keeper   = the active one (Status = 1) with the lowest id; every other row in the group goes.
+
+   Nothing is deleted while it is still pointed at: every reference to a duplicate is first moved
+   to its keeper, then the duplicate is deleted.
+     - every column named DepartmentMasterID / FromDepartmentMasterID / ToDepartmentMasterID
+       (and the Designation equivalents), in every table, plus any column with a declared FK
+       to either master
+     - HR_ApprovalConfigApprover group selectors (SelectorType 'department'/'designation' store
+       the id in SelectorId, not a named column)
+     - rows that would collide with a unique key after the move are dropped first:
+       HR_FNFClearanceDepartment (CompanyMasterID, DepartmentMasterID) and identical
+       HR_ApprovalConfigApprover selector rows
+
+   RUN IT TWICE:
+     1. As is (@Apply = 0): prints the duplicate groups, every column it would touch with row
+        counts, and any column whose name LOOKS like a department/designation id but is not
+        handled - then rolls everything back.
+     2. Review that output, set @Apply = 1, run again to commit.
+
+   Any error (e.g. an unexpected unique key) rolls the whole thing back - SET XACT_ABORT ON.
+   ============================================================================================ */
+SET NOCOUNT ON;
+SET XACT_ABORT ON;
+
+DECLARE @Apply bit = 0;   -- <-- 0 = preview + rollback, 1 = commit
+
+BEGIN TRAN;
+
+/* ---- 1. Duplicate -> keeper maps ------------------------------------------------------------ */
+IF OBJECT_ID('tempdb..#DeptMap') IS NOT NULL DROP TABLE #DeptMap;
+IF OBJECT_ID('tempdb..#DesgMap') IS NOT NULL DROP TABLE #DesgMap;
+
+;WITH ranked AS (
+    SELECT DepartmentMasterID AS Id, CompanyMasterID,
+           UPPER(LTRIM(RTRIM(DepartmentName))) AS NameKey,
+           ROW_NUMBER() OVER (PARTITION BY CompanyMasterID, UPPER(LTRIM(RTRIM(DepartmentName)))
+                              ORDER BY CASE WHEN Status = 1 THEN 0 ELSE 1 END, DepartmentMasterID) AS rn
+    FROM HR_DepartmentMaster
+)
+SELECT d.Id AS DupId, k.Id AS KeepId, d.CompanyMasterID, d.NameKey
+INTO   #DeptMap
+FROM   ranked d
+JOIN   ranked k ON k.CompanyMasterID = d.CompanyMasterID AND k.NameKey = d.NameKey AND k.rn = 1
+WHERE  d.rn > 1;
+
+;WITH ranked AS (
+    SELECT DesignationMasterID AS Id, CompanyMasterID,
+           UPPER(LTRIM(RTRIM(DesignationName))) AS NameKey,
+           ROW_NUMBER() OVER (PARTITION BY CompanyMasterID, UPPER(LTRIM(RTRIM(DesignationName)))
+                              ORDER BY CASE WHEN Status = 1 THEN 0 ELSE 1 END, DesignationMasterID) AS rn
+    FROM HR_DesignationMaster
+)
+SELECT d.Id AS DupId, k.Id AS KeepId, d.CompanyMasterID, d.NameKey
+INTO   #DesgMap
+FROM   ranked d
+JOIN   ranked k ON k.CompanyMasterID = d.CompanyMasterID AND k.NameKey = d.NameKey AND k.rn = 1
+WHERE  d.rn > 1;
+
+SELECT 'Department' AS Master, CompanyMasterID, NameKey AS Name, KeepId, DupId FROM #DeptMap
+UNION ALL
+SELECT 'Designation', CompanyMasterID, NameKey, KeepId, DupId FROM #DesgMap
+ORDER BY 1, 2, 3, 5;
+
+/* ---- 2. Every column to repoint ------------------------------------------------------------- */
+IF OBJECT_ID('tempdb..#Targets') IS NOT NULL DROP TABLE #Targets;
+
+SELECT DISTINCT s.name AS SchemaName, t.name AS TableName, c.name AS ColumnName,
+       CASE WHEN c.name LIKE '%Designation%' OR fk.ref_table = 'HR_DesignationMaster' THEN 'Designation' ELSE 'Department' END AS Master
+INTO   #Targets
+FROM   sys.columns c
+JOIN   sys.tables  t ON t.object_id = c.object_id
+JOIN   sys.schemas s ON s.schema_id = t.schema_id
+OUTER  APPLY (
+    SELECT TOP 1 OBJECT_NAME(fkc.referenced_object_id) AS ref_table
+    FROM   sys.foreign_key_columns fkc
+    WHERE  fkc.parent_object_id = c.object_id AND fkc.parent_column_id = c.column_id
+      AND  OBJECT_NAME(fkc.referenced_object_id) IN ('HR_DepartmentMaster', 'HR_DesignationMaster')
+) fk
+WHERE  t.is_ms_shipped = 0
+  AND  t.name NOT IN ('HR_DepartmentMaster', 'HR_DesignationMaster')
+  AND  c.is_computed = 0
+  AND  TYPE_NAME(c.system_type_id) IN ('bigint', 'int')
+  AND  (c.name IN ('DepartmentMasterID', 'FromDepartmentMasterID', 'ToDepartmentMasterID',
+                   'DesignationMasterID', 'FromDesignationMasterID', 'ToDesignationMasterID')
+        OR fk.ref_table IS NOT NULL);
+
+-- Columns that look related but are NOT touched - check these by hand.
+SELECT s.name AS SchemaName, t.name AS TableName, c.name AS ColumnName, 'NOT remapped - review' AS Note
+FROM   sys.columns c
+JOIN   sys.tables  t ON t.object_id = c.object_id
+JOIN   sys.schemas s ON s.schema_id = t.schema_id
+WHERE  t.is_ms_shipped = 0
+  AND  t.name NOT IN ('HR_DepartmentMaster', 'HR_DesignationMaster')
+  AND  (c.name LIKE '%Dept%Id' OR c.name LIKE '%Department%Id' OR c.name LIKE '%Designation%Id')
+  AND  NOT EXISTS (SELECT 1 FROM #Targets x WHERE x.SchemaName = s.name AND x.TableName = t.name AND x.ColumnName = c.name)
+ORDER BY 2, 3;
+
+/* ---- 3. Rows that would break a unique key once repointed ----------------------------------- */
+IF OBJECT_ID('dbo.HR_FNFClearanceDepartment') IS NOT NULL
+    DELETE c
+    FROM   HR_FNFClearanceDepartment c
+    JOIN   #DeptMap m ON m.DupId = c.DepartmentMasterID
+    WHERE  EXISTS (SELECT 1 FROM HR_FNFClearanceDepartment k
+                   WHERE k.CompanyMasterID = c.CompanyMasterID AND k.DepartmentMasterID = m.KeepId);
+
+IF COL_LENGTH('dbo.HR_ApprovalConfigApprover', 'SelectorType') IS NOT NULL
+BEGIN
+    EXEC sp_executesql N'
+        DELETE a
+        FROM   HR_ApprovalConfigApprover a
+        JOIN   #DeptMap m ON a.SelectorType = ''department'' AND a.SelectorId = m.DupId
+        WHERE  EXISTS (SELECT 1 FROM HR_ApprovalConfigApprover k
+                       WHERE k.ApprovalConfigId = a.ApprovalConfigId AND k.SelectorType = ''department'' AND k.SelectorId = m.KeepId);
+        DELETE a
+        FROM   HR_ApprovalConfigApprover a
+        JOIN   #DesgMap m ON a.SelectorType = ''designation'' AND a.SelectorId = m.DupId
+        WHERE  EXISTS (SELECT 1 FROM HR_ApprovalConfigApprover k
+                       WHERE k.ApprovalConfigId = a.ApprovalConfigId AND k.SelectorType = ''designation'' AND k.SelectorId = m.KeepId);
+
+        UPDATE a SET a.SelectorId = m.KeepId
+        FROM   HR_ApprovalConfigApprover a JOIN #DeptMap m ON a.SelectorType = ''department'' AND a.SelectorId = m.DupId;
+        PRINT ''HR_ApprovalConfigApprover department selectors repointed: '' + CAST(@@ROWCOUNT AS varchar(10));
+        UPDATE a SET a.SelectorId = m.KeepId
+        FROM   HR_ApprovalConfigApprover a JOIN #DesgMap m ON a.SelectorType = ''designation'' AND a.SelectorId = m.DupId;
+        PRINT ''HR_ApprovalConfigApprover designation selectors repointed: '' + CAST(@@ROWCOUNT AS varchar(10));';
+END
+
+/* ---- 4. Repoint every reference -------------------------------------------------------------- */
+DECLARE @schema sysname, @table sysname, @column sysname, @master varchar(20), @sql nvarchar(max);
+
+DECLARE target_cursor CURSOR LOCAL FAST_FORWARD FOR
+    SELECT SchemaName, TableName, ColumnName, Master FROM #Targets ORDER BY TableName, ColumnName;
+OPEN target_cursor;
+FETCH NEXT FROM target_cursor INTO @schema, @table, @column, @master;
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    SET @sql = N'UPDATE t SET t.' + QUOTENAME(@column) + N' = m.KeepId
+                 FROM ' + QUOTENAME(@schema) + N'.' + QUOTENAME(@table) + N' t
+                 JOIN ' + CASE @master WHEN 'Designation' THEN N'#DesgMap' ELSE N'#DeptMap' END + N' m
+                   ON m.DupId = t.' + QUOTENAME(@column) + N';
+                 DECLARE @n int = @@ROWCOUNT;
+                 IF @n > 0 PRINT ''' + REPLACE(@table, '''', '''''') + N'.' + @column + N' repointed: '' + CAST(@n AS varchar(10));';
+    EXEC sp_executesql @sql;
+    FETCH NEXT FROM target_cursor INTO @schema, @table, @column, @master;
+END
+CLOSE target_cursor;
+DEALLOCATE target_cursor;
+
+/* ---- 5. Delete the duplicates ---------------------------------------------------------------- */
+DELETE d FROM HR_DepartmentMaster d JOIN #DeptMap m ON m.DupId = d.DepartmentMasterID;
+PRINT 'HR_DepartmentMaster duplicates deleted: ' + CAST(@@ROWCOUNT AS varchar(10));
+
+DELETE d FROM HR_DesignationMaster d JOIN #DesgMap m ON m.DupId = d.DesignationMasterID;
+PRINT 'HR_DesignationMaster duplicates deleted: ' + CAST(@@ROWCOUNT AS varchar(10));
+
+/* ---- 6. Check: should return no rows -------------------------------------------------------- */
+SELECT 'Department' AS Master, CompanyMasterID, UPPER(LTRIM(RTRIM(DepartmentName))) AS Name, COUNT(*) AS Copies
+FROM HR_DepartmentMaster GROUP BY CompanyMasterID, UPPER(LTRIM(RTRIM(DepartmentName))) HAVING COUNT(*) > 1
+UNION ALL
+SELECT 'Designation', CompanyMasterID, UPPER(LTRIM(RTRIM(DesignationName))), COUNT(*)
+FROM HR_DesignationMaster GROUP BY CompanyMasterID, UPPER(LTRIM(RTRIM(DesignationName))) HAVING COUNT(*) > 1;
+
+IF @Apply = 1
+BEGIN
+    COMMIT;
+    PRINT 'COMMITTED.';
+END
+ELSE
+BEGIN
+    ROLLBACK;
+    PRINT 'PREVIEW ONLY - rolled back. Set @Apply = 1 to commit.';
+END

@@ -1,0 +1,151 @@
+import { Component, EventEmitter, Input, OnChanges, Output, ViewChild } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { firstValueFrom, isObservable, Observable } from 'rxjs';
+import { DxButtonModule, DxDataGridComponent, DxDataGridModule, DxPopupModule } from 'devextreme-angular';
+
+type SaveResult = Observable<unknown> | Promise<unknown>;
+
+/**
+ * Click-to-edit grid: click any editable cell, change it, and it saves on blur through `updateFn`.
+ * Unlike app-common-grid (edit icon -> parent popup), there is no row form here — the cell itself is
+ * the editor. Columns opt out with `allowEditing: false`; drop-downs come from the column's own
+ * DevExtreme `lookup` ({ dataSource, valueExpr, displayExpr }), validation from `validationRules`.
+ * Give editable columns `cssClass: 'editable-cell'` for the hover hint.
+ *
+ * Every save callback owns its own toast/reload. Reject or throw to put the cell back to its old value.
+ */
+@Component({
+  selector: 'app-editable-grid',
+  standalone: true,
+  imports: [CommonModule, DxDataGridModule, DxPopupModule, DxButtonModule],
+  templateUrl: './editable-grid.component.html',
+  styleUrls: ['../common-grid/common-grid.component.scss', './editable-grid.component.scss'],
+})
+export class EditableGridComponent implements OnChanges {
+  @Input() dataSource: unknown[] = [];
+  @Input() columns: any[] = [];
+  /** Row id field — required, it is what `updateFn`/`deleteFn` get back. */
+  @Input({ required: true }) keyExpr!: string;
+
+  @Input() gridTitle = '';
+  /** Font Awesome classes for the title icon. */
+  @Input() gridIcon = 'fa fa-pen-to-square';
+  @Input() gridSubtitle = '';
+  @Input() showRefreshButton = false;
+  @Input() refreshDisabled = false;
+  @Output() refresh = new EventEmitter<void>();
+
+  /** Master switch, e.g. false once a case leaves Draft. Off = plain read-only grid. */
+  @Input() editable = true;
+  @Input() allowAdding = false;
+  @Input() allowDeleting = false;
+  @Input() addButtonText = 'Add';
+  /** Values a newly added row starts with (drop-down defaults etc.). */
+  @Input() newRowDefaults: Record<string, unknown> = {};
+
+  /** One call per saved cell. `changes` = only the edited field(s); `fullRow` = old row merged with them. */
+  @Input() updateFn?: (key: any, changes: any, fullRow: any) => SaveResult;
+  @Input() insertFn?: (row: any) => SaveResult;
+  /** Called after the built-in delete confirmation. */
+  @Input() deleteFn?: (row: any) => SaveResult;
+  /** Per-row/per-cell lock, e.g. an auto-calculated line. Return false to keep the cell read-only. */
+  @Input() isCellEditable?: (row: any, dataField: string) => boolean;
+  @Input() onCellPrepared?: (e: any) => void;
+  /** DevExtreme's own hook, e.g. to give a column a free-text drop-down (`e.editorName = 'dxSelectBox'`). */
+  @Input() onEditorPreparing?: (e: any) => void;
+
+  @ViewChild(DxDataGridComponent) private dataGrid?: DxDataGridComponent;
+
+  /**
+   * Plain property rebuilt in ngOnChanges, never a getter — a new object on every change-detection
+   * pass makes dx-data-grid think its config changed and reset (see app-common-grid's notes).
+   */
+  editingConfig: Record<string, unknown> = {};
+
+  isDeletePopupVisible = false;
+  private rowPendingDelete: any = null;
+
+  ngOnChanges(): void {
+    this.editingConfig = {
+      mode: 'cell',
+      startEditAction: 'click',
+      selectTextOnEditStart: true,
+      allowUpdating: this.editable && !!this.updateFn,
+      allowAdding: false, // the toolbar button adds rows, not DevExtreme's own
+      allowDeleting: this.canDelete,
+      useIcons: true,
+      confirmDelete: false,
+    };
+  }
+
+  get canAdd(): boolean {
+    return this.editable && this.allowAdding && !!this.insertFn;
+  }
+
+  get canDelete(): boolean {
+    return this.editable && this.allowDeleting && !!this.deleteFn;
+  }
+
+  onAddClick(): void {
+    this.dataGrid?.instance.addRow();
+  }
+
+  onInitNewRow(e: any): void {
+    e.data = { ...this.newRowDefaults, ...e.data };
+  }
+
+  onEditingStart(e: any): void {
+    const field = e.column?.dataField;
+    if (this.isCellEditable && field && !this.isCellEditable(e.data, field)) e.cancel = true;
+  }
+
+  /**
+   * DevExtreme cancels the edit when `e.cancel` resolves to true. A failed save resolves true rather
+   * than rejecting (which would paint DevExtreme's own error row on top of the parent's toast) and
+   * drops the pending edit so the cell shows its old value again.
+   */
+  private runSave(e: any, call: () => SaveResult): void {
+    e.cancel = (async () => {
+      try {
+        const result = call();
+        await (isObservable(result) ? firstValueFrom(result) : result);
+        return false;
+      } catch {
+        e.component.cancelEditData();
+        return true;
+      }
+    })();
+  }
+
+  onRowUpdating(e: any): void {
+    const fn = this.updateFn;
+    if (!fn) return;
+    this.runSave(e, () => fn(e.key, e.newData, { ...e.oldData, ...e.newData }));
+  }
+
+  onRowInserting(e: any): void {
+    const fn = this.insertFn;
+    if (!fn) return;
+    this.runSave(e, () => fn(e.data));
+  }
+
+  onRowRemoving(e: any): void {
+    e.cancel = true;
+    this.rowPendingDelete = e.data;
+    this.isDeletePopupVisible = true;
+  }
+
+  confirmDelete(): void {
+    const row = this.rowPendingDelete;
+    this.cancelDelete();
+    if (!row || !this.deleteFn) return;
+    const result = this.deleteFn(row);
+    // Parent owns errors/toasts and the reload; swallow the rejection so it isn't unhandled.
+    (isObservable(result) ? firstValueFrom(result) : result).catch(() => {});
+  }
+
+  cancelDelete(): void {
+    this.isDeletePopupVisible = false;
+    this.rowPendingDelete = null;
+  }
+}

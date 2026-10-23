@@ -1,0 +1,580 @@
+public static class FNFSettlementService
+{
+    // Component types, matching HR_FNFSettlementDetail.ComponentType.
+    public const string CompFinalSalary     = "FinalSalary";
+    public const string CompLeaveEncashment = "LeaveEncashment";
+    public const string CompGratuity        = "Gratuity";
+    public const string CompNoticePay       = "NoticePay";
+    public const string CompNoticeRecovery  = "NoticeRecovery";
+    public const string CompLoanRecovery    = "LoanRecovery";
+    public const string CompAssetRecovery   = "AssetRecovery";
+    public const string CompOtherRecovery   = "OtherRecovery";
+
+    public const string Add = "Add";
+    public const string Deduct = "Deduct";
+
+    /// <summary>
+    /// The final month's salary is shown on the statement so the net figure means what
+    /// the employee expects, but it is PAID BY PAYROLL ITSELF — pushing it as an
+    /// additional head would pay it twice. This is the one component the push skips.
+    /// </summary>
+    public static bool IsPushable(string componentType)
+    {
+        return !string.Equals(componentType, CompFinalSalary, StringComparison.OrdinalIgnoreCase);
+    }
+
+    // =========================================================================
+    //  Configuration
+    // =========================================================================
+
+    public sealed class Config
+    {
+        public long CompanyMasterID;
+        public bool GratuityEnabled;
+        public decimal GratuityEligibleYears;
+        public decimal GratuityDaysPerYear;
+        public decimal GratuityDivisor;
+        public string GratuityBase;              // Basic | Basic+DA | Gross
+        public string PerDayRateBase;            // Basic | Gross | CTC
+        public string PerDayRateDivisorType;     // Fixed | MonthDays | WorkingDays
+        public decimal PerDayRateDivisorValue;
+            cmd.Parameters.AddWithValue("@Kind", kind);
+            cmd.Parameters.AddWithValue("@Code", code);
+            cmd.Parameters.AddWithValue("@Name", name);
+            cmd.Parameters.AddWithValue("@Actual", (object)actualValue ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("@Sort", sortOrder);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    public static decimal AmountOf(Result result, string componentType)
+    {
+        if (result == null) return 0m;
+        Component c = result.Components.Find(x => x.ComponentType == componentType);
+        return c == null ? 0m : c.Amount;
+    }
+
+    // =========================================================================
+    //  Approval
+    // =========================================================================
+
+    /// <summary>
+    /// Seeds the approval parameters — the key figures checked against policy before
+    /// sign-off. Policy and Actual are both text so a money figure, a day count and a
+    /// policy name can share one grid.
+    ///
+    /// The policy side is read from HR_FNFConfig rather than typed, so the comparison is
+    /// against what the system will actually apply.
+    /// </summary>
+    public static void SeedApprovalParameters(SqlConnection conn, SqlTransaction tx,
+                                              long caseId, Result result, Config cfg)
+    {
+        decimal encashDays = 0m;
+        Component encash = result.Components.Find(x => x.ComponentType == CompLeaveEncashment);
+        if (encash != null && encash.Days.HasValue) encashDays = encash.Days.Value;
+
+        string encashPolicy = cfg.EncashmentCapDays.HasValue
+            ? "Max " + cfg.EncashmentCapDays.Value.ToString("0.##") + " days"
+            : "No cap configured";
+
+        string gratuityPolicy = cfg.GratuityEnabled
+            ? cfg.GratuityDaysPerYear.ToString("0.##") + " days/yr at " + cfg.GratuityBase + "/" +
+              cfg.GratuityDivisor.ToString("0.##") + ", after " + cfg.GratuityEligibleYears.ToString("0.##") + " yrs"
+            : "Gratuity switched off";
+
+        var rows = new[]
+        {
+            new object[] { "AP_GRATUITY", "Gratuity", gratuityPolicy,
+                           AmountOf(result, CompGratuity).ToString("n2"), 1 },
+            new object[] { "AP_ENCASH", "Leave encashment days", encashPolicy,
+                           encashDays.ToString("0.##") + " days", 2 },
+            new object[] { "AP_NOTICE", "Notice pay recovery", "As per notice policy",
+                           AmountOf(result, CompNoticeRecovery).ToString("n2"), 3 },
+            new object[] { "AP_RECOVERY", "Total recoveries", "Must match clearance dues",
+                           result.TotalDeductions.ToString("n2"), 4 },
+            new object[] { "AP_NET", "Net payable", "-", result.NetPayable.ToString("n2"), 5 },
+        };
+
+        foreach (object[] r in rows)
+        {
+            using (var cmd = new SqlCommand(@"
+                UPDATE dbo.HR_FNFCheck
+                SET    PolicyStandard = @Policy, ActualValue = @Actual
+                WHERE  FNFSettlementID = @Id AND CheckKind = 'ApprovalParameter' AND CheckCode = @Code;
+
+                IF @@ROWCOUNT = 0
+                    INSERT INTO dbo.HR_FNFCheck
+                        (FNFSettlementID, CheckKind, CheckCode, CheckName, IsRequired,
+                         PolicyStandard, ActualValue, SortOrder)
+                    VALUES (@Id, 'ApprovalParameter', @Code, @Name, 1, @Policy, @Actual, @Sort);", conn, tx))
+            {
+                cmd.Parameters.AddWithValue("@Id", caseId);
+                cmd.Parameters.AddWithValue("@Code", Convert.ToString(r[0]));
+                cmd.Parameters.AddWithValue("@Name", Convert.ToString(r[1]));
+                cmd.Parameters.AddWithValue("@Policy", Convert.ToString(r[2]));
+                cmd.Parameters.AddWithValue("@Actual", Convert.ToString(r[3]));
+                cmd.Parameters.AddWithValue("@Sort", Convert.ToInt32(r[4]));
+                cmd.ExecuteNonQuery();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Approves a settlement and does everything that follows from it, in one transaction:
+    /// stamps the status, settlement date and compliance window, pushes the money into the
+    /// chosen payroll month, and settles the loan schedule it recovered.
+    ///
+    /// Refuses a case that is not Submitted, so a second approver pressing the button cannot
+    /// approve it twice and push the money twice.
+    ///
+    /// Returns how many components reached payroll.
+    /// </summary>
+    public static int ApproveCase(SqlConnection conn, SqlTransaction tx, long caseId,
+                                  int month, int year, int userId, string systemName)
+    {
+        string status;
+        int windowDays;
+
+        using (var cmd = new SqlCommand(@"
+            SELECT F.WorkflowStatus, ISNULL(C.ComplianceWindowDays, ISNULL(F.ComplianceWindowDays, 90))
+            FROM   dbo.HR_FNFSettlement F
+            LEFT   JOIN dbo.HR_FNFConfig C ON C.CompanyMasterID = F.CompanyMasterID AND C.Status = 1
+            WHERE  F.FNFSettlementID = @Id AND F.Status = 1", conn, tx))
+        {
+            cmd.Parameters.AddWithValue("@Id", caseId);
+            using (SqlDataReader rd = cmd.ExecuteReader())
+            {
+                if (!rd.Read())
+                    throw new InvalidOperationException("F&F case " + caseId + " was not found.");
+                status = rd.GetString(0);
+                windowDays = Convert.ToInt32(rd.GetValue(1));
+            }
+        }
+
+        if (!string.Equals(status, FNFCaseService.StatusSubmitted, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException(
+                "This case is " + status + ", not Submitted, so it cannot be approved. " +
+                "Only a submitted settlement can be signed off.");
+
+        using (var cmd = new SqlCommand(@"
+            UPDATE dbo.HR_FNFSettlement
+            SET    WorkflowStatus        = @Approved,
+                   SettlementDate        = CAST(GETDATE() AS date),
+                   ComplianceWindowDays  = @WindowDays,
+                   ComplianceWindowStart = CAST(GETDATE() AS date),
+                   ComplianceWindowEnd   = DATEADD(DAY, @WindowDays, CAST(GETDATE() AS date)),
+                   ApproverUserMasterID  = ISNULL(ApproverUserMasterID, @UserID),
+                   EditUserMasterID      = @UserID,
+                   EditUserDateTime      = GETDATE()
+            WHERE  FNFSettlementID = @Id AND WorkflowStatus = @Submitted", conn, tx))
+        {
+            cmd.Parameters.AddWithValue("@Approved", FNFCaseService.StatusApproved);
+            cmd.Parameters.AddWithValue("@Submitted", FNFCaseService.StatusSubmitted);
+            cmd.Parameters.AddWithValue("@WindowDays", windowDays);
+            cmd.Parameters.AddWithValue("@UserID", userId);
+            cmd.Parameters.AddWithValue("@Id", caseId);
+
+            if (cmd.ExecuteNonQuery() == 0)
+                throw new InvalidOperationException(
+                    "Somebody else changed this case a moment ago. Re-open it and try again.");
+        }
+
+        int pushed = PushToPayroll(conn, tx, caseId, month, year, userId, systemName);
+        SettleLoanSchedule(conn, tx, caseId);
+        return pushed;
+    }
+
+    /// <summary>
+    /// Sends a submitted case back to Draft with the reason recorded, so the preparer can fix
+    /// it. Deliberately NOT Cancelled: a rejection is a correction round, not the end of the
+    /// settlement.
+    /// </summary>
+    public static void RejectCase(SqlConnection conn, SqlTransaction tx, long caseId,
+                                  int userId, string reason)
+    {
+        if (string.IsNullOrEmpty(reason))
+            throw new ArgumentException("A rejection needs a reason - it is what the preparer acts on.", "reason");
+
+        using (var cmd = new SqlCommand(@"
+            UPDATE dbo.HR_FNFSettlement
+            SET    WorkflowStatus   = @Draft,
+                   Remarks          = LEFT(ISNULL(Remarks + ' | ', '') + 'Returned by approver: ' + @Reason, 500),
+                   EditUserMasterID = @UserID,
+                   EditUserDateTime = GETDATE()
+            WHERE  FNFSettlementID = @Id AND WorkflowStatus = @Submitted", conn, tx))
+        {
+            cmd.Parameters.AddWithValue("@Draft", FNFCaseService.StatusDraft);
+            cmd.Parameters.AddWithValue("@Submitted", FNFCaseService.StatusSubmitted);
+            cmd.Parameters.AddWithValue("@Reason", reason);
+            cmd.Parameters.AddWithValue("@UserID", userId);
+            cmd.Parameters.AddWithValue("@Id", caseId);
+
+            if (cmd.ExecuteNonQuery() == 0)
+                throw new InvalidOperationException(
+                    "This case is no longer Submitted, so it cannot be returned.");
+        }
+    }
+
+    /// <summary>
+    /// Records the employee's response to the statement (stage 15) and, when they accept,
+    /// writes the alumni note from the exit interview so the rehire view is filled in without
+    /// anyone retyping it.
+    /// </summary>
+    public static void RecordAcceptance(SqlConnection conn, SqlTransaction tx, long caseId,
+                                        string result, string remarks, int userId, string systemName)
+    {
+        using (var cmd = new SqlCommand(@"
+            UPDATE dbo.HR_FNFSettlement
+            SET    AcceptanceResult  = @Result,
+                   AcceptanceRemarks = @Remarks,
+                   AcceptedOn        = GETDATE(),
+                   StatementSharedOn = ISNULL(StatementSharedOn, GETDATE()),
+                   EditUserMasterID  = @UserID,
+                   EditUserDateTime  = GETDATE()
+            WHERE  FNFSettlementID = @Id AND Status = 1", conn, tx))
+        {
+            cmd.Parameters.AddWithValue("@Result", result);
+            cmd.Parameters.AddWithValue("@Remarks", (object)remarks ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("@UserID", userId);
+            cmd.Parameters.AddWithValue("@Id", caseId);
+            cmd.ExecuteNonQuery();
+        }
+
+        // Carry the exit interview's reason and manager feedback into the alumni record.
+        // Guarded, so re-accepting does not create a second row.
+        using (var cmd = new SqlCommand(@"
+            INSERT INTO dbo.HR_FNFAlumni
+                (EmployeeMasterID, FNFSettlementID, ReasonForLeaving, ManagerFeedback,
+                 CompanyMasterID, Status, EntryUserMasterID, EntryUserDateTime, SystemName)
+            SELECT F.EmployeeMasterID, F.FNFSettlementID,
+                   X.ReasonForLeaving, X.ManagerFeedback,
+                   F.CompanyMasterID, 1, @UserID, GETDATE(), @SystemName
+            FROM   dbo.HR_FNFSettlement F
+            LEFT   JOIN dbo.HR_ExitFormality X ON X.ExitFormalityID = F.ExitFormalityID
+            WHERE  F.FNFSettlementID = @Id
+              AND  NOT EXISTS (SELECT 1 FROM dbo.HR_FNFAlumni A
+                               WHERE A.EmployeeMasterID = F.EmployeeMasterID
+                                 AND A.Status = 1);", conn, tx))
+        {
+            cmd.Parameters.AddWithValue("@UserID", userId);
+            cmd.Parameters.AddWithValue("@SystemName", Trunc(systemName, 50));
+            cmd.Parameters.AddWithValue("@Id", caseId);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    // =========================================================================
+    //  Push into payroll
+    // =========================================================================
+
+    /// <summary>
+    /// Writes one HR_SalaryAdditionalHead row per pushable component for the settlement
+    /// month, so the next Salary Generate for that month carries the settlement.
+    ///
+    /// Returns the number of components pushed. Throws with a message naming the component
+    /// when a head is not configured, rather than silently dropping money.
+    /// </summary>
+    public static int PushToPayroll(SqlConnection conn, SqlTransaction tx, long caseId,
+                                    int month, int year, int userId, string systemName)
+    {
+        DataRow head = LoadCaseRow(conn, tx, caseId);
+        if (head == null) throw new InvalidOperationException("F&F case " + caseId + " was not found.");
+
+        long employeeId = Convert.ToInt64(head["EmployeeMasterID"]);
+        long companyId = Convert.ToInt64(head["CompanyMasterID"]);
+        long categoryId = head["CategoryMasterID"] == DBNull.Value ? 0 : Convert.ToInt64(head["CategoryMasterID"]);
+        long branchId = head["BranchMasterID"] == DBNull.Value ? 0 : Convert.ToInt64(head["BranchMasterID"]);
+
+        // Needed for the head fallback below: a MANUALLY added detail row carries no
+        // SalaryHeadMasterID, because the person typing an extra line should not have to
+        // know which head pays it. Its component type is enough to resolve one.
+        Config cfg = LoadConfig(conn, tx, companyId);
+
+        // The override joins on Category and Branch too, so a stale value silently matches
+        // nothing. Take them from the employee as they are NOW.
+        using (var cmd = new SqlCommand(
+            "SELECT CategoryMasterID, BranchMasterID FROM dbo.HR_EmployeeMaster WHERE EmployeeMasterID = @Emp",
+            conn, tx))
+        {
+            cmd.Parameters.AddWithValue("@Emp", employeeId);
+            using (SqlDataReader rd = cmd.ExecuteReader())
+            {
+                if (rd.Read())
+                {
+                    if (!rd.IsDBNull(0)) categoryId = rd.GetInt64(0);
+                    if (!rd.IsDBNull(1)) branchId = rd.GetInt64(1);
+                }
+            }
+        }
+
+        var lines = new List<object[]>();
+        using (var cmd = new SqlCommand(@"
+            SELECT ComponentType, SalaryHeadMasterID, [Add/Deduct], SUM(Amount) AS Amount
+            FROM   dbo.HR_FNFSettlementDetail
+            WHERE  FNFSettlementID = @Id AND Amount <> 0
+            GROUP  BY ComponentType, SalaryHeadMasterID, [Add/Deduct]", conn, tx))
+        {
+            cmd.Parameters.AddWithValue("@Id", caseId);
+            using (SqlDataReader rd = cmd.ExecuteReader())
+                while (rd.Read())
+                    lines.Add(new object[]
+                    {
+                        rd.GetString(0),
+                        rd.IsDBNull(1) ? (long?)null : rd.GetInt64(1),
+                        rd.GetString(2),
+                        rd.GetDecimal(3),
+                    });
+        }
+
+        int pushed = 0;
+
+        foreach (object[] line in lines)
+        {
+            string component = Convert.ToString(line[0]);
+            if (!IsPushable(component)) continue;      // payroll already pays the final salary
+
+            // The row's own head wins; a manual row falls back to the one configured for
+            // its component type.
+            long? headId = (long?)line[1] ?? cfg.HeadFor(component);
+            string addDeduct = Convert.ToString(line[2]);
+            decimal amount = Convert.ToDecimal(line[3]);
+
+            if (!headId.HasValue)
+                throw new InvalidOperationException(
+                    "No salary head is configured for " + component + ", so it cannot be paid. " +
+                    "Set it in F&F Configuration.");
+
+            // The override is only a LEFT JOIN onto HR_EmployeeWiseSalaryHead, so without a
+            // row there the amount is never seen - with no error at all.
+            EnsureEmployeeHead(conn, tx, employeeId, headId.Value, addDeduct,
+                               categoryId, branchId, companyId, userId, systemName);
+
+            UpsertAdditionalHead(conn, tx, employeeId, headId.Value, amount, month, year,
+                                 categoryId, branchId, component, userId, systemName);
+            pushed++;
+        }
+
+        using (var cmd = new SqlCommand(@"
+            UPDATE dbo.HR_FNFSettlement
+            SET    SettlementMonth = @M, SettlementYear = @Y,
+                   EditUserMasterID = @UserID, EditUserDateTime = GETDATE()
+            WHERE  FNFSettlementID = @Id", conn, tx))
+        {
+            cmd.Parameters.AddWithValue("@M", month);
+            cmd.Parameters.AddWithValue("@Y", year);
+            cmd.Parameters.AddWithValue("@UserID", userId);
+            cmd.Parameters.AddWithValue("@Id", caseId);
+            cmd.ExecuteNonQuery();
+        }
+
+        return pushed;
+    }
+
+    /// <summary>
+    /// Makes sure the employee's own salary structure carries this head, at Amount 0 and
+    /// AmountCalculation = 'Manual'.
+    ///
+    /// Amount stays 0 because that row is the STANDING structure — a figure written there
+    /// would be deducted or paid every month forever. The settlement amount goes in the
+    /// per-month override instead, exactly as a loan installment does.
+    ///
+    /// 'Manual' is load-bearing: IsFixedAmountType() exempts only 'Manual' and
+    /// 'FixPerMonthDay' from pro-rata, so on any other type CalculateHeads() would scale
+    /// the settlement by TotalPayDays / MonthDays.
+    /// </summary>
+    private static void EnsureEmployeeHead(SqlConnection conn, SqlTransaction tx, long employeeId,
+                                            long headId, string addDeduct, long categoryId,
+                                            long branchId, long companyId, int userId, string systemName)
+    {
+        using (var cmd = new SqlCommand(@"
+            IF NOT EXISTS (SELECT 1 FROM dbo.HR_EmployeeWiseSalaryHead
+                           WHERE EmployeeMasterID = @Emp AND SalaryHeadMasterID = @Head
+                             AND CategoryMasterID = @Cat AND BranchMasterID = @Br)
+            BEGIN
+                INSERT INTO dbo.HR_EmployeeWiseSalaryHead
+                    ([Sr.No.], CheckBox, SalaryHeadMasterID, AccountHeadCode, [Add/Deduct],
+                     Percentage, Amount, AmountCalculation, Formula, RoundOff, AllowEdit,
+                     Remarks, EmployeeMasterID, CategoryMasterID, BranchMasterID, CompanyMasterID, Status)
+                SELECT ISNULL((SELECT MAX([Sr.No.]) FROM dbo.HR_EmployeeWiseSalaryHead
+                               WHERE EmployeeMasterID = @Emp), 0) + 1,
+                       1, @Head, ISNULL(SH.Code, ''), @AddDeduct,
+                       0, 0, 'Manual', '', 0, 0,
+                       'Added for F&F settlement', @Emp, @Cat, @Br, @Company, 1
+                FROM   dbo.HR_SalaryHeadMaster SH
+                WHERE  SH.SalaryHeadMasterID = @Head;
+            END", conn, tx))
+        {
+            cmd.Parameters.AddWithValue("@Emp", employeeId);
+            cmd.Parameters.AddWithValue("@Head", headId);
+            cmd.Parameters.AddWithValue("@AddDeduct", addDeduct);
+            cmd.Parameters.AddWithValue("@Cat", categoryId);
+            cmd.Parameters.AddWithValue("@Br", branchId);
+            cmd.Parameters.AddWithValue("@Company", companyId);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>
+    /// The per-month amount override the payroll proc reads. Upsert, so recalculating and
+    /// re-approving replaces the figure rather than doubling it.
+    /// </summary>
+    private static void UpsertAdditionalHead(SqlConnection conn, SqlTransaction tx, long employeeId,
+                                              long headId, decimal amount, int month, int year,
+                                              long categoryId, long branchId, string component,
+                                              int userId, string systemName)
+    {
+        using (var cmd = new SqlCommand(@"
+            UPDATE dbo.HR_SalaryAdditionalHead
+            SET    Amount = @Amount, Remarks = @Remarks,
+                   EditUserMasterID = @UserID, EditUserDateTime = GETDATE()
+            WHERE  EmployeeMasterID = @Emp AND SalaryHeadMasterID = @Head
+              AND  AttendMonth = @M AND AttendYear = @Y
+              AND  CategoryMasterID = @Cat AND BranchMasterID = @Br;
+
+            IF @@ROWCOUNT = 0
+                INSERT INTO dbo.HR_SalaryAdditionalHead
+                    (SalaryHeadMasterID, AccountHeadCode, EmployeeMasterID, Amount, Remarks,
+                     AttendMonth, AttendYear, CategoryMasterID, BranchMasterID,
+                     EntryUserMasterID, EntryUserDateTime, SystemName)
+                SELECT @Head, ISNULL(SH.Code, ''), @Emp, @Amount, @Remarks,
+                       @M, @Y, @Cat, @Br, @UserID, GETDATE(), @SystemName
+                FROM   dbo.HR_SalaryHeadMaster SH
+                WHERE  SH.SalaryHeadMasterID = @Head;", conn, tx))
+        {
+            cmd.Parameters.AddWithValue("@Amount", amount);
+            cmd.Parameters.AddWithValue("@Remarks", "F&F settlement - " + component);
+            cmd.Parameters.AddWithValue("@Emp", employeeId);
+            cmd.Parameters.AddWithValue("@Head", headId);
+            cmd.Parameters.AddWithValue("@M", month);
+            cmd.Parameters.AddWithValue("@Y", year);
+            cmd.Parameters.AddWithValue("@Cat", categoryId);
+            cmd.Parameters.AddWithValue("@Br", branchId);
+            cmd.Parameters.AddWithValue("@UserID", userId);
+            cmd.Parameters.AddWithValue("@SystemName", Trunc(systemName, 50));
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>
+    /// Settles the loan schedule this settlement recovered.
+    ///
+    /// Every unpaid installment is marked paid, not just the settlement month's, because
+    /// the settlement recovered the WHOLE outstanding. Leaving them unpaid would inflate
+    /// the loan's outstanding for ever, since outstanding is derived as SUM(EMIAmount)
+    /// over unpaid rows.
+    /// </summary>
+    public static int SettleLoanSchedule(SqlConnection conn, SqlTransaction tx, long caseId)
+    {
+        using (var cmd = new SqlCommand(@"
+            UPDATE S
+            SET    S.IsPaid = 1
+            FROM   dbo.HR_LoanEMISchedule S
+            INNER  JOIN dbo.HR_FNFSettlement F ON F.EmployeeMasterID = S.EmployeeMasterID
+            WHERE  F.FNFSettlementID = @Id
+              AND  S.IsPaid = 0
+              AND  S.Status = 1
+              AND  EXISTS (SELECT 1 FROM dbo.HR_FNFSettlementDetail D
+                           WHERE D.FNFSettlementID = @Id
+                             AND D.ComponentType = @Comp
+                             AND D.Amount > 0)", conn, tx))
+        {
+            cmd.Parameters.AddWithValue("@Id", caseId);
+            cmd.Parameters.AddWithValue("@Comp", CompLoanRecovery);
+            return cmd.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>
+    /// True when the F&amp;F tables exist in THIS database.
+    ///
+    /// Tenant databases drift: migrations 110-113 may not have reached a client yet, and
+    /// SQL referencing a missing table fails at parse time, so no <c>IF</c> inside the batch
+    /// can save it. Payroll must keep running on a database that has never seen F&amp;F, so
+    /// any payroll-side F&amp;F predicate has to be appended conditionally.
+    ///
+    /// Deliberately NOT cached in a static: the menu-schema probe does that and it is a
+    /// documented trap — after the migration applies, the app pool has to be recycled before
+    /// the cached answer changes. One cheap lookup per payroll Go is worth more than that.
+    /// </summary>
+    public static bool SchemaReady(SqlConnection conn, SqlTransaction tx)
+    {
+        using (var cmd = new SqlCommand(@"
+        <SettingsAdaptivity Enabled="true" EnableAutoHideRootItems="true"
+            EnableCollapseRootItemsToIcons="true" CollapseRootItemsToIconsAtWindowInnerWidth="600" />
+        <ItemStyle CssClass="item" VerticalAlign="Middle" />
+        <ItemImage Width="16px" Height="16px" />
+        <Items>
+            <dx:MenuItem Enabled="false"><Template><h1>My Full &amp; Final Statement</h1></Template></dx:MenuItem>
+            <dx:MenuItem Name="Refresh" Text="Refresh" Alignment="Right" AdaptivePriority="3" />
+            <dx:MenuItem Name="Dispute" Text="Not Accepted" Alignment="Right" AdaptivePriority="3" />
+            <dx:MenuItem Name="AcceptQuery" Text="Accept with Query" Alignment="Right" AdaptivePriority="2" />
+            <dx:MenuItem Name="Accept" Text="Accept" Alignment="Right" AdaptivePriority="2" />
+        </Items>
+    </dx:ASPxMenu>
+</asp:Content>
+
+<asp:Content ID="Content3" ContentPlaceHolderID="PageContent" runat="Server">
+    <style type="text/css">
+        .st-wrap { padding: 6px 4px 16px; max-width: 1100px; }
+        .st-sec { font-size: 14px; font-weight: 700; color: #34495e; margin: 14px 2px 8px; }
+        .st-note { font-size: 12px; color: #555; margin: 2px 0 10px; }
+        .st-kv { font-size: 12.5px; color: #444; }
+        .st-banner { border-radius: 4px; padding: 10px 14px; margin: 0 0 14px; font-size: 13px; font-weight: 600; }
+        .st-banner.ready { color: #14532d; background: #f0fdf4; border-left: 4px solid #16a34a; }
+        .st-banner.wait { color: #7e5109; background: #fef8e7; border-left: 4px solid #d68910; }
+        <ItemImage Width="16px" Height="16px" />
+        <Items>
+            <%-- Inline SVG in the heading template rather than an <Image IconID="...">: an
+                 unknown IconID fails silently and the item just renders with no picture. --%>
+            <dx:MenuItem Enabled="false">
+                <Template>
+                    <h1 style="display:inline-flex; align-items:center; gap:8px;">
+                        <svg viewBox="0 0 16 16" width="17" height="17" aria-hidden="true" style="display:block; color:#16a34a;"><path fill="currentColor" d="M8 .8 14.5 3v4.3c0 3.5-2.4 6.6-6.5 7.9-4.1-1.3-6.5-4.4-6.5-7.9V3zm-.7 9.9 4.2-4.2-1.15-1.15L7.3 8.4 5.65 6.75 4.5 7.9z"/></svg>
+                        <span>F&amp;F Approval</span>
+                    </h1>
+                </Template>
+            </dx:MenuItem>
+            <%-- The toolbar items take Image Url, not inline markup - these are the same .svg
+                 files the rest of the application's toolbars use. Back also loses its
+                 "&#8592;" text arrow now that it has a real icon. --%>
+            <dx:MenuItem Name="Refresh" Text="Refresh" Alignment="Right" AdaptivePriority="2">
+                <Image Url="../Content/Images/edit.svg" />
+            </dx:MenuItem>
+            <dx:MenuItem Name="Back" Text="Back to List" Alignment="Right" AdaptivePriority="2">
+                <Image Url="../Content/Images/back.svg" />
+            </dx:MenuItem>
+            <dx:MenuItem Name="Reject" Text="Return to Preparer" Alignment="Right" AdaptivePriority="3">
+                <Image Url="../Content/Images/cancel1.svg" />
+            </dx:MenuItem>
+            <dx:MenuItem Name="Approve" Text="Approve" Alignment="Right" AdaptivePriority="2">
+                <Image Url="../Content/Images/save.svg" />
+            </dx:MenuItem>
+        </Items>
+    </dx:ASPxMenu>
+</asp:Content>
+
+<asp:Content ID="Content3" ContentPlaceHolderID="PageContent" runat="Server">
+    <style type="text/css">
+        .ap-wrap { padding: 6px 4px 16px; }
+        /* Section headings carry a small icon, the same way Fine Approval's do. display:flex
+           so the glyph sits on the text's block rather than being shifted by line-height,
+           and currentColor on the path so one CSS rule tints them all. */
+        .ap-sec { font-size: 14px; font-weight: 700; color: #34495e; margin: 12px 2px 8px;
+                  display: flex; align-items: center; gap: 7px; }
+        .ap-sec svg { display: block; flex: 0 0 auto; color: #7b8794; }
+        .ap-note { font-size: 12px; color: #555; margin: 2px 0 10px; }
+        .ap-kv { font-size: 12.5px; color: #444; }
+        .pill { display: inline-block; padding: 2px 9px; border-radius: 11px; font-size: 11px; font-weight: 700; }
+        .pill.Pending { background: #fef3c7; color: #92400e; }
+        .pill.Approved { background: #dcfce7; color: #166534; }
+        .pill.Cancelled { background: #f3f4f6; color: #6b7280; }
+        .ap-banner { border-radius: 4px; padding: 9px 13px; margin: 0 0 12px; font-size: 12.5px; font-weight: 600; }
+        .ap-banner.ready { color: #14532d; background: #f0fdf4; border-left: 4px solid #16a34a; }
+        .ap-banner.blocked { color: #7f1d1d; background: #fef2f2; border-left: 4px solid #dc2626; }
+        .ap-net { font-size: 20px; font-weight: 700; color: #14532d; }
+        .ap-net.neg { color: #7f1d1d; }
+    </style>
+
+    <div class="ap-wrap">
+
+    <%-- ============================ ENTRY ============================ --%>

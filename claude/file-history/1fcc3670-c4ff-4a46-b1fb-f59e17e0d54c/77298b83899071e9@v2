@@ -1,0 +1,97 @@
+/* ============================================================================================
+   Test data: one resigning employee who shows up in F&F Settlement -> "Eligible Employees".
+
+   Eligibility rule (FnfSettlementRepository.GetEligibleEmployeesAsync):
+     - HR_EmployeeMaster.Status = 1, same CompanyMasterID as the logged-in user
+     - ResignDate or DateOfLeft set (> 1900-01-01)
+     - no live HR_FNFSettlement row (Status = 1, WorkflowStatus <> 'Cancelled')
+     - only if HR_FNFConfig.RequireExitFormality = 1: a completed HR_ExitFormality row
+
+   Master FKs (department/designation/shift/category/branch) are copied from an existing active
+   employee of the same company, so no FK guessing is needed. Set the 3 variables below and run.
+   ============================================================================================ */
+SET XACT_ABORT ON;
+BEGIN TRAN;
+
+DECLARE @CompanyMasterID   bigint = 1;            -- <-- your company
+DECLARE @TemplateEmpID     bigint = NULL;         -- <-- optional: copy masters from this employee (also becomes Reporting Manager)
+DECLARE @EntryUserMasterID bigint = 1;            -- <-- user creating the record
+
+DECLARE @Today       date = CAST(GETDATE() AS date);
+DECLARE @JoinDate    date = DATEADD(YEAR, -6, @Today);   -- > 5 years, so gratuity applies
+DECLARE @ResignDate  date = DATEADD(DAY, -30, @Today);
+DECLARE @LastWorking date = @Today;
+DECLARE @Code        nvarchar(15) = N'FNF' + RIGHT(CONVERT(varchar(20), DATEDIFF(SECOND, '2020-01-01', GETDATE())), 9);
+
+IF @TemplateEmpID IS NULL
+    SELECT TOP 1 @TemplateEmpID = EmployeeMasterID
+    FROM HR_EmployeeMaster
+    WHERE CompanyMasterID = @CompanyMasterID AND Status = 1 AND BranchMasterID IS NOT NULL
+    ORDER BY EmployeeMasterID;
+
+IF @TemplateEmpID IS NULL
+BEGIN
+    RAISERROR('No active employee found in company %I64d to copy masters from.', 16, 1, @CompanyMasterID);
+    ROLLBACK; RETURN;
+END
+
+/* ---- 1. Employee (resigned, still Status = 1) ------------------------------------------- */
+INSERT INTO HR_EmployeeMaster
+    (Code, FirstName, LastName, FatherName, Gender,
+     DateOfJoining, DateOfBirth, ResignDate, DateOfLeft, NoticePeriod,
+     WeeklyOffDay, WorkingHours, SalaryCalculation, JobType, JobStatus, Status,
+     ReportingPersonID,
+     DepartmentMasterID, DesignationMasterID, ShiftMasterID, CategoryMasterID,
+     BranchMasterID, CompanyMasterID, FormID,
+     EntryUserMasterID, EntryUserDateTime, SystemName)
+SELECT
+    @Code, N'Fnf', N'Tester', N'Test', N'Male',
+    @JoinDate, '1990-01-01', @ResignDate, @LastWorking, N'30',
+    t.WeeklyOffDay, t.WorkingHours, t.SalaryCalculation, t.JobType, t.JobStatus, 1,
+    t.EmployeeMasterID,
+    t.DepartmentMasterID, t.DesignationMasterID, t.ShiftMasterID, t.CategoryMasterID,
+    t.BranchMasterID, t.CompanyMasterID, t.FormID,
+    @EntryUserMasterID, GETDATE(), N'SQL-SCRIPT'
+FROM HR_EmployeeMaster t
+WHERE t.EmployeeMasterID = @TemplateEmpID;
+
+DECLARE @EmpID bigint = SCOPE_IDENTITY();
+
+/* ---- 2. Salary, so Calculate produces real figures (read via ORDER BY FromDate DESC) ----- */
+INSERT INTO HR_EmployeeBasicSalary
+    (EmployeeMasterID, SrNo, BasicAmount, GrossAmount, CTCAmount, OTRate, GovernmentRate,
+     FromDate, ToDate, YearID, CategoryMasterID, BranchMasterID, CompanyMasterID)
+SELECT TOP 1
+    @EmpID, 1, 25000, 50000, 600000, 0, 0,
+    @JoinDate, '2099-12-31',
+    ISNULL((SELECT TOP 1 YearID FROM HR_EmployeeBasicSalary
+            WHERE EmployeeMasterID = @TemplateEmpID ORDER BY FromDate DESC), 1),
+    e.CategoryMasterID, e.BranchMasterID, e.CompanyMasterID
+FROM HR_EmployeeMaster e
+WHERE e.EmployeeMasterID = @EmpID;
+
+/* ---- 3. Completed exit formality - only needed when the company requires it ------------- */
+IF EXISTS (SELECT 1 FROM HR_FNFConfig WHERE CompanyMasterID = @CompanyMasterID AND RequireExitFormality = 1)
+BEGIN
+    INSERT INTO HR_ExitFormality
+        (ExitNo, EmployeeMasterID, ResignDate, LastWorkingDate, InterviewStatus,
+         CategoryMasterID, BranchMasterID, CompanyMasterID, IsComplete, Status,
+         EntryUserMasterID, EntryUserDateTime)
+    SELECT N'EXT-T' + CAST(@EmpID AS nvarchar(20)), e.EmployeeMasterID, @ResignDate, @LastWorking, 'Completed',
+           e.CategoryMasterID, e.BranchMasterID, @CompanyMasterID, 1, 1,
+           @EntryUserMasterID, GETDATE()
+    FROM HR_EmployeeMaster e
+    WHERE e.EmployeeMasterID = @EmpID;
+END
+
+/* ---- Check: must return 1 row, same predicate as GetEligibleEmployeesAsync -------------- */
+SELECT em.EmployeeMasterID, em.Code, em.FirstName, em.LastName, em.ResignDate, em.DateOfLeft,
+       em.ReportingPersonID, em.BranchMasterID
+FROM HR_EmployeeMaster em
+WHERE em.EmployeeMasterID = @EmpID
+  AND em.CompanyMasterID = @CompanyMasterID AND em.Status = 1
+  AND ((em.ResignDate > '1900-01-01') OR (em.DateOfLeft > '1900-01-01'))
+  AND NOT EXISTS (SELECT 1 FROM HR_FNFSettlement f
+                  WHERE f.EmployeeMasterID = em.EmployeeMasterID AND f.Status = 1 AND f.WorkflowStatus <> 'Cancelled');
+
+COMMIT;   -- change to ROLLBACK for a dry run

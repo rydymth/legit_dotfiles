@@ -1,0 +1,163 @@
+import { CommonModule } from '@angular/common';
+import { Component, OnInit } from '@angular/core';
+import { Router } from '@angular/router';
+import { DxButtonModule, DxPopupModule, DxSelectBoxModule } from 'devextreme-angular';
+import { finalize } from 'rxjs/operators';
+import { CommonGridComponent } from '../../../../layout/common-grid/common-grid.component';
+import { AuthService } from '../../../../services/auth.service';
+import { ChipNavigationService } from '../../../../services/ChipNavigation.service';
+import { ToastService } from '../../../../services/toaster.service';
+import { EligibleEmployeeModel, FnfCaseModel } from '../../models/fnf.model';
+import { FnfApiService } from '../../services/fnf-api.service';
+
+const STATUS_PILL: Record<string, string> = {
+  Draft: 'status-pending',
+  Submitted: 'status-submitted',
+  Approved: 'status-approved',
+};
+
+/** Preparer's case list — create a case, work through it, or reopen (read-only) a decided one. */
+@Component({
+  selector: 'app-fnf-settlement-list',
+  standalone: true,
+  imports: [CommonModule, CommonGridComponent, DxPopupModule, DxSelectBoxModule, DxButtonModule],
+  templateUrl: './list.component.html',
+})
+export class FnfSettlementListComponent implements OnInit {
+  columns: Record<string, unknown>[] = [];
+  data: FnfCaseModel[] = [];
+  isLoading = false;
+
+  newCasePopupVisible = false;
+  eligibleEmployees: EligibleEmployeeModel[] = [];
+  selectedEmployeeId: number | null = null;
+  creating = false;
+
+  constructor(
+    private authService: AuthService,
+    private fnfApi: FnfApiService,
+    private toast: ToastService,
+    private router: Router,
+    private chipService: ChipNavigationService,
+  ) {
+    this.authService.ScreenName = 'F&F Settlement';
+    this.chipService.addTab({ title: 'F&F Settlement', route: '/fnf/settlement' });
+  }
+
+  ngOnInit(): void {
+    this.columns = [
+      { dataField: 'caseNo', caption: 'Case No.', width: 130 },
+      { dataField: 'employeeName', caption: 'Employee' },
+      { dataField: 'employeeCode', caption: 'Code', width: 100 },
+      { dataField: 'lastWorkingDate', caption: 'LWD', dataType: 'date', format: 'dd-MMM-yyyy', width: 120 },
+      { dataField: 'casePriority', caption: 'Priority', width: 150 },
+      {
+        dataField: 'isClearanceReady',
+        caption: 'Clearance',
+        width: 150,
+        cellTemplate: (container: HTMLElement, options: any) => {
+          container.innerText = options.data?.isClearanceReady ? 'Ready' : options.data?.clearanceBlockReason || 'Not ready';
+        },
+      },
+      {
+        dataField: 'workflowStatus',
+        caption: 'Status',
+        width: 120,
+        cellTemplate: (container: HTMLElement, options: any) => {
+          const span = document.createElement('span');
+          const cls = STATUS_PILL[options.data?.workflowStatus] || 'status-pending';
+          span.className = `status-pill ${cls}`;
+          span.innerText = options.data?.workflowStatus ?? '';
+          container.appendChild(span);
+        },
+      },
+      { dataField: 'netPayable', caption: 'Net Payable', dataType: 'number', format: { type: 'fixedPoint', precision: 2 }, width: 130 },
+      {
+        type: 'buttons',
+        caption: 'Actions',
+        width: 90,
+        buttons: [
+          {
+            hint: 'Open case',
+            icon: 'folder',
+            onClick: (e: any) => this.openCase(e.row?.data),
+          },
+        ],
+      },
+    ];
+
+    this.load();
+  }
+
+  get gridSubtitle(): string {
+    const n = this.data.length;
+    return `${n} case${n === 1 ? '' : 's'}`;
+  }
+
+  load(): void {
+    this.isLoading = true;
+    this.fnfApi
+      .getCases()
+      .pipe(finalize(() => (this.isLoading = false)))
+      .subscribe({
+        next: (res) => {
+          if (!FnfApiService.isOk(res)) {
+            this.data = [];
+            this.toast.error(FnfApiService.messageOf(res, 'Failed to load cases.'));
+            return;
+          }
+          const rows = FnfApiService.dataOf<FnfCaseModel[]>(res);
+          this.data = Array.isArray(rows) ? rows : [];
+        },
+        error: (err) => {
+          this.data = [];
+          this.toast.error(FnfApiService.errorMessage(err, 'Failed to load cases.'));
+        },
+      });
+  }
+
+  openCase(row: FnfCaseModel): void {
+    this.router.navigate(['/fnf/settlement/case', row.fnfSettlementId]);
+  }
+
+  onNewCase(): void {
+    this.selectedEmployeeId = null;
+    this.newCasePopupVisible = true;
+    this.fnfApi.getEligibleEmployees().subscribe({
+      next: (res) => {
+        const rows = FnfApiService.dataOf<EligibleEmployeeModel[]>(res);
+        this.eligibleEmployees = Array.isArray(rows) ? rows : [];
+      },
+    });
+  }
+
+  employeeDisplay = (item: EligibleEmployeeModel): string => {
+    if (!item) return '';
+    return `${item.employeeCode} - ${item.employeeName}`;
+  };
+
+  createCase(): void {
+    if (!this.selectedEmployeeId) {
+      this.toast.error('Select an employee first.');
+      return;
+    }
+    this.creating = true;
+    this.fnfApi
+      .createCase(this.selectedEmployeeId)
+      .pipe(finalize(() => (this.creating = false)))
+      .subscribe({
+        next: (res) => {
+          if (!FnfApiService.isOk(res)) {
+            this.toast.error(FnfApiService.messageOf(res, 'Could not create case.'));
+            return;
+          }
+          const created = FnfApiService.dataOf<FnfCaseModel>(res);
+          this.toast.success(FnfApiService.messageOf(res, 'Case created.'));
+          this.newCasePopupVisible = false;
+          this.load();
+          if (created?.fnfSettlementId) this.router.navigate(['/fnf/settlement/case', created.fnfSettlementId]);
+        },
+        error: (err) => this.toast.error(FnfApiService.errorMessage(err, 'Could not create case.')),
+      });
+  }
+}

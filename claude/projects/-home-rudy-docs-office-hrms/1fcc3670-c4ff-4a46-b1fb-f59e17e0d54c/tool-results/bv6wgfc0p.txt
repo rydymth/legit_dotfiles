@@ -1,0 +1,780 @@
+     1	using System;
+     2	using System.Data;
+     3	using System.Data.SqlClient;
+     4	using System.Web;
+     5	using DevExpress.Web;
+     6	
+     7	/// <summary>
+     8	/// Exit Formality — stages 1 and 2 of the employee-exit flow, and the gate in front of F&amp;F.
+     9	///
+    10	/// Three things have to be true before a settlement may be calculated: the exit interview is
+    11	/// recorded, every issued asset is back, and every department has answered. Until then
+    12	/// <b>Create F&amp;F Case</b> is not offered, because a settlement worked out without knowing
+    13	/// the dues is a figure somebody will believe and act on.
+    14	///
+    15	/// All logic lives in <see cref="ExitFormalityService"/> so it can be tested against the
+    16	/// database without the site. This file is plumbing only.
+    17	/// </summary>
+    18	public partial class Payroll_ExitFormality : System.Web.UI.Page
+    19	{
+    20	    // Session, never ViewState: a DevExpress callback does not round-trip the page's
+    21	    // ViewState, so anything written there during a callback reads back as its initial
+    22	    // value on the next one.
+    23	    private long CurrentExitId
+    24	    {
+    25	        get { return Session["EXF_ExitId"] != null ? Convert.ToInt64(Session["EXF_ExitId"]) : 0; }
+    26	        set { Session["EXF_ExitId"] = value; }
+    27	    }
+    28	
+    29	    private long CompanyId
+    30	    {
+    31	        get { return Session["CompanyID"] != null ? Convert.ToInt64(Session["CompanyID"]) : 0; }
+    32	    }
+    33	
+    34	    private int UserId
+    35	    {
+    36	        get { return Session["UserID"] != null ? Convert.ToInt32(Session["UserID"]) : 0; }
+    37	    }
+    38	
+    39	    private static SqlConnection CreateConnection()
+    40	    {
+    41	        return new SqlConnection(DbConnectionFactory.GetConnectionString());
+    42	    }
+    43	
+    44	    /// <summary>SystemName column widths vary across this schema (20 to 128) and 2014 does
+    45	    /// not name the column in a truncation error, so cap it.</summary>
+    46	    private static string HostNameCapped()
+    47	    {
+    48	        string name = null;
+    49	        try { name = System.Net.Dns.GetHostName(); } catch { /* not fatal */ }
+    50	        if (string.IsNullOrEmpty(name)) return string.Empty;
+    51	        return name.Length > 50 ? name.Substring(0, 50) : name;
+    52	    }
+    53	
+    54	    // -- Lifecycle ------------------------------------------------------------
+    55	
+    56	    protected void Page_Load(object sender, EventArgs e)
+    57	    {
+    58	        if (!IsPostBack)
+    59	        {
+    60	            CurrentExitId = 0;
+    61	            LoadEmployeesNeedingExit();
+    62	            LoadUserCombo();
+    63	
+    64	            // BeforePerformDataSelect only supplies the DataSource; it fires when the grid
+    65	            // performs a select, which on a first render means never. Without this the page
+    66	            // opens empty and only fills once Refresh raises the grid's own callback.
+    67	            ExitGridView.DataBind();
+    68	        }
+    69	    }
+    70	
+    71	    // -- Combos ---------------------------------------------------------------
+    72	
+    73	    /// <summary>Returns how many employees still need an exit record, so the caller can
+    74	    /// explain an empty list instead of leaving the user staring at one.</summary>
+    75	    private int LoadEmployeesNeedingExit()
+    76	    {
+    77	        try
+    78	        {
+    79	            using (SqlConnection conn = CreateConnection())
+    80	            {
+    81	                conn.Open();
+    82	                DataTable dt = ExitFormalityService.EmployeesNeedingExit(conn, null, CompanyId);
+    83	                cmbEmployee.DataSource = dt;
+    84	                cmbEmployee.ValueType = typeof(long);
+    85	                cmbEmployee.DataBind();
+    86	                return dt.Rows.Count;
+    87	            }
+    88	        }
+    89	        catch (Exception ex)
+    90	        {
+    91	            ErrorLogHelper.Log(ex, "ExitFormality.LoadEmployees");
+    92	            return -1;      // unknown - do not claim there is nobody
+    93	        }
+    94	    }
+    95	
+    96	    /// <summary>Logins, not employees: an HR executive is often an admin-style user with no
+    97	    /// employee record, and they are the person conducting the interview.</summary>
+    98	    private void LoadUserCombo()
+    99	    {
+   100	        const string sql = @"
+   101	            SELECT U.UserMasterID,
+   102	                   ISNULL(U.UserName, '') + ISNULL(' (' + NULLIF(LTRIM(RTRIM(U.Code)),'') + ')', '') AS Name
+   103	            FROM   dbo.HR_UserMaster U
+   104	            WHERE  U.Status = 1
+   105	              AND  (U.CompanyMasterID = @CompanyID OR U.CompanyMasterID IS NULL)
+   106	            ORDER  BY U.UserName";
+   107	
+   108	        try
+   109	        {
+   110	            using (SqlConnection conn = CreateConnection())
+   111	            using (var cmd = new SqlCommand(sql, conn))
+   112	            {
+   113	                cmd.Parameters.AddWithValue("@CompanyID", CompanyId);
+   114	                var dt = new DataTable();
+   115	                using (var da = new SqlDataAdapter(cmd)) da.Fill(dt);
+   116	
+   117	                cmbInterviewBy.DataSource = dt;
+   118	                cmbInterviewBy.ValueType = typeof(long);
+   119	                cmbInterviewBy.DataBind();
+   120	            }
+   121	        }
+   122	        catch (Exception ex)
+   123	        {
+   124	            ErrorLogHelper.Log(ex, "ExitFormality.LoadUsers");
+   125	        }
+   126	    }
+   127	
+   128	    // -- List grid ------------------------------------------------------------
+   129	
+   130	    protected void ExitGridView_BeforePerformDataSelect(object sender, EventArgs e)
+   131	    {
+   132	        // Supplied here rather than only on the first request: paging, sorting, the page-size
+   133	        // picker and the filter row all raise the GRID's own callback, which passes through
+   134	        // neither Page_Load's !IsPostBack branch nor the panel handler.
+   135	        ExitGridView.DataSource = LoadExits();
+   136	    }
+   137	
+   138	    private DataTable LoadExits()
+   139	    {
+   140	        // An exit record carries the employee's own words from their interview. An admin sees
+   141	        // the company's exits; anyone else sees only the ones they are working on. Scoped in
+   142	        // the single query the grid runs, so paging and filtering cannot widen it - the same
+   143	        // rule the settlement list uses.
+   144	        string scope = RoleHelper.IsAdmin(Session["UserRole"])
+   145	            ? string.Empty
+   146	            : " AND (X.InterviewByUserMasterID = @UserID OR X.EntryUserMasterID = @UserID) ";
+   147	
+   148	        string sql = @"
+   149	            SELECT X.ExitFormalityID, X.ExitNo, X.LastWorkingDate, X.InterviewStatus,
+   150	                   ISNULL(X.TotalDues, 0) AS TotalDues,
+   151	                   LTRIM(ISNULL(' ' + NULLIF(LTRIM(RTRIM(EM.FirstName)),''), '') + ISNULL(' ' + NULLIF(LTRIM(RTRIM(EM.FatherName)),''), '') + ISNULL(' ' + NULLIF(LTRIM(RTRIM(EM.LastName)),''), '')) AS EmployeeName,
+   152	                   ISNULL(EM.Code, '') AS EmployeeCode,
+   153	                   CASE WHEN ISNULL(X.ClearanceComplete, 0) = 1 THEN 'All answered' ELSE 'Waiting' END AS ClearanceText,
+   154	                   CASE WHEN X.IsComplete = 1 THEN 'Complete - F&F can be raised'
+   155	                        ELSE ISNULL(X.BlockReason, 'Not checked') END AS StatusText,
+   156	                   X.IsComplete
+   157	            FROM   dbo.HR_ExitFormality X
+   158	            LEFT   JOIN dbo.HR_EmployeeMaster EM ON EM.EmployeeMasterID = X.EmployeeMasterID
+   159	            WHERE  X.Status = 1 AND X.CompanyMasterID = @CompanyID " + scope + @"
+   160	            ORDER  BY X.ExitFormalityID DESC";
+   161	
+   162	        var table = new DataTable();
+   163	        try
+   164	        {
+   165	            using (SqlConnection conn = CreateConnection())
+   166	            using (var cmd = new SqlCommand(sql, conn))
+   167	            {
+   168	                cmd.Parameters.AddWithValue("@CompanyID", CompanyId);
+   169	                cmd.Parameters.AddWithValue("@UserID", UserId);
+   170	                using (var da = new SqlDataAdapter(cmd)) da.Fill(table);
+   171	            }
+   172	        }
+   173	        catch (Exception ex)
+   174	        {
+   175	            ErrorLogHelper.Log(ex, "ExitFormality.LoadExits");
+   176	        }
+   177	        return table;
+   178	    }
+   179	
+   180	    protected void ExitGridView_CustomButtonCallback(object sender, ASPxGridViewCustomButtonCallbackEventArgs e)
+   181	    {
+   182	        if (e.ButtonID != "btnOpen") return;
+   183	
+   184	        // The grid's own callback can only re-render the grid, so hand the id to the browser
+   185	        // and let onExitGridEnd load the form via the panel's own callback.
+   186	        ExitGridView.JSProperties["cpOpenId"] =
+   187	            Convert.ToString(ExitGridView.GetRowValues(e.VisibleIndex, "ExitFormalityID"));
+   188	    }
+   189	
+   190	    protected void ExitGridView_HtmlDataCellPrepared(object sender, ASPxGridViewTableDataCellEventArgs e)
+   191	    {
+   192	        if (e.DataColumn.FieldName != "StatusText") return;
+   193	
+   194	        object complete = ExitGridView.GetRowValues(e.VisibleIndex, "IsComplete");
+   195	        bool isComplete = complete != null && complete != DBNull.Value && Convert.ToBoolean(complete);
+   196	
+   197	        e.Cell.Text = "<span class=\"pill " + (isComplete ? "Approved" : "Pending") + "\">" +
+   198	                      HttpUtility.HtmlEncode(Convert.ToString(e.CellValue)) + "</span>";
+   199	    }
+   200	
+   201	    // -- Panel dispatch -------------------------------------------------------
+   202	
+   203	    protected void ExPanel_Callback(object sender, CallbackEventArgsBase e)
+   204	    {
+   205	        string[] parts = (e.Parameter ?? string.Empty).Split('|');
+   206	        if (parts.Length < 2) return;
+   207	
+   208	        string action = parts[0];
+   209	        long id;
+   210	        long.TryParse(parts[1], out id);
+   211	
+   212	        try
+   213	        {
+   214	            switch (action)
+   215	            {
+   216	                case "New":      HandleNew();      break;
+   217	                case "Create":   HandleCreate();   break;
+   218	                case "Load":     LoadExit(id);     break;
+   219	                case "Save":     HandleSave();     break;
+   220	                case "Recheck":  HandleRecheck();  break;
+   221	                case "MakeCase": HandleMakeCase(); break;
+   222	            }
+   223	        }
+   224	        catch (Exception ex)
+   225	        {
+   226	            ErrorLogHelper.Log(ex, "ExitFormality." + action);
+   227	            ExPanel.JSProperties["cpMsg"] = ErrorLogHelper.FriendlyMessage;
+   228	        }
+   229	    }
+   230	
+   231	    private void HandleNew()
+   232	    {
+   233	        CurrentExitId = 0;
+   234	
+   235	        txtExitNo.Text = string.Empty;
+   236	        cmbEmployee.Value = null;
+   237	        cmbEmployee.Enabled = true;
+   238	        cmbInterviewStatus.Value = ExitFormalityService.InterviewPending;
+   239	        dtInterview.Value = null;
+   240	        cmbInterviewBy.Value = null;
+   241	        cmbReason.Value = null;
+   242	        memEmployeeFeedback.Text = string.Empty;
+   243	        memManagerFeedback.Text = string.Empty;
+   244	        litBanner.Text = string.Empty;
+   245	
+   246	        int waiting = LoadEmployeesNeedingExit();
+   247	
+   248	        if (waiting == 0)
+   249	        {
+   250	            litSnapshot.Text =
+   251	                "<div class=\"ex-banner blocked\">Nobody in this company needs an exit record.</div>"
+   252	              + "<div class=\"ex-kv\">The list only offers employees who have a <b>Date Of Resign</b> "
+   253	              + "or a <b>Date Of Left</b> on their record and do not already have one. Set the "
+   254	              + "resignation date in <b>Employee &#8594; Employee</b> first.</div>";
+   255	        }
+   256	        else
+   257	        {
+   258	            string count = waiting < 0
+   259	                ? "The employee list could not be read - check HR_ErrorLog."
+   260	                : waiting + " employee" + (waiting == 1 ? "" : "s") + " awaiting exit formality.";
+   261	
+   262	            litSnapshot.Text = "<div class=\"ex-kv\">" + HttpUtility.HtmlEncode(count)
+   263	                + " Pick one and press <b>Open Exit</b>. Their dates, department and manager are "
+   264	                + "copied from the employee record, and the five department clearance rows are "
+   265	                + "created automatically.</div>";
+   266	        }
+   267	
+   268	        ExPanel.JSProperties["cpCreating"] = "1";
+   269	        ExPanel.JSProperties["cpComplete"] = "0";
+   270	        ExPanel.JSProperties["cpNoEligible"] = (waiting == 0) ? "1" : "0";
+   271	    }
+   272	
+   273	    private void HandleCreate()
+   274	    {
+   275	        if (cmbEmployee.Value == null)
+   276	        {
+   277	            ExPanel.JSProperties["cpMsg"] = "Pick the employee first.";
+   278	            return;
+   279	        }
+   280	
+   281	        long employeeId = Convert.ToInt64(cmbEmployee.Value);
+   282	        long newId;
+   283	
+   284	        using (SqlConnection conn = CreateConnection())
+   285	        {
+   286	            conn.Open();
+   287	            // One transaction: header, five clearance rows and the first verdict. An exit
+   288	            // must never exist with a half-built clearance list.
+   289	            using (SqlTransaction tx = conn.BeginTransaction())
+   290	            {
+   291	                try
+   292	                {
+   293	                    newId = ExitFormalityService.CreateExit(conn, tx, employeeId, CompanyId,
+   294	                                                            UserId, HostNameCapped());
+   295	                    tx.Commit();
+   296	                }
+   297	                catch
+   298	                {
+   299	                    try { tx.Rollback(); } catch { /* connection already gone */ }
+   300	                    throw;
+   301	                }
+   302	            }
+   303	        }
+   304	
+   305	        LoadExit(newId);
+   306	        ExPanel.JSProperties["cpMsg"] = "Exit " + txtExitNo.Text + " opened.";
+   307	    }
+   308	
+   309	    private void LoadExit(long id)
+   310	    {
+   311	        if (id <= 0) return;
+   312	
+   313	        const string sql = @"
+   314	            SELECT X.*,
+   315	                   LTRIM(ISNULL(' ' + NULLIF(LTRIM(RTRIM(EM.FirstName)),''), '') + ISNULL(' ' + NULLIF(LTRIM(RTRIM(EM.FatherName)),''), '') + ISNULL(' ' + NULLIF(LTRIM(RTRIM(EM.LastName)),''), '')) AS EmployeeName,
+   316	                   ISNULL(EM.Code, '')           AS EmployeeCode,
+   317	                   ISNULL(D.DepartmentName, '')  AS DepartmentName,
+   318	                   ISNULL(G.DesignationName, '') AS DesignationName,
+   319	                   LTRIM(ISNULL(' ' + NULLIF(LTRIM(RTRIM(MG.FirstName)),''), '') + ISNULL(' ' + NULLIF(LTRIM(RTRIM(MG.LastName)),''), '')) AS ManagerName,
+   320	                   NULLIF(EM.DateOfJoining, '1900-01-01') AS DateOfJoining,
+   321	                   (SELECT COUNT(*) FROM dbo.HR_FNFSettlement F
+   322	                    WHERE F.EmployeeMasterID = X.EmployeeMasterID AND F.Status = 1
+   323	                      AND F.WorkflowStatus <> 'Cancelled')        AS ExistingCases
+   324	            FROM   dbo.HR_ExitFormality X
+   325	            LEFT   JOIN dbo.HR_EmployeeMaster    EM ON EM.EmployeeMasterID   = X.EmployeeMasterID
+   326	            LEFT   JOIN dbo.HR_DepartmentMaster  D  ON D.DepartmentMasterID  = EM.DepartmentMasterID
+   327	            LEFT   JOIN dbo.HR_DesignationMaster G  ON G.DesignationMasterID = EM.DesignationMasterID
+   328	            LEFT   JOIN dbo.HR_EmployeeMaster    MG ON MG.EmployeeMasterID   = EM.ReportingPersonID
+   329	            WHERE  X.ExitFormalityID = @Id";
+   330	
+   331	        DataRow row = null;
+   332	        using (SqlConnection conn = CreateConnection())
+   333	        using (var cmd = new SqlCommand(sql, conn))
+   334	        {
+   335	            cmd.Parameters.AddWithValue("@Id", id);
+   336	            var dt = new DataTable();
+   337	            using (var da = new SqlDataAdapter(cmd)) da.Fill(dt);
+   338	            if (dt.Rows.Count > 0) row = dt.Rows[0];
+   339	        }
+   340	
+   341	        if (row == null)
+   342	        {
+   343	            ExPanel.JSProperties["cpMsg"] = "That exit record no longer exists.";
+   344	            ExPanel.JSProperties["cpReloadList"] = true;
+   345	            return;
+   346	        }
+   347	
+   348	        CurrentExitId = id;
+   349	
+   350	        txtExitNo.Text = Convert.ToString(row["ExitNo"]);
+   351	
+   352	        // The employee cannot be changed once the exit exists - the snapshot came from them.
+   353	        cmbEmployee.Value = Convert.ToInt64(row["EmployeeMasterID"]);
+   354	        cmbEmployee.Enabled = false;
+   355	
+   356	        cmbInterviewStatus.Value = Convert.ToString(row["InterviewStatus"]);
+   357	        dtInterview.Value = NullIfDbNull(row["InterviewDate"]);
+   358	        cmbInterviewBy.Value = NullIfDbNull(row["InterviewByUserMasterID"]);
+   359	        cmbReason.Value = NullIfDbNull(row["ReasonForLeaving"]);
+   360	        memEmployeeFeedback.Text = Convert.ToString(row["EmployeeFeedback"]);
+   361	        memManagerFeedback.Text = Convert.ToString(row["ManagerFeedback"]);
+   362	
+   363	        litSnapshot.Text = BuildSnapshotHtml(row);
+   364	        litBanner.Text = BuildBannerHtml(row);
+   365	
+   366	        AssetGrid.DataBind();
+   367	        ClearanceGrid.DataBind();
+   368	
+   369	        bool complete = row["IsComplete"] != DBNull.Value && Convert.ToBoolean(row["IsComplete"]);
+   370	        bool alreadyCased = Convert.ToInt32(row["ExistingCases"]) > 0;
+   371	
+   372	        ExPanel.JSProperties["cpCreating"] = "0";
+   373	        // Offer Create F&F Case only when the exit is done AND no live case exists, so the
+   374	        // button cannot make a second settlement for the same person.
+   375	        ExPanel.JSProperties["cpComplete"] = (complete && !alreadyCased) ? "1" : "0";
+   376	    }
+   377	
+   378	    private static object NullIfDbNull(object value)
+   379	    {
+   380	        return (value == null || value == DBNull.Value) ? null : value;
+   381	    }
+   382	
+   383	    private static string Cell(string label, object value)
+   384	    {
+   385	        string text = (value == null || value == DBNull.Value || Convert.ToString(value).Length == 0)
+   386	            ? "<i style=\"color:#999\">not set</i>"
+   387	            : HttpUtility.HtmlEncode(Convert.ToString(value));
+   388	
+   389	        return "<td style=\"padding:4px 14px 4px 0;white-space:nowrap\"><span style=\"color:#777\">" +
+   390	               HttpUtility.HtmlEncode(label) + "</span><br /><b>" + text + "</b></td>";
+   391	    }
+   392	
+   393	    private static string DateCell(string label, object value)
+   394	    {
+   395	        if (value == null || value == DBNull.Value) return Cell(label, null);
+   396	        return Cell(label, Convert.ToDateTime(value).ToString("dd-MM-yyyy"));
+   397	    }
+   398	
+   399	    private string BuildSnapshotHtml(DataRow row)
+   400	    {
+   401	        var sb = new System.Text.StringBuilder();
+   402	        sb.Append("<table class=\"ex-kv\" style=\"border-collapse:collapse\"><tr>");
+   403	        sb.Append(Cell("Employee", row["EmployeeName"]));
+   404	        sb.Append(Cell("Code", row["EmployeeCode"]));
+   405	        sb.Append(Cell("Department", row["DepartmentName"]));
+   406	        sb.Append(Cell("Designation", row["DesignationName"]));
+   407	        sb.Append(Cell("Manager", row["ManagerName"]));
+   408	        sb.Append("</tr><tr>");
+   409	        sb.Append(DateCell("Joining Date", row["DateOfJoining"]));
+   410	        sb.Append(DateCell("Resignation Date", row["ResignDate"]));
+   411	        sb.Append(DateCell("Last Working Day", row["LastWorkingDate"]));
+   412	        sb.Append(Cell("Dues Raised", Convert.ToDecimal(row["TotalDues"]).ToString("n2")));
+   413	        sb.Append(DateCell("Completed On", row["CompletedOn"]));
+   414	        sb.Append("</tr></table>");
+   415	        return sb.ToString();
+   416	    }
+   417	
+   418	    /// <summary>
+   419	    /// The verdict, plus a three-step indicator so it is obvious WHICH of the three parts is
+   420	    /// holding things up rather than just that something is.
+   421	    /// </summary>
+   422	    private string BuildBannerHtml(DataRow row)
+   423	    {
+   424	        bool complete = row["IsComplete"] != DBNull.Value && Convert.ToBoolean(row["IsComplete"]);
+   425	        bool assets = row["AssetReturnComplete"] != DBNull.Value && Convert.ToBoolean(row["AssetReturnComplete"]);
+   426	        bool clearance = row["ClearanceComplete"] != DBNull.Value && Convert.ToBoolean(row["ClearanceComplete"]);
+   427	
+   428	        string status = Convert.ToString(row["InterviewStatus"]);
+   429	        bool interview = status == ExitFormalityService.InterviewCompleted
+   430	                      || status == ExitFormalityService.InterviewUnavailable
+   431	                      || status == ExitFormalityService.InterviewSkipped;
+   432	
+   433	        string steps =
+   434	            Step("Exit Interview", interview) +
+   435	            Step("Asset Return", assets) +
+   436	            Step("Department Clearance", clearance);
+   437	
+   438	        if (complete)
+   439	        {
+   440	            return "<div class=\"ex-banner ready\">Exit Formality complete &mdash; the F&amp;F case "
+   441	                 + "can now be created.<div style=\"margin-top:6px\">" + steps + "</div></div>";
+   442	        }
+   443	
+   444	        string reason = Convert.ToString(row["BlockReason"]);
+   445	        if (string.IsNullOrEmpty(reason)) reason = "Not checked yet - press Re-check.";
+   446	
+   447	        return "<div class=\"ex-banner blocked\">Exit Formality not complete &mdash; "
+   448	             + HttpUtility.HtmlEncode(reason)
+   449	             + "<div style=\"margin-top:6px\">" + steps + "</div></div>";
+   450	    }
+   451	
+   452	    private static string Step(string label, bool done)
+   453	    {
+   454	        return "<span class=\"ex-step " + (done ? "done" : "todo") + "\">"
+   455	             + (done ? "&#10003; " : "&#9675; ") + HttpUtility.HtmlEncode(label) + "</span>";
+   456	    }
+   457	
+   458	    // -- Save / recheck -------------------------------------------------------
+   459	
+   460	    private void HandleSave()
+   461	    {
+   462	        if (CurrentExitId <= 0)
+   463	        {
+   464	            ExPanel.JSProperties["cpMsg"] = "Open an exit first.";
+   465	            return;
+   466	        }
+   467	
+   468	        const string sql = @"
+   469	            UPDATE dbo.HR_ExitFormality
+   470	            SET    InterviewStatus         = @Status,
+   471	                   InterviewDate           = @Date,
+   472	                   InterviewByUserMasterID = @By,
+   473	                   ReasonForLeaving        = @Reason,
+   474	                   EmployeeFeedback        = @EmpFeedback,
+   475	                   ManagerFeedback         = @MgrFeedback,
+   476	                   EditUserMasterID        = @UserID,
+   477	                   EditUserDateTime        = GETDATE()
+   478	            WHERE  ExitFormalityID = @Id AND Status = 1";
+   479	
+   480	        using (SqlConnection conn = CreateConnection())
+   481	        {
+   482	            conn.Open();
+   483	            using (var cmd = new SqlCommand(sql, conn))
+   484	            {
+   485	                cmd.Parameters.AddWithValue("@Status",
+   486	                    Str(cmbInterviewStatus.Value, ExitFormalityService.InterviewPending));
+   487	                cmd.Parameters.AddWithValue("@Date",
+   488	                    dtInterview.Value == null ? (object)DBNull.Value : dtInterview.Date);
+   489	                cmd.Parameters.AddWithValue("@By",
+   490	                    cmbInterviewBy.Value == null ? (object)DBNull.Value : Convert.ToInt64(cmbInterviewBy.Value));
+   491	                cmd.Parameters.AddWithValue("@Reason", Nullable(cmbReason.Value));
+   492	                cmd.Parameters.AddWithValue("@EmpFeedback", Nullable(memEmployeeFeedback.Text));
+   493	                cmd.Parameters.AddWithValue("@MgrFeedback", Nullable(memManagerFeedback.Text));
+   494	                cmd.Parameters.AddWithValue("@UserID", UserId);
+   495	                cmd.Parameters.AddWithValue("@Id", CurrentExitId);
+   496	                cmd.ExecuteNonQuery();
+   497	            }
+   498	
+   499	            // The interview is one of the three legs, so saving it changes the verdict.
+   500	            using (SqlTransaction tx = conn.BeginTransaction())
+   501	            {
+   502	                try { ExitFormalityService.Evaluate(conn, tx, CurrentExitId); tx.Commit(); }
+   503	                catch { try { tx.Rollback(); } catch { } throw; }
+   504	            }
+   505	        }
+   506	
+   507	        LoadExit(CurrentExitId);
+   508	        ExPanel.JSProperties["cpMsg"] = "Saved.";
+   509	    }
+   510	
+   511	    /// <summary>
+   512	    /// Re-reads asset returns and clearances and recomputes the verdict. Needed because both
+   513	    /// move underneath the exit: a return is recorded in the Assets module, not here.
+   514	    /// </summary>
+   515	    private void HandleRecheck()
+   516	    {
+   517	        if (CurrentExitId <= 0) return;
+   518	
+   519	        using (SqlConnection conn = CreateConnection())
+   520	        {
+   521	            conn.Open();
+   522	            using (SqlTransaction tx = conn.BeginTransaction())
+   523	            {
+   524	                try
+   525	                {
+   526	                    ExitFormalityService.SeedClearances(conn, tx, CurrentExitId);
+   527	                    ExitFormalityService.Evaluate(conn, tx, CurrentExitId);
+   528	                    tx.Commit();
+   529	                }
+   530	                catch { try { tx.Rollback(); } catch { } throw; }
+   531	            }
+   532	        }
+   533	
+   534	        LoadExit(CurrentExitId);
+   535	        ExPanel.JSProperties["cpMsg"] = "Re-checked.";
+   536	    }
+   537	
+   538	    /// <summary>
+   539	    /// Creates the F&amp;F case and carries every department due into it as a recovery, then
+   540	    /// sends the user to the settlement screen. Both re-checked server-side: the callback is
+   541	    /// reachable from a second tab whatever the toolbar is showing.
+   542	    /// </summary>
+   543	    private void HandleMakeCase()
+   544	    {
+   545	        if (CurrentExitId <= 0) return;
+   546	
+   547	        long employeeId = 0;
+   548	        long caseId;
+   549	        int duesPushed;
+   550	
+   551	        using (SqlConnection conn = CreateConnection())
+   552	        {
+   553	            conn.Open();
+   554	
+   555	            using (var cmd = new SqlCommand(@"
+   556	                SELECT EmployeeMasterID, CAST(IsComplete AS int)
+   557	                FROM   dbo.HR_ExitFormality WHERE ExitFormalityID = @Id AND Status = 1", conn))
+   558	            {
+   559	                cmd.Parameters.AddWithValue("@Id", CurrentExitId);
+   560	                using (SqlDataReader rd = cmd.ExecuteReader())
+   561	                {
+   562	                    if (!rd.Read())
+   563	                    {
+   564	                        ExPanel.JSProperties["cpMsg"] = "That exit record no longer exists.";
+   565	                        return;
+   566	                    }
+   567	                    employeeId = rd.GetInt64(0);
+   568	                    if (rd.GetInt32(1) != 1)
+   569	                    {
+   570	                        ExPanel.JSProperties["cpMsg"] =
+   571	                            "This exit is not complete yet, so no F&F case was created.";
+   572	                        return;
+   573	                    }
+   574	                }
+   575	            }
+   576	
+   577	            // Refuse a second live case for the same person rather than creating one and
+   578	            // leaving two settlements to reconcile.
+   579	            using (var cmd = new SqlCommand(@"
+   580	                SELECT COUNT(*) FROM dbo.HR_FNFSettlement
+   581	                WHERE  EmployeeMasterID = @Emp AND Status = 1 AND WorkflowStatus <> 'Cancelled'", conn))
+   582	            {
+   583	                cmd.Parameters.AddWithValue("@Emp", employeeId);
+   584	                if (Convert.ToInt32(cmd.ExecuteScalar()) > 0)
+   585	                {
+   586	                    ExPanel.JSProperties["cpMsg"] =
+   587	                        "This employee already has an F&F case. Open it from Full & Final Settlement.";
+   588	                    return;
+   589	                }
+   590	            }
+   591	
+   592	            using (SqlTransaction tx = conn.BeginTransaction())
+   593	            {
+   594	                try
+   595	                {
+   596	                    caseId = FNFCaseService.CreateCase(conn, tx, employeeId, CompanyId, UserId,
+   597	                                                       HostNameCapped(), 90);
+   598	
+   599	                    // Record which exit it came from, then carry the dues over.
+   600	                    using (var cmd = new SqlCommand(
+   601	                        "UPDATE dbo.HR_FNFSettlement SET ExitFormalityID = @ExitId WHERE FNFSettlementID = @CaseId",
+   602	                        conn, tx))
+   603	                    {
+   604	                        cmd.Parameters.AddWithValue("@ExitId", CurrentExitId);
+   605	                        cmd.Parameters.AddWithValue("@CaseId", caseId);
+   606	                        cmd.ExecuteNonQuery();
+   607	                    }
+   608	
+   609	                    duesPushed = ExitFormalityService.PushDuesToCase(conn, tx, CurrentExitId, caseId,
+   610	                                                                     UserId, HostNameCapped());
+   611	                    tx.Commit();
+   612	                }
+   613	                catch
+   614	                {
+   615	                    try { tx.Rollback(); } catch { /* connection already gone */ }
+   616	                    throw;
+   617	                }
+   618	            }
+   619	        }
+   620	
+   621	        ExPanel.JSProperties["cpMsg"] = "F&F case created"
+   622	            + (duesPushed > 0 ? " with " + duesPushed + " recovery line(s) from department dues." : ".")
+   623	            + " Opening Full & Final Settlement.";
+   624	        ExPanel.JSProperties["cpGoToCase"] = ResolveUrl("~/Payroll/FNFSettlement.aspx");
+   625	    }
+   626	
+   627	    // -- Asset grid (read-only, from the Assets module) ------------------------
+   628	
+   629	    protected void AssetGrid_BeforePerformDataSelect(object sender, EventArgs e)
+   630	    {
+   631	        var table = new DataTable();
+   632	        if (CurrentExitId > 0)
+   633	        {
+   634	            try
+   635	            {
+   636	                using (SqlConnection conn = CreateConnection())
+   637	                {
+   638	                    conn.Open();
+   639	                    table = ExitFormalityService.OutstandingAssets(conn, null, CurrentExitId);
+   640	                }
+   641	            }
+   642	            catch (Exception ex)
+   643	            {
+   644	                ErrorLogHelper.Log(ex, "ExitFormality.LoadAssets");
+   645	            }
+   646	        }
+   647	        AssetGrid.DataSource = table;
+   648	    }
+   649	
+   650	    // -- Clearance grid -------------------------------------------------------
+   651	
+   652	    protected void ClearanceGrid_BeforePerformDataSelect(object sender, EventArgs e)
+   653	    {
+   654	        ClearanceGrid.DataSource = LoadClearances();
+   655	    }
+   656	
+   657	    private DataTable LoadClearances()
+   658	    {
+   659	        var table = new DataTable();
+   660	        if (CurrentExitId <= 0) return table;
+   661	
+   662	        const string sql = @"
+   663	            SELECT C.ExitClearanceID, C.DepartmentCode, C.DepartmentName, C.ChecklistHint,
+   664	                   C.ClearanceStatus, C.Remarks, ISNULL(C.DuesAmount, 0) AS DuesAmount,
+   665	                   C.DuesDescription, C.ClearedOn, C.SortOrder,
+   666	                   ISNULL(U.UserName, '') AS ClearedByName
+   667	            FROM   dbo.HR_ExitClearance C
+   668	            LEFT   JOIN dbo.HR_UserMaster U ON U.UserMasterID = C.ClearedByUserMasterID
+   669	            WHERE  C.ExitFormalityID = @Id
+   670	            ORDER  BY C.SortOrder, C.ExitClearanceID";
+   671	
+   672	        try
+   673	        {
+   674	            using (SqlConnection conn = CreateConnection())
+   675	            using (var cmd = new SqlCommand(sql, conn))
+   676	            {
+   677	                cmd.Parameters.AddWithValue("@Id", CurrentExitId);
+   678	                using (var da = new SqlDataAdapter(cmd)) da.Fill(table);
+   679	            }
+   680	        }
+   681	        catch (Exception ex)
+   682	        {
+   683	            ErrorLogHelper.Log(ex, "ExitFormality.LoadClearances");
+   684	        }
+   685	        return table;
+   686	    }
+   687	
+   688	    protected void ClearanceGrid_RowUpdating(object sender, DevExpress.Web.Data.ASPxDataUpdatingEventArgs e)
+   689	    {
+   690	        e.Cancel = true;
+   691	        try
+   692	        {
+   693	            if (CurrentExitId <= 0)
+   694	            {
+   695	                ExPanel.JSProperties["cpMsg"] = "Open an exit first.";
+   696	                ClearanceGrid.CancelEdit();
+   697	                return;
+   698	            }
+   699	
+   700	            string status = Str(e.NewValues["ClearanceStatus"], ExitFormalityService.ClearancePending);
+   701	            decimal dues = Money(e.NewValues["DuesAmount"]);
+   702	
+   703	            // An objection with an amount is how a due gets recorded; without a description
+   704	            // the F&F recovery line would read as an unexplained deduction.
+   705	            if (status == ExitFormalityService.ClearanceObjection && dues > 0
+   706	                && string.IsNullOrEmpty(Convert.ToString(e.NewValues["DuesDescription"])))
+   707	            {
+   708	                ExPanel.JSProperties["cpMsg"] =
+   709	                    "Say what the dues are for - it becomes the description on the F&F recovery line.";
+   710	                return;     // leave the row in edit so the text can be typed
+   711	            }
+   712	
+   713	            // Only stamp who cleared it when an actual answer was given, so re-saving a
+   714	            // still-Pending row does not claim somebody answered it.
+   715	            bool answered = (status != ExitFormalityService.ClearancePending);
+   716	
+   717	            const string sql = @"
+   718	                UPDATE dbo.HR_ExitClearance
+   719	                SET    ClearanceStatus = @Status,
+   720	                       Remarks         = @Remarks,
+   721	                       DuesAmount      = @Dues,
+   722	                       DuesDescription = @DuesDesc,
+   723	                       ClearedByUserMasterID = CASE WHEN @Answered = 1 THEN @UserID ELSE NULL END,
+   724	                       ClearedOn             = CASE WHEN @Answered = 1 THEN GETDATE() ELSE NULL END
+   725	                WHERE  ExitClearanceID = @RowId AND ExitFormalityID = @ExitId";
+   726	
+   727	            using (SqlConnection conn = CreateConnection())
+   728	            {
+   729	                conn.Open();
+   730	                using (var cmd = new SqlCommand(sql, conn))
+   731	                {
+   732	                    cmd.Parameters.AddWithValue("@Status", status);
+   733	                    cmd.Parameters.AddWithValue("@Remarks", Nullable(e.NewValues["Remarks"]));
+   734	                    cmd.Parameters.AddWithValue("@Dues", dues);
+   735	                    cmd.Parameters.AddWithValue("@DuesDesc", Nullable(e.NewValues["DuesDescription"]));
+   736	                    cmd.Parameters.AddWithValue("@Answered", answered);
+   737	                    cmd.Parameters.AddWithValue("@UserID", UserId);
+   738	                    cmd.Parameters.AddWithValue("@RowId", Convert.ToInt64(e.Keys[ClearanceGrid.KeyFieldName]));
+   739	                    cmd.Parameters.AddWithValue("@ExitId", CurrentExitId);
+   740	                    cmd.ExecuteNonQuery();
+   741	                }
+   742	
+   743	                using (SqlTransaction tx = conn.BeginTransaction())
+   744	                {
+   745	                    try { ExitFormalityService.Evaluate(conn, tx, CurrentExitId); tx.Commit(); }
+   746	                    catch { try { tx.Rollback(); } catch { } throw; }
+   747	                }
+   748	            }
+   749	
+   750	            ClearanceGrid.CancelEdit();
+   751	            LoadExit(CurrentExitId);      // refreshes the banner, the steps and the dues total
+   752	        }
+   753	        catch (Exception ex)
+   754	        {
+   755	            ErrorLogHelper.Log(ex, "ExitFormality.ClearanceUpdate");
+   756	            ExPanel.JSProperties["cpMsg"] = ErrorLogHelper.FriendlyMessage;
+   757	        }
+   758	    }
+   759	
+   760	    // -- helpers --------------------------------------------------------------
+   761	
+   762	    private static string Str(object value, string fallback)
+   763	    {
+   764	        string text = Convert.ToString(value);
+   765	        return string.IsNullOrEmpty(text) ? fallback : text;
+   766	    }
+   767	
+   768	    private static object Nullable(object value)
+   769	    {
+   770	        string text = Convert.ToString(value);
+   771	        return string.IsNullOrEmpty(text) ? (object)DBNull.Value : text;
+   772	    }
+   773	
+   774	    private static decimal Money(object value)
+   775	    {
+   776	        if (value == null || value == DBNull.Value) return 0m;
+   777	        decimal amount;
+   778	        return decimal.TryParse(Convert.ToString(value), out amount) ? amount : 0m;
+   779	    }
+   780	}

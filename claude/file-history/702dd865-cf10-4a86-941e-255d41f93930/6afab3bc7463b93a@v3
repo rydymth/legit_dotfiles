@@ -1,0 +1,178 @@
+/*
+    Update: Canteen meal session ordering deadlines
+    Date: 2026-10-23
+
+    HOW THE DEADLINE WORKS
+      Every meal session carries the moment ordering closes, as a clock time plus how many days before
+      the meal that clock time falls on:
+        OrderCutoffTime       the clock time ordering closes
+        OrderCutoffDaysBefore 0 = that time on the day of the meal, 1 = the day before, 2 = two days before ...
+      So "Breakfast has to be asked for by 11:59 PM the night before" is 23:59 + 1, and "Lunch by 9:30 in
+      the morning" is 09:30 + 0. The same deadline governs cancelling: after it passes the count is final,
+      the employee can neither add nor drop that meal.
+
+    HOW TO USE
+      1. Run it as it is. It changes nothing: it lists every meal session with its current and new deadline.
+      2. Fill in your deadlines in the EDIT HERE block (one UPDATE line per session). A column left out stays
+         as it is.
+      3. Run it again and check the "new" columns, then set @Apply = 1 and run it a last time to save.
+
+    WHAT IT WILL REFUSE
+      - A same-day deadline (DaysBefore = 0) later than the meal's own start time. Breakfast served
+        07:30-09:30 cannot be ordered at 08:00 on the day: use 07:30 or earlier, or set DaysBefore = 1.
+      - Fewer than 0 or more than 7 days before.
+      A deadline further back than HR_CMS_Config.MaxOrderCutoffDaysBefore (default 1) saves fine here and
+      keeps working, but cannot be moved further back from the Meal Session screen until that row is raised.
+
+    Run Migration_CanteenMealSessionOrderCutoff_20261023.sql first (it adds the columns).
+    Safe to run more than once. SQL Server 2014 compatible.
+*/
+
+SET NOCOUNT ON;
+
+DECLARE @Apply        BIT    = 0;   -- 0 = preview only (default), 1 = save the changes
+DECLARE @ModifiedById BIGINT = 1;   -- written to HR_CMS_MealSession.ModifiedById
+
+-- One row per session name, filled in by you below. (COLLATE DATABASE_DEFAULT: a temp table otherwise takes
+-- tempdb's collation, which can differ from this database's and makes every comparison with a real column fail
+-- with error 468.) NULL = keep the current value. Pre-filled with the real session names, so a mistyped name can
+-- never be the reason an update did nothing.
+IF OBJECT_ID('tempdb..#Cutoffs') IS NOT NULL DROP TABLE #Cutoffs;
+CREATE TABLE #Cutoffs
+(
+    SessionName NVARCHAR(50) COLLATE DATABASE_DEFAULT NOT NULL PRIMARY KEY,
+    CutoffTime  TIME(0) NULL,
+    DaysBefore  INT     NULL
+);
+
+IF OBJECT_ID(N'[dbo].[HR_CMS_SessionName]', N'U') IS NULL OR OBJECT_ID(N'[dbo].[HR_CMS_MealSession]', N'U') IS NULL
+BEGIN
+    RAISERROR(N'HR_CMS_SessionName / HR_CMS_MealSession do not exist in this database.', 16, 1);
+    RETURN;
+END
+
+IF COL_LENGTH('dbo.HR_CMS_MealSession', 'OrderCutoffTime') IS NULL OR COL_LENGTH('dbo.HR_CMS_MealSession', 'OrderCutoffDaysBefore') IS NULL
+BEGIN
+    RAISERROR(N'The ordering deadline columns are missing. Run Migration_CanteenMealSessionOrderCutoff_20261023.sql first.', 16, 1);
+    RETURN;
+END
+
+INSERT INTO #Cutoffs (SessionName) SELECT SessionName FROM dbo.HR_CMS_SessionName;
+
+/* ========================== EDIT HERE ==========================================================================
+   One line per session. Delete the leading -- and put your own deadline in.
+   Examples (illustration only - these are NOT the agreed figures):
+
+   -- Breakfast has to be in by the end of the previous evening, so the kitchen can shop overnight:
+   -- UPDATE #Cutoffs SET CutoffTime = '23:59', DaysBefore = 1 WHERE SessionName = N'Breakfast';
+
+   -- Lunch is counted at half past nine the same morning:
+   -- UPDATE #Cutoffs SET CutoffTime = '09:30', DaysBefore = 0 WHERE SessionName = N'Lunch';
+
+   -- Evening Snacks: by lunchtime the same day.
+   -- UPDATE #Cutoffs SET CutoffTime = '13:00', DaysBefore = 0 WHERE SessionName = N'Evening Snacks';
+
+   -- Dinner: by the end of the morning the same day.
+   -- UPDATE #Cutoffs SET CutoffTime = '11:00', DaysBefore = 0 WHERE SessionName = N'Dinner';
+
+   -- Move a deadline to the day before without changing the clock time:
+   -- UPDATE #Cutoffs SET DaysBefore = 1 WHERE SessionName = N'Breakfast';
+   ================================================================================================================ */
+
+
+
+-- ---------------------------------------------------------------------------------------------------------------------
+-- Nothing below needs editing.
+-- (Dynamic SQL, so a database that has not had the migration yet gets the message above instead of a compile error.)
+-- ---------------------------------------------------------------------------------------------------------------------
+DECLARE @sql NVARCHAR(MAX) = N'
+IF EXISTS (SELECT 1 FROM #Cutoffs WHERE DaysBefore < 0 OR DaysBefore > 7)
+BEGIN
+    RAISERROR(N''A deadline can be 0 (the day of the meal) to 7 days before it, nothing else.'', 16, 1);
+    RETURN;
+END
+
+-- A same-day deadline after the meal has already started would be unreachable.
+IF EXISTS (
+    SELECT 1
+    FROM dbo.HR_CMS_MealSession ms
+    INNER JOIN dbo.HR_CMS_SessionName n ON n.SessionNameId = ms.SessionNameId
+    INNER JOIN #Cutoffs c ON c.SessionName = n.SessionName COLLATE DATABASE_DEFAULT
+    WHERE ISNULL(c.DaysBefore, ms.OrderCutoffDaysBefore) = 0
+      AND ISNULL(c.CutoffTime, ms.OrderCutoffTime) > ms.StartTime)
+BEGIN
+    SELECT [Deadline is after this meal starts - set an earlier time, or DaysBefore = 1] = n.SessionName,
+           [Meal starts] = CONVERT(CHAR(5), ms.StartTime, 108),
+           [Deadline]    = CONVERT(CHAR(5), ISNULL(c.CutoffTime, ms.OrderCutoffTime), 108)
+    FROM dbo.HR_CMS_MealSession ms
+    INNER JOIN dbo.HR_CMS_SessionName n ON n.SessionNameId = ms.SessionNameId
+    INNER JOIN #Cutoffs c ON c.SessionName = n.SessionName COLLATE DATABASE_DEFAULT
+    WHERE ISNULL(c.DaysBefore, ms.OrderCutoffDaysBefore) = 0
+      AND ISNULL(c.CutoffTime, ms.OrderCutoffTime) > ms.StartTime;
+
+    RAISERROR(N''Nothing was changed - see the meal session(s) listed above.'', 16, 1);
+    RETURN;
+END
+
+-- 1. What each meal session has now, what it will have, and whether anything changes.
+SELECT n.SessionName,
+       ms.IsActive,
+       [Served]        = CONVERT(CHAR(5), ms.StartTime, 108) + N'' - '' + CONVERT(CHAR(5), ms.EndTime, 108),
+       [Order by now]  = CONVERT(CHAR(5), ms.OrderCutoffTime, 108),
+       [Days before now] = ms.OrderCutoffDaysBefore,
+       [Order by new]  = CONVERT(CHAR(5), ISNULL(c.CutoffTime, ms.OrderCutoffTime), 108),
+       [Days before new] = ISNULL(c.DaysBefore, ms.OrderCutoffDaysBefore),
+       [Reads as]      = CONVERT(CHAR(5), ISNULL(c.CutoffTime, ms.OrderCutoffTime), 108)
+                       + CASE ISNULL(c.DaysBefore, ms.OrderCutoffDaysBefore)
+                             WHEN 0 THEN N'' on the day of the meal''
+                             WHEN 1 THEN N'' the day before''
+                             ELSE N'', '' + CAST(ISNULL(c.DaysBefore, ms.OrderCutoffDaysBefore) AS NVARCHAR(10)) + N'' days before''
+                         END,
+       [Result] = CASE WHEN ISNULL(c.CutoffTime, ms.OrderCutoffTime) = ms.OrderCutoffTime
+                        AND ISNULL(c.DaysBefore, ms.OrderCutoffDaysBefore) = ms.OrderCutoffDaysBefore
+                       THEN N''no change'' ELSE N''WILL CHANGE'' END
+FROM dbo.HR_CMS_MealSession ms
+INNER JOIN dbo.HR_CMS_SessionName n ON n.SessionNameId = ms.SessionNameId
+LEFT  JOIN #Cutoffs c ON c.SessionName = n.SessionName COLLATE DATABASE_DEFAULT
+ORDER BY n.SortOrder, n.SessionName;
+
+-- 2. Session names you gave a deadline for that have no meal session row yet (add it on the Meal Session screen first).
+SELECT c.SessionName AS [Has a deadline above but no meal session row - nothing to update]
+FROM #Cutoffs c
+WHERE (c.CutoffTime IS NOT NULL OR c.DaysBefore IS NOT NULL)
+  AND NOT EXISTS (SELECT 1 FROM dbo.HR_CMS_MealSession ms INNER JOIN dbo.HR_CMS_SessionName n ON n.SessionNameId = ms.SessionNameId WHERE n.SessionName COLLATE DATABASE_DEFAULT = c.SessionName);
+
+IF @Apply = 1
+BEGIN
+    BEGIN TRAN;
+
+    UPDATE ms
+       SET ms.OrderCutoffTime       = ISNULL(c.CutoffTime, ms.OrderCutoffTime),
+           ms.OrderCutoffDaysBefore = ISNULL(c.DaysBefore, ms.OrderCutoffDaysBefore),
+           ms.ModifiedDate          = GETDATE(),
+           ms.ModifiedById          = @ModifiedById
+    FROM dbo.HR_CMS_MealSession ms
+    INNER JOIN dbo.HR_CMS_SessionName n ON n.SessionNameId = ms.SessionNameId
+    INNER JOIN #Cutoffs c ON c.SessionName = n.SessionName COLLATE DATABASE_DEFAULT
+    WHERE ISNULL(c.CutoffTime, ms.OrderCutoffTime) <> ms.OrderCutoffTime
+       OR ISNULL(c.DaysBefore, ms.OrderCutoffDaysBefore) <> ms.OrderCutoffDaysBefore;
+
+    DECLARE @updated INT = @@ROWCOUNT;
+    COMMIT;
+
+    SELECT @updated AS [Meal sessions updated];
+
+    -- 3. The deadlines as they are now.
+    SELECT n.SessionName,
+           [Served]   = CONVERT(CHAR(5), ms.StartTime, 108) + N'' - '' + CONVERT(CHAR(5), ms.EndTime, 108),
+           [Order by] = CONVERT(CHAR(5), ms.OrderCutoffTime, 108),
+           [Days before] = ms.OrderCutoffDaysBefore
+    FROM dbo.HR_CMS_MealSession ms
+    INNER JOIN dbo.HR_CMS_SessionName n ON n.SessionNameId = ms.SessionNameId
+    ORDER BY n.SortOrder, n.SessionName;
+END
+ELSE
+    PRINT N''Preview only - nothing was changed. Set @Apply = 1 to save.'';
+';
+
+EXEC sp_executesql @sql, N'@Apply BIT, @ModifiedById BIGINT', @Apply = @Apply, @ModifiedById = @ModifiedById;

@@ -1,0 +1,247 @@
+import { CommonModule } from '@angular/common';
+import { Component, OnInit } from '@angular/core';
+import { FormBuilder, FormGroup, ReactiveFormsModule, Validators } from '@angular/forms';
+import {
+  DxButtonModule,
+  DxCheckBoxModule,
+  DxPopupModule,
+  DxSelectBoxModule,
+  DxTextAreaModule,
+  DxTextBoxModule,
+} from 'devextreme-angular';
+import { finalize } from 'rxjs/operators';
+import { CommonGridComponent } from '../../../../layout/common-grid/common-grid.component';
+import { EmployeePickerComponent, PickerOption } from '../../../../shared/employee-picker/employee-picker.component';
+import { AuthService } from '../../../../services/auth.service';
+import { ChipNavigationService } from '../../../../services/ChipNavigation.service';
+import { ToastService } from '../../../../services/toaster.service';
+import { ListFnfAlumniModel } from '../../models/fnf.model';
+import { FnfApiService } from '../../services/fnf-api.service';
+
+const REASON_OPTIONS = [
+  'Better opportunity',
+  'Salary',
+  'Relocation',
+  'Personal reasons',
+  'Higher studies',
+  'Health',
+  'Retirement',
+  'Termination',
+  'Other',
+];
+
+const REHIRE_OPTIONS = [
+  { value: true, text: 'Yes' },
+  { value: false, text: 'No' },
+];
+
+/** Rehire/blacklist notes, keyed by employee — most rows are auto-written when an employee accepts their settlement. */
+@Component({
+  selector: 'app-fnf-alumni-list',
+  standalone: true,
+  imports: [
+    CommonModule,
+    ReactiveFormsModule,
+    CommonGridComponent,
+    EmployeePickerComponent,
+    DxPopupModule,
+    DxTextBoxModule,
+    DxTextAreaModule,
+    DxCheckBoxModule,
+    DxSelectBoxModule,
+    DxButtonModule,
+  ],
+  templateUrl: './list.component.html',
+})
+export class FnfAlumniListComponent implements OnInit {
+  columns: Record<string, unknown>[] = [];
+  data: ListFnfAlumniModel[] = [];
+  isLoading = false;
+
+  reasonOptions = REASON_OPTIONS;
+  rehireOptions = REHIRE_OPTIONS;
+  employees: PickerOption[] = [];
+
+  popupVisible = false;
+  saving = false;
+  isEditMode = false;
+  submitted = false;
+  form: FormGroup;
+  private editingId: number | null = null;
+
+  constructor(
+    private authService: AuthService,
+    private fnfApi: FnfApiService,
+    private toast: ToastService,
+    private fb: FormBuilder,
+    private chipService: ChipNavigationService,
+  ) {
+    this.authService.ScreenName = 'Alumni Register';
+    this.chipService.addTab({ title: 'Alumni Register', route: '/fnf/alumni' });
+    this.form = this.fb.group({
+      employeeMasterId: [null, Validators.required],
+      reasonForLeaving: [''],
+      managerFeedback: [''],
+      eligibleForRehire: [null],
+      blacklistFlag: [false],
+      blacklistReason: [''],
+      hrRemarks: [''],
+    });
+  }
+
+  ngOnInit(): void {
+    this.columns = [
+      { dataField: 'employeeCode', caption: 'Code', width: 100 },
+      { dataField: 'employeeName', caption: 'Employee Name' },
+      { dataField: 'caseNo', caption: 'F&F Case No.', width: 130 },
+      { dataField: 'reasonForLeaving', caption: 'Reason for Leaving' },
+      {
+        dataField: 'eligibleForRehire',
+        caption: 'Rehire?',
+        width: 110,
+        cellTemplate: (container: HTMLElement, options: any) => {
+          const span = document.createElement('span');
+          const value = options.data?.eligibleForRehire;
+          span.className = `status-pill ${value === true ? 'status-approved' : value === false ? 'status-rejected' : 'status-hold'}`;
+          span.innerText = value === true ? 'Yes' : value === false ? 'No' : 'Not assessed';
+          container.appendChild(span);
+        },
+      },
+      {
+        dataField: 'blacklistFlag',
+        caption: 'Blacklisted',
+        width: 110,
+        cellTemplate: (container: HTMLElement, options: any) => {
+          const span = document.createElement('span');
+          span.className = `status-pill ${options.data?.blacklistFlag ? 'status-rejected' : 'status-hold'}`;
+          span.innerText = options.data?.blacklistFlag ? 'Yes' : 'No';
+          container.appendChild(span);
+        },
+      },
+      { dataField: 'hrRemarks', caption: 'HR Remarks' },
+    ];
+
+    this.load();
+    this.loadEmployees();
+  }
+
+  get gridSubtitle(): string {
+    const n = this.data.length;
+    return `${n} record${n === 1 ? '' : 's'}`;
+  }
+
+  load(): void {
+    this.isLoading = true;
+    this.fnfApi
+      .getAlumni()
+      .pipe(finalize(() => (this.isLoading = false)))
+      .subscribe({
+        next: (res) => {
+          if (!FnfApiService.isOk(res)) {
+            this.data = [];
+            this.toast.error(FnfApiService.messageOf(res, 'Failed to load alumni records.'));
+            return;
+          }
+          const rows = FnfApiService.dataOf<ListFnfAlumniModel[]>(res);
+          this.data = Array.isArray(rows) ? rows : [];
+        },
+        error: (err) => {
+          this.data = [];
+          this.toast.error(FnfApiService.errorMessage(err, 'Failed to load alumni records.'));
+        },
+      });
+  }
+
+  private loadEmployees(): void {
+    this.fnfApi.getEmployees(this.authService.getBranchId()).subscribe({
+      next: (list) => (this.employees = list),
+    });
+  }
+
+  onAdd(): void {
+    this.isEditMode = false;
+    this.submitted = false;
+    this.editingId = null;
+    this.form.reset({
+      employeeMasterId: null,
+      reasonForLeaving: '',
+      managerFeedback: '',
+      eligibleForRehire: null,
+      blacklistFlag: false,
+      blacklistReason: '',
+      hrRemarks: '',
+    });
+    this.popupVisible = true;
+  }
+
+  onEdit(row: ListFnfAlumniModel): void {
+    this.isEditMode = true;
+    this.submitted = false;
+    this.editingId = row.fnfAlumniId;
+    this.form.reset({
+      employeeMasterId: row.employeeMasterId,
+      reasonForLeaving: row.reasonForLeaving ?? '',
+      managerFeedback: row.managerFeedback ?? '',
+      eligibleForRehire: row.eligibleForRehire,
+      blacklistFlag: row.blacklistFlag,
+      blacklistReason: row.blacklistReason ?? '',
+      hrRemarks: row.hrRemarks ?? '',
+    });
+    this.popupVisible = true;
+  }
+
+  onDelete(row: ListFnfAlumniModel): void {
+    this.fnfApi.deleteAlumni(row.fnfAlumniId).subscribe({
+      next: (res) => {
+        if (!FnfApiService.isOk(res)) {
+          this.toast.error(FnfApiService.messageOf(res, 'Delete failed.'));
+          return;
+        }
+        this.toast.success(FnfApiService.messageOf(res, 'Record removed.'));
+        this.load();
+      },
+      error: (err) => this.toast.error(FnfApiService.errorMessage(err, 'Unable to delete record.')),
+    });
+  }
+
+  get needsBlacklistReason(): boolean {
+    return !!this.form.value.blacklistFlag;
+  }
+
+  hasError(field: string, error: string): boolean {
+    const control = this.form.get(field);
+    return !!control && (control.touched || this.submitted) && control.hasError(error);
+  }
+
+  save(): void {
+    this.submitted = true;
+    if (this.form.invalid) {
+      this.form.markAllAsTouched();
+      return;
+    }
+    if (this.needsBlacklistReason && !String(this.form.value.blacklistReason ?? '').trim()) {
+      this.toast.error('Give the reason for blacklisting — it must not sit on the record unexplained.');
+      return;
+    }
+
+    const value = this.form.value;
+    this.saving = true;
+
+    const request$ = this.isEditMode
+      ? this.fnfApi.updateAlumni({ fnfAlumniId: this.editingId!, ...value })
+      : this.fnfApi.addAlumni(value);
+
+    request$.pipe(finalize(() => (this.saving = false))).subscribe({
+      next: (res) => {
+        if (!FnfApiService.isOk(res)) {
+          this.toast.error(FnfApiService.messageOf(res, 'Save failed.'));
+          return;
+        }
+        this.toast.success(FnfApiService.messageOf(res, 'Saved.'));
+        this.popupVisible = false;
+        this.load();
+      },
+      error: (err) => this.toast.error(FnfApiService.errorMessage(err, 'Unable to save record.')),
+    });
+  }
+}

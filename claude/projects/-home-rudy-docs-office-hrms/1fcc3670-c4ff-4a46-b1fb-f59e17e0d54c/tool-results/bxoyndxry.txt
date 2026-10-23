@@ -1,0 +1,838 @@
+     1	using Microsoft.Data.SqlClient;
+     2	using Microsoft.Extensions.Logging;
+     3	using SolutionOne_BusinessLogicLayer.Services.Approval.Interface;
+     4	using SolutionOne_BusinessLogicLayer.Services.Common.Interface;
+     5	using SolutionOne_BusinessLogicLayer.Services.Payroll.Interface;
+     6	using SolutionOne_Core.ApprovalModels;
+     7	using SolutionOne_Core.CommonModels;
+     8	using SolutionOne_Core.PayrollModels;
+     9	using SolutionOne_DataAccessLayer.Repositories.Common.Interface;
+    10	using SolutionOne_DataAccessLayer.Repositories.Payroll.Interface;
+    11	using System.Net;
+    12	
+    13	namespace SolutionOne_BusinessLogicLayer.Services.Payroll.Implementation;
+    14	
+    15	/// <summary>
+    16	/// F&amp;F case lifecycle. Ported from the legacy FNFCaseService.
+    17	/// </summary>
+    18	/// <remarks>
+    19	/// The FNF-2026-00002 rule lives in IFnfCalculationService.ChecklistIncompleteReasonAsync -
+    20	/// called from both SubmitAsync (here) and FnfApproval's approve path, as ONE shared method,
+    21	/// not two near-duplicates.
+    22	/// </remarks>
+    23	public class FnfCaseService(
+    24	    IFnfSettlementRepository repository,
+    25	    IFnfCalculationService calculationService,
+    26	    INotificationRepository notificationRepository,
+    27	    IRequestMetadata requestMetadata,
+    28	    IApprovalService approvalService,
+    29	    ILogger<FnfCaseService> logger
+    30	) : IFnfCaseService
+    31	{
+    32	    private readonly IFnfSettlementRepository _repository = repository;
+    33	    private readonly IFnfCalculationService _calculationService = calculationService;
+    34	    private readonly INotificationRepository _notificationRepository = notificationRepository;
+    35	    private readonly IRequestMetadata _requestMetadata = requestMetadata;
+    36	    private readonly IApprovalService _approvalService = approvalService;
+    37	    private readonly ILogger<FnfCaseService> _logger = logger;
+    38	
+    39	    private static bool CanEdit(string? status) => string.IsNullOrEmpty(status) || string.Equals(status, "Draft", StringComparison.OrdinalIgnoreCase);
+    40	
+    41	    private static readonly (string Code, string Name)[] ReadinessChecks =
+    42	    {
+    43	        ("RESIGN_APPROVED", "Resignation Approved by Manager"),
+    44	        ("EXIT_INTERVIEW", "Exit Interview Submitted"),
+    45	        ("IT_CLEARANCE", "IT Clearance (Asset Return)"),
+    46	        ("ADMIN_CLEARANCE", "Admin Clearance"),
+    47	        ("FIN_CLEARANCE", "Finance Clearance (No Dues)"),
+    48	        ("MGR_CLEARANCE", "Manager Clearance (Handover/KT)"),
+    49	        ("LEAVE_BAL", "Leave Balance Updated"),
+    50	        ("LOAN_LEDGER", "Loan/Advance Ledger Updated"),
+    51	        ("ATT_FINAL", "Attendance Finalized till LWD"),
+    52	    };
+    53	
+    54	    public async Task<ResponseModel> GetEligibleEmployeesAsync()
+    55	    {
+    56	        var res = new ResponseModel();
+    57	        var companyId = _requestMetadata.CompanyId;
+    58	        try
+    59	        {
+    60	            var config = await _calculationService.LoadConfigAsync(companyId);
+    61	            var list = await _repository.GetEligibleEmployeesAsync(companyId, config.RequireExitFormality);
+    62	            return Success(res, "Fetched eligible employees.", list);
+    63	        }
+    64	        catch (Exception e)
+    65	        {
+    66	            _logger.LogError(e, "Exception while fetching eligible employees");
+    67	            return Fail(res, HttpStatusCode.InternalServerError, e.Message);
+    68	        }
+    69	    }
+    70	
+    71	    public async Task<ResponseModel> CreateCaseAsync(long employeeMasterId)
+    72	    {
+    73	        var res = new ResponseModel();
+    74	        var companyId = _requestMetadata.CompanyId;
+    75	        var userId = _requestMetadata.UserId;
+    76	        try
+    77	        {
+    78	            var snapshot = await _repository.GetEmployeeSnapshotAsync(employeeMasterId, companyId);
+    79	            if (snapshot == null) return Fail(res, HttpStatusCode.NotFound, "Employee not found.");
+    80	
+    81	            long caseId;
+    82	            try
+    83	            {
+    84	                caseId = await CreateCaseRow(employeeMasterId, snapshot.Value, userId, companyId);
+    85	            }
+    86	            catch (SqlException ex) when (ex.Number is 2601 or 2627)
+    87	            {
+    88	                // Two concurrent creates computed the same CaseNo - retry once with a fresh number.
+    89	                // See 05_FNFSettlementApproval.md §6 "NextCaseNo": this is strategy (b), a retry on
+    90	                // the unique-key violation, not the row-lock strategy (a).
+    91	                _logger.LogWarning(ex, "CaseNo collision creating F&F case for employee {EmployeeId}, retrying once", employeeMasterId);
+    92	                caseId = await CreateCaseRow(employeeMasterId, snapshot.Value, userId, companyId);
+    93	            }
+    94	
+    95	            await SeedReadinessAsync(caseId);
+    96	            await AutoAnswerReadinessAsync(caseId, employeeMasterId, snapshot.Value.DateOfLeft);
+    97	            await DiscoverRecoveriesAsync(caseId, employeeMasterId);
+    98	            await EvaluateClearanceAsync(caseId);
+    99	
+   100	            var created = await _repository.GetCaseByIdAsync(caseId, companyId);
+   101	            return Success(res, "F&F case created.", created);
+   102	        }
+   103	        catch (Exception e)
+   104	        {
+   105	            _logger.LogError(e, "Exception while creating F&F case for employee {EmployeeId}", employeeMasterId);
+   106	            return Fail(res, HttpStatusCode.InternalServerError, e.Message);
+   107	        }
+   108	    }
+   109	
+   110	    private async Task<long> CreateCaseRow(long employeeMasterId,
+   111	        (DateTime? ResignDate, DateTime? DateOfLeft, DateTime? DateOfJoining, long? DepartmentMasterId,
+   112	         long? DesignationMasterId, long? ReportingPersonId, int? NoticePeriodDays, long? ExitFormalityId) snapshot,
+   113	        long userId, long companyId)
+   114	    {
+   115	        var year = DateTime.Today.Year;
+   116	        var maxNumber = await _repository.GetMaxCaseNumberForYearAsync(year);
+   117	        var caseNo = $"FNF-{year}-{(maxNumber + 1):00000}";
+   118	
+   119	        return await _repository.AddCaseAsync(employeeMasterId, snapshot.ResignDate, snapshot.DateOfLeft,
+   120	            snapshot.DateOfJoining, snapshot.DepartmentMasterId, snapshot.DesignationMasterId,
+   121	            snapshot.ReportingPersonId, snapshot.NoticePeriodDays, snapshot.ExitFormalityId, caseNo, userId, companyId);
+   122	    }
+   123	
+   124	    private async Task SeedReadinessAsync(long caseId)
+   125	    {
+   126	        var sortOrder = 10;
+   127	        foreach (var (code, name) in ReadinessChecks)
+   128	        {
+   129	            await _repository.UpsertCheckAsync(caseId, "Readiness", code, name, isRequired: true,
+   130	                policyStandard: null, actualValue: null, sortOrder);
+   131	            sortOrder += 10;
+   132	        }
+   133	    }
+   134	
+   135	    private async Task AutoAnswerReadinessAsync(long caseId, long employeeMasterId, DateTime? lastWorkingDate = null)
+   136	    {
+   137	        var (count, totalBalance) = await _repository.GetActiveLeaveBalanceSummaryAsync(employeeMasterId);
+   138	        await _repository.AutoAnswerCheckIfUnansweredAsync(caseId, "LEAVE_BAL", count > 0 ? "Yes" : "No",
+   139	            $"{count} leave type(s), total balance {totalBalance:0.##} days.");
+   140	
+   141	        // LOAN_LEDGER never sets Result - Finance's own judgement call. Only Remarks is filled,
+   142	        // via the same "don't overwrite what's already there" guard the auto-checks use (Result
+   143	        // stays null either way, so this is a no-op the second time it runs for the same case).
+   144	        var outstanding = await _repository.GetOutstandingLoanAsync(employeeMasterId);
+   145	        await _repository.AutoAnswerCheckIfUnansweredAsync(caseId, "LOAN_LEDGER", result: null,
+   146	            remarks: $"Outstanding loan/advance EMI: {outstanding:0.##}.");
+   147	
+   148	        // ATT_FINAL genuinely gates Calculate later (via the FinalSalary line's own read of the
+   149	        // same confirmation table) - unanswerable without a last working date, left null rather
+   150	        // than guessed at.
+   151	        if (lastWorkingDate.HasValue)
+   152	        {
+   153	            var attendance = await _repository.GetMonthlyAttendanceAsync(employeeMasterId, lastWorkingDate.Value.Month, lastWorkingDate.Value.Year);
+   154	            await _repository.AutoAnswerCheckIfUnansweredAsync(caseId, "ATT_FINAL", attendance != null ? "Yes" : "No",
+   155	                attendance != null ? null : "Run Confirm Pay for the final month first.");
+   156	        }
+   157	    }
+   158	
+   159	    private async Task DiscoverRecoveriesAsync(long caseId, long employeeMasterId)
+   160	    {
+   161	        // See FnfSettlementRepository's class remarks - HR_LoanEMISchedule/Assets tables not
+   162	        // cross-checked against an entity. Guarded so Recheck never duplicates or resurrects a
+   163	        // Waived row (RecoveryExistsAsync).
+   164	        try
+   165	        {
+   166	            var outstanding = await _repository.GetOutstandingLoanAsync(employeeMasterId);
+   167	            if (outstanding > 0 && !await _repository.RecoveryExistsAsync(caseId, "Loan", null))
+   168	            {
+   169	                await _repository.AddRecoveryAsync(new AddRecoveryModel
+   170	                {
+   171	                    FnfSettlementId = caseId, ClearanceDepartment = "Finance", DuesType = "Loan",
+   172	                    Description = "Outstanding loan/advance EMI", Amount = outstanding, RecoveryStatus = "Confirmed",
+   173	                }, _requestMetadata.UserId, _requestMetadata.CompanyId);
+   174	            }
+   175	        }
+   176	        catch (Exception e)
+   177	        {
+   178	            // Asset/loan auto-discovery is a convenience, not a blocker - a case must still be
+   179	            // reviewable even if this optional step fails (e.g. the loan table's real schema
+   180	            // differs from what's assumed here).
+   181	            _logger.LogWarning(e, "DiscoverRecoveries could not auto-discover loan/asset recoveries for case {CaseId}", caseId);
+   182	        }
+   183	    }
+   184	
+   185	    private async Task EvaluateClearanceAsync(long caseId)
+   186	    {
+   187	        var checks = await _repository.GetChecksAsync(caseId, "Readiness");
+   188	        var outstanding = checks.Where(c => c.IsRequired && !string.Equals(c.Result, "Yes", StringComparison.OrdinalIgnoreCase))
+   189	            .OrderBy(c => c.SortOrder).ToList();
+   190	
+   191	        if (outstanding.Count == 0)
+   192	        {
+   193	            await _repository.UpdateClearanceVerdictAsync(caseId, true, null);
+   194	        }
+   195	        else
+   196	        {
+   197	            var reason = $"{outstanding[0].CheckName} is pending.";
+   198	            if (outstanding.Count > 1) reason += $" ({outstanding.Count} requirements outstanding)";
+   199	            await _repository.UpdateClearanceVerdictAsync(caseId, false, reason);
+   200	        }
+   201	    }
+   202	
+   203	    public async Task<ResponseModel> GetCaseAsync(long caseId)
+   204	    {
+   205	        var res = new ResponseModel();
+   206	        var companyId = _requestMetadata.CompanyId;
+   207	        try
+   208	        {
+   209	            var model = await _repository.GetCaseByIdAsync(caseId, companyId);
+   210	            if (model == null) return Fail(res, HttpStatusCode.NotFound, "F&F case not found.");
+   211	            return Success(res, "Fetched F&F case.", model);
+   212	        }
+   213	        catch (Exception e)
+   214	        {
+   215	            _logger.LogError(e, "Exception while fetching F&F case {Id}", caseId);
+   216	            return Fail(res, HttpStatusCode.InternalServerError, e.Message);
+   217	        }
+   218	    }
+   219	
+   220	    public async Task<ResponseModel> GetCasesAsync()
+   221	    {
+   222	        var res = new ResponseModel();
+   223	        var companyId = _requestMetadata.CompanyId;
+   224	        try
+   225	        {
+   226	            var list = await _repository.GetCasesAsync(companyId);
+   227	            return Success(res, "Fetched F&F cases.", list);
+   228	        }
+   229	        catch (Exception e)
+   230	        {
+   231	            _logger.LogError(e, "Exception while fetching F&F cases");
+   232	            return Fail(res, HttpStatusCode.InternalServerError, e.Message);
+   233	        }
+   234	    }
+   235	
+   236	    /// <summary>
+   237	    /// The caller's OWN approved F&amp;F statement, and nothing else.
+   238	    /// </summary>
+   239	    /// <remarks>
+   240	    /// My F&amp;F Statement used to call GetCases and filter to itself in the browser. GetCases is
+   241	    /// scoped by company only, so that handed every logged-in employee the full list - every
+   242	    /// departing colleague's gratuity, recoveries and net payable - and relied on client-side
+   243	    /// code for confidentiality. Anyone could read the rest straight from the endpoint.
+   244	    ///
+   245	    /// The employee is taken from the token, never from the request, so there is no id for a
+   246	    /// caller to change. Only Approved cases are returned: an employee has no business seeing a
+   247	    /// draft that HR is still working on.
+   248	    /// </remarks>
+   249	    public async Task<ResponseModel> GetMyStatementAsync()
+   250	    {
+   251	        var res = new ResponseModel();
+   252	        var companyId = _requestMetadata.CompanyId;
+   253	        var employeeId = _requestMetadata.EmployeeMasterId;
+   254	        try
+   255	        {
+   256	            if (employeeId <= 0)
+   257	                return Fail(res, HttpStatusCode.BadRequest,
+   258	                    "Your login is not linked to an employee record, so there is no statement to show.");
+   259	
+   260	            var list = await _repository.GetCasesAsync(companyId);
+   261	            var mine = list
+   262	                .Where(c => c.EmployeeMasterId == employeeId
+   263	                         && string.Equals(c.WorkflowStatus, "Approved", StringComparison.OrdinalIgnoreCase))
+   264	                .OrderByDescending(c => c.FnfSettlementId)
+   265	                .Take(1)
+   266	                .ToList();
+   267	
+   268	            return Success(res, "Fetched your F&F statement.", mine);
+   269	        }
+   270	        catch (Exception e)
+   271	        {
+   272	            _logger.LogError(e, "Exception while fetching own F&F statement for employee {Id}", employeeId);
+   273	            return Fail(res, HttpStatusCode.InternalServerError, e.Message);
+   274	        }
+   275	    }
+   276	
+   277	    public async Task<ResponseModel> SaveAsync(UpdateCasePlanningModel model)
+   278	    {
+   279	        var res = new ResponseModel();
+   280	        var companyId = _requestMetadata.CompanyId;
+   281	        var userId = _requestMetadata.UserId;
+   282	        try
+   283	        {
+   284	            var existing = await _repository.GetCaseByIdAsync(model.FnfSettlementId, companyId);
+   285	            if (existing == null) return Fail(res, HttpStatusCode.NotFound, "F&F case not found.");
+   286	            if (!CanEdit(existing.WorkflowStatus))
+   287	                return Fail(res, HttpStatusCode.BadRequest, $"This case is {existing.WorkflowStatus} and can no longer be edited.");
+   288	
+   289	            await _repository.UpdateCasePlanningAsync(model, userId, companyId);
+   290	            return Success(res, "Case saved.");
+   291	        }
+   292	        catch (Exception e)
+   293	        {
+   294	            _logger.LogError(e, "Exception while saving F&F case {Id}", model.FnfSettlementId);
+   295	            return Fail(res, HttpStatusCode.InternalServerError, e.Message);
+   296	        }
+   297	    }
+   298	
+   299	    public async Task<ResponseModel> RecheckAsync(long caseId)
+   300	    {
+   301	        var res = new ResponseModel();
+   302	        var companyId = _requestMetadata.CompanyId;
+   303	        try
+   304	        {
+   305	            var existing = await _repository.GetCaseByIdAsync(caseId, companyId);
+   306	            if (existing == null) return Fail(res, HttpStatusCode.NotFound, "F&F case not found.");
+   307	
+   308	            await SeedReadinessAsync(caseId);
+   309	            await AutoAnswerReadinessAsync(caseId, existing.EmployeeMasterId, existing.LastWorkingDate);
+   310	            await DiscoverRecoveriesAsync(caseId, existing.EmployeeMasterId);
+   311	            await EvaluateClearanceAsync(caseId);
+   312	
+   313	            var updated = await _repository.GetCaseByIdAsync(caseId, companyId);
+   314	            return Success(res, "Readiness re-checked.", updated);
+   315	        }
+   316	        catch (Exception e)
+   317	        {
+   318	            _logger.LogError(e, "Exception while rechecking F&F case {Id}", caseId);
+   319	            return Fail(res, HttpStatusCode.InternalServerError, e.Message);
+   320	        }
+   321	    }
+   322	
+   323	    public async Task<ResponseModel> CalculateAsync(long caseId)
+   324	    {
+   325	        var res = new ResponseModel();
+   326	        var companyId = _requestMetadata.CompanyId;
+   327	        try
+   328	        {
+   329	            var existing = await _repository.GetCaseByIdAsync(caseId, companyId);
+   330	            if (existing == null) return Fail(res, HttpStatusCode.NotFound, "F&F case not found.");
+   331	            if (!CanEdit(existing.WorkflowStatus))
+   332	                return Fail(res, HttpStatusCode.BadRequest, $"This case is {existing.WorkflowStatus} and can no longer be edited.");
+   333	            // Re-read fresh from the DB, never trust what the form shows.
+   334	            if (existing.IsClearanceReady != true)
+   335	                return Fail(res, HttpStatusCode.BadRequest, existing.ClearanceBlockReason ?? "Clearance is not ready yet.");
+   336	
+   337	            var result = await _calculationService.CalculateAsync(caseId, companyId, persist: true);
+   338	            await _calculationService.SeedVerificationAndHandoverAsync(caseId, result);
+   339	
+   340	            var updated = await _repository.GetCaseByIdAsync(caseId, companyId);
+   341	            return Success(res, "Calculated.", updated);
+   342	        }
+   343	        catch (Exception e)
+   344	        {
+   345	            _logger.LogError(e, "Exception while calculating F&F case {Id}", caseId);
+   346	            return Fail(res, HttpStatusCode.InternalServerError, e.Message);
+   347	        }
+   348	    }
+   349	
+   350	    public async Task<ResponseModel> SubmitAsync(long caseId)
+   351	    {
+   352	        var res = new ResponseModel();
+   353	        var companyId = _requestMetadata.CompanyId;
+   354	        try
+   355	        {
+   356	            var existing = await _repository.GetCaseByIdAsync(caseId, companyId);
+   357	            if (existing == null) return Fail(res, HttpStatusCode.NotFound, "F&F case not found.");
+   358	            if (!CanEdit(existing.WorkflowStatus))
+   359	                return Fail(res, HttpStatusCode.BadRequest, $"This case is {existing.WorkflowStatus} and can no longer be submitted.");
+   360	            if (existing.IsClearanceReady != true)
+   361	                return Fail(res, HttpStatusCode.BadRequest, existing.ClearanceBlockReason ?? "Clearance is not ready yet.");
+   362	
+   363	            var details = await _repository.GetSettlementDetailsAsync(caseId);
+   364	            if (details.Count == 0)
+   365	                return Fail(res, HttpStatusCode.BadRequest,
+   366	                    "No settlement lines exist yet - an approver seeing 0.00 has no way to tell 'nothing owed' from 'nobody pressed Calculate.' Run Calculate first.");
+   367	
+   368	            // The FNF-2026-00002 rule - shared with FnfApproval's Approve path.
+   369	            var failing = await _calculationService.ChecklistIncompleteReasonAsync(caseId, "Verification", "verification");
+   370	            if (failing != null)
+   371	                return Fail(res, HttpStatusCode.BadRequest, $"Verification is incomplete: {failing}");
+   372	
+   373	            var rows = await _repository.SubmitCaseAsync(caseId, companyId);
+   374	            if (rows == 0)
+   375	                return Fail(res, HttpStatusCode.Conflict, "Somebody else changed this case - reload and try again.");
+   376	
+   377	            // Seed the approver's checklist now, on the way in, so the F&F Approval screen has
+   378	            // something to show. Seeding only inside Approve - as this used to - meant the
+   379	            // approver opened an empty checklist, pressed Approve, and was refused for not
+   380	            // ticking parameters they had never been shown. Approve re-seeds from a live
+   381	            // calculation, and UpsertCheck keeps any answer already given.
+   382	            await _calculationService.SeedApprovalParametersAsync(caseId, companyId);
+   383	
+   384	            // Approval Engine instance (docs/dev-tracking/approval.md Phase 11) - non-fatal, same
+   385	            // reasoning as every prior module. A case rejected once and resubmitted reuses the same
+   386	            // caseId, so this will fail (duplicate key on HR_ApprovalInstance's own
+   387	            // (FormDocId, TransactionRecordId) uniqueness) on every resubmission after the first -
+   388	            // caught and logged here, not thrown. See ApproveAsync/RejectAsync's gate for how that
+   389	            // stale-instance case is handled without hard-blocking a legitimate resubmission.
+   390	            await TryCreateApprovalInstanceAsync(caseId, existing.EmployeeMasterId, companyId);
+   391	
+   392	            return Success(res, "Submitted for approval.");
+   393	        }
+   394	        catch (Exception e)
+   395	        {
+   396	            _logger.LogError(e, "Exception while submitting F&F case {Id}", caseId);
+   397	            return Fail(res, HttpStatusCode.InternalServerError, e.Message);
+   398	        }
+   399	    }
+   400	
+   401	    public async Task<ResponseModel> ApproveAsync(long caseId, ApproveCaseModel model)
+   402	    {
+   403	        var res = new ResponseModel();
+   404	        var companyId = _requestMetadata.CompanyId;
+   405	        try
+   406	        {
+   407	            var existing = await _repository.GetCaseByIdAsync(caseId, companyId);
+   408	            if (existing == null) return Fail(res, HttpStatusCode.NotFound, "F&F case not found.");
+   409	            if (existing.WorkflowStatus != "Submitted")
+   410	                return Fail(res, HttpStatusCode.BadRequest, $"This case is {existing.WorkflowStatus}, not Submitted, so it cannot be approved.");
+   411	
+   412	            // Re-seed the approval-parameter checklist from a fresh, live calculation before
+   413	            // checking it - so the approver's figures always reflect current config.
+   414	            await _calculationService.SeedApprovalParametersAsync(caseId, companyId);
+   415	
+   416	            var failingVerification = await _calculationService.ChecklistIncompleteReasonAsync(caseId, "Verification", "verification");
+   417	            if (failingVerification != null)
+   418	                return Fail(res, HttpStatusCode.BadRequest, $"Verification is incomplete: {failingVerification}");
+   419	            var failingParams = await _calculationService.ChecklistIncompleteReasonAsync(caseId, "ApprovalParameter", "approval parameter");
+   420	            if (failingParams != null)
+   421	                return Fail(res, HttpStatusCode.BadRequest, $"Approval parameter not passed: {failingParams}");
+   422	
+   423	            var config = await _calculationService.LoadConfigAsync(companyId);
+   424	            var windowDays = existing.ComplianceWindowDays ?? config.ComplianceWindowDays;
+   425	
+   426	            var gateError = await ApplyApprovalEngineGateAsync(caseId, ApprovalStatusNames.Approved, null);
+   427	            if (gateError != null) return Fail(res, gateError.Value.Status, gateError.Value.Message);
+   428	
+   429	            var rows = await _repository.ApproveCaseHeaderAsync(caseId, windowDays, _requestMetadata.UserId, companyId);
+   430	            if (rows == 0)
+   431	                return Fail(res, HttpStatusCode.Conflict, "Somebody else changed this case - reload and try again.");
+   432	
+   433	            var pushed = await _calculationService.PushToPayrollAsync(caseId, existing.EmployeeMasterId, companyId, model.Month, model.Year);
+   434	            await _calculationService.SettleLoanScheduleAsync(caseId, existing.EmployeeMasterId);
+   435	
+   436	            // Matches legacy FNFApproval.aspx.cs's NotifyEmployee() - the employee is told their
+   437	            // statement is ready as soon as it's approved, not when it's eventually paid.
+   438	            var loginUserId = await _notificationRepository.ResolveUserIdForEmployeeAsync(existing.EmployeeMasterId, companyId);
+   439	            if (loginUserId.HasValue)
+   440	            {
+   441	                await _notificationRepository.AddNotificationAsync(loginUserId.Value, companyId,
+   442	                    "Your full & final settlement is ready",
+   443	                    "Your full & final settlement statement has been approved and is ready to review.",
+   444	                    module: "FNF", employeeMasterId: existing.EmployeeMasterId, referenceId: caseId, referenceType: "FnfCase");
+   445	            }
+   446	
+   447	            return Success(res, $"Approved. {pushed} component(s) pushed into {model.Month:00}/{model.Year}. Run Salary Generate for that month to pay it.");
+   448	        }
+   449	        catch (Exception e)
+   450	        {
+   451	            _logger.LogError(e, "Exception while approving F&F case {Id}", caseId);
+   452	            return Fail(res, HttpStatusCode.InternalServerError, e.Message);
+   453	        }
+   454	    }
+   455	
+   456	    public async Task<ResponseModel> RejectAsync(long caseId, RejectCaseModel model)
+   457	    {
+   458	        var res = new ResponseModel();
+   459	        var companyId = _requestMetadata.CompanyId;
+   460	        try
+   461	        {
+   462	            if (string.IsNullOrWhiteSpace(model.Reason))
+   463	                return Fail(res, HttpStatusCode.BadRequest, "Say why you are returning it - the preparer needs the reason.");
+   464	
+   465	            var existing = await _repository.GetCaseByIdAsync(caseId, companyId);
+   466	            if (existing == null) return Fail(res, HttpStatusCode.NotFound, "F&F case not found.");
+   467	            if (existing.WorkflowStatus != "Submitted")
+   468	                return Fail(res, HttpStatusCode.BadRequest, $"This case is {existing.WorkflowStatus}, not Submitted, so it cannot be rejected.");
+   469	
+   470	            var gateError = await ApplyApprovalEngineGateAsync(caseId, ApprovalStatusNames.Rejected, model.Reason.Trim());
+   471	            if (gateError != null) return Fail(res, gateError.Value.Status, gateError.Value.Message);
+   472	
+   473	            var rows = await _repository.RejectCaseAsync(caseId, model.Reason.Trim(), _requestMetadata.UserId, companyId);
+   474	            if (rows == 0)
+   475	                return Fail(res, HttpStatusCode.Conflict, "Somebody else changed this case - reload and try again.");
+   476	
+   477	            return Success(res, "Returned to the preparer as a draft.");
+   478	        }
+   479	        catch (Exception e)
+   480	        {
+   481	            _logger.LogError(e, "Exception while rejecting F&F case {Id}", caseId);
+   482	            return Fail(res, HttpStatusCode.InternalServerError, e.Message);
+   483	        }
+   484	    }
+   485	
+   486	    public async Task<ResponseModel> AcceptStatementAsync(long caseId, AcceptStatementModel model)
+   487	    {
+   488	        var res = new ResponseModel();
+   489	        var companyId = _requestMetadata.CompanyId;
+   490	        try
+   491	        {
+   492	            var existing = await _repository.GetCaseByIdAsync(caseId, companyId);
+   493	            if (existing == null) return Fail(res, HttpStatusCode.NotFound, "F&F case not found.");
+   494	
+   495	            // Accepting or disputing a statement is the departing employee's own act, and this
+   496	            // checked only that the case existed in the company - so any logged-in user could
+   497	            // post someone else's caseId and settle their statement for them. The employee comes
+   498	            // from the token; NotFound rather than Forbidden, so a caller cannot probe for which
+   499	            // case ids exist.
+   500	            if (existing.EmployeeMasterId != _requestMetadata.EmployeeMasterId)
+   501	            {
+   502	                _logger.LogWarning(
+   503	                    "User {UserId} (employee {CallerId}) tried to accept F&F case {CaseId}, which belongs to employee {OwnerId}.",
+   504	                    _requestMetadata.UserId, _requestMetadata.EmployeeMasterId, caseId, existing.EmployeeMasterId);
+   505	                return Fail(res, HttpStatusCode.NotFound, "F&F case not found.");
+   506	            }
+   507	
+   508	            await _calculationService.RecordAcceptanceAsync(caseId, existing.EmployeeMasterId, companyId,
+   509	                model.AcceptanceResult, model.Remarks, _requestMetadata.UserId);
+   510	            return Success(res, "Acceptance recorded.");
+   511	        }
+   512	        catch (Exception e)
+   513	        {
+   514	            _logger.LogError(e, "Exception while recording acceptance for F&F case {Id}", caseId);
+   515	            return Fail(res, HttpStatusCode.InternalServerError, e.Message);
+   516	        }
+   517	    }
+   518	
+   519	    // ---------------------------------------------------------------------- Checks grid --
+   520	
+   521	    public async Task<ResponseModel> GetChecksAsync(long caseId, string checkKind)
+   522	    {
+   523	        var res = new ResponseModel();
+   524	        try
+   525	        {
+   526	            var list = await _repository.GetChecksAsync(caseId, checkKind);
+   527	            return Success(res, "Fetched checks.", list);
+   528	        }
+   529	        catch (Exception e)
+   530	        {
+   531	            _logger.LogError(e, "Exception while fetching {Kind} checks for case {Id}", checkKind, caseId);
+   532	            return Fail(res, HttpStatusCode.InternalServerError, e.Message);
+   533	        }
+   534	    }
+   535	
+   536	    public async Task<ResponseModel> UpdateCheckResultAsync(long caseId, UpdateCheckResultModel model)
+   537	    {
+   538	        var res = new ResponseModel();
+   539	        var companyId = _requestMetadata.CompanyId;
+   540	        try
+   541	        {
+   542	            var existing = await _repository.GetCaseByIdAsync(caseId, companyId);
+   543	            if (existing == null) return Fail(res, HttpStatusCode.NotFound, "F&F case not found.");
+   544	
+   545	            // The check's own row carries its kind, so none is passed here. Passing a literal
+   546	            // "Readiness" - as this did - meant Verification and Handover checks matched no row
+   547	            // and could never be answered, which left every case stuck in Draft.
+   548	            await _repository.UpdateCheckResultAsync(model.FnfCheckId, caseId, model.Result, model.Remarks, _requestMetadata.UserId);
+   549	            await EvaluateClearanceAsync(caseId);
+   550	            return Success(res, "Updated.");
+   551	        }
+   552	        catch (Exception e)
+   553	        {
+   554	            _logger.LogError(e, "Exception while updating check {Id}", model.FnfCheckId);
+   555	            return Fail(res, HttpStatusCode.InternalServerError, e.Message);
+   556	        }
+   557	    }
+   558	
+   559	    // ------------------------------------------------------------------- Recovery grid --
+   560	
+   561	    public async Task<ResponseModel> GetRecoveriesAsync(long caseId)
+   562	    {
+   563	        var res = new ResponseModel();
+   564	        try
+   565	        {
+   566	            var list = await _repository.GetRecoveriesAsync(caseId);
+   567	            return Success(res, "Fetched recoveries.", list);
+   568	        }
+   569	        catch (Exception e)
+   570	        {
+   571	            _logger.LogError(e, "Exception while fetching recoveries for case {Id}", caseId);
+   572	            return Fail(res, HttpStatusCode.InternalServerError, e.Message);
+   573	        }
+   574	    }
+   575	
+   576	    public async Task<ResponseModel> AddRecoveryAsync(AddRecoveryModel model)
+   577	    {
+   578	        var res = new ResponseModel();
+   579	        try
+   580	        {
+   581	            var newId = await _repository.AddRecoveryAsync(model, _requestMetadata.UserId, _requestMetadata.CompanyId);
+   582	            return Success(res, "Recovery added.", new { id = newId });
+   583	        }
+   584	        catch (Exception e)
+   585	        {
+   586	            _logger.LogError(e, "Exception while adding recovery to case {Id}", model.FnfSettlementId);
+   587	            return Fail(res, HttpStatusCode.InternalServerError, e.Message);
+   588	        }
+   589	    }
+   590	
+   591	    public async Task<ResponseModel> UpdateRecoveryAsync(long caseId, UpdateRecoveryModel model)
+   592	    {
+   593	        var res = new ResponseModel();
+   594	        try
+   595	        {
+   596	            var existing = await _repository.GetRecoveryByIdAsync(model.FnfRecoveryId, caseId);
+   597	            if (existing == null) return Fail(res, HttpStatusCode.NotFound, "Recovery not found.");
+   598	            await _repository.UpdateRecoveryAsync(model, _requestMetadata.UserId);
+   599	            return Success(res, "Recovery updated.");
+   600	        }
+   601	        catch (Exception e)
+   602	        {
+   603	            _logger.LogError(e, "Exception while updating recovery {Id}", model.FnfRecoveryId);
+   604	            return Fail(res, HttpStatusCode.InternalServerError, e.Message);
+   605	        }
+   606	    }
+   607	
+   608	    public async Task<ResponseModel> DeleteRecoveryAsync(long caseId, long recoveryId)
+   609	    {
+   610	        var res = new ResponseModel();
+   611	        try
+   612	        {
+   613	            var existing = await _repository.GetRecoveryByIdAsync(recoveryId, caseId);
+   614	            if (existing == null) return Fail(res, HttpStatusCode.NotFound, "Recovery not found.");
+   615	            // Soft delete, on purpose: the next Recheck's auto-discovery must never immediately
+   616	            // resurrect a row someone just waived/deleted.
+   617	            await _repository.SoftDeleteRecoveryAsync(recoveryId, _requestMetadata.UserId);
+   618	            return Success(res, "Recovery removed.");
+   619	        }
+   620	        catch (Exception e)
+   621	        {
+   622	            _logger.LogError(e, "Exception while deleting recovery {Id}", recoveryId);
+   623	            return Fail(res, HttpStatusCode.InternalServerError, e.Message);
+   624	        }
+   625	    }
+   626	
+   627	    // -------------------------------------------------------------- Settlement detail grid --
+   628	
+   629	    public async Task<ResponseModel> GetSettlementDetailsAsync(long caseId)
+   630	    {
+   631	        var res = new ResponseModel();
+   632	        try
+   633	        {
+   634	            var list = await _repository.GetSettlementDetailsAsync(caseId);
+   635	            return Success(res, "Fetched settlement lines.", list);
+   636	        }
+   637	        catch (Exception e)
+   638	        {
+   639	            _logger.LogError(e, "Exception while fetching settlement lines for case {Id}", caseId);
+   640	            return Fail(res, HttpStatusCode.InternalServerError, e.Message);
+   641	        }
+   642	    }
+   643	
+   644	    public async Task<ResponseModel> AddManualDetailAsync(AddManualDetailModel model)
+   645	    {
+   646	        var res = new ResponseModel();
+   647	        var companyId = _requestMetadata.CompanyId;
+   648	        try
+   649	        {
+   650	            var existing = await _repository.GetCaseByIdAsync(model.FnfSettlementId, companyId);
+   651	            if (existing == null) return Fail(res, HttpStatusCode.NotFound, "F&F case not found.");
+   652	            if (!CanEdit(existing.WorkflowStatus))
+   653	                return Fail(res, HttpStatusCode.BadRequest, $"This case is {existing.WorkflowStatus} - the settlement lines can no longer be edited.");
+   654	
+   655	            var details = await _repository.GetSettlementDetailsAsync(model.FnfSettlementId);
+   656	            var sortOrder = (details.Count == 0 ? 0 : details.Max(d => d.SortOrder)) + 10;
+   657	            var newId = await _repository.AddManualDetailAsync(model, sortOrder);
+   658	
+   659	            await LightweightRetotalAsync(model.FnfSettlementId);
+   660	            return Success(res, "Line added.", new { id = newId });
+   661	        }
+   662	        catch (Exception e)
+   663	        {
+   664	            _logger.LogError(e, "Exception while adding a manual settlement line to case {Id}", model.FnfSettlementId);
+   665	            return Fail(res, HttpStatusCode.InternalServerError, e.Message);
+   666	        }
+   667	    }
+   668	
+   669	    public async Task<ResponseModel> UpdateManualDetailAsync(long caseId, UpdateManualDetailModel model)
+   670	    {
+   671	        var res = new ResponseModel();
+   672	        var companyId = _requestMetadata.CompanyId;
+   673	        try
+   674	        {
+   675	            var existingCase = await _repository.GetCaseByIdAsync(caseId, companyId);
+   676	            if (existingCase == null) return Fail(res, HttpStatusCode.NotFound, "F&F case not found.");
+   677	            if (!CanEdit(existingCase.WorkflowStatus))
+   678	                return Fail(res, HttpStatusCode.BadRequest, $"This case is {existingCase.WorkflowStatus} - the settlement lines can no longer be edited.");
+   679	
+   680	            var existingLine = await _repository.GetDetailByIdAsync(model.FnfSettlementDetailId, caseId);
+   681	            if (existingLine == null) return Fail(res, HttpStatusCode.NotFound, "Settlement line not found.");
+   682	            // Dual lock: an IsAuto=1 row can never be edited, at any workflow status.
+   683	            if (existingLine.IsAuto)
+   684	                return Fail(res, HttpStatusCode.BadRequest, "This line was calculated automatically and cannot be edited directly.");
+   685	
+   686	            await _repository.UpdateManualDetailAsync(model);
+   687	            await LightweightRetotalAsync(caseId);
+   688	            return Success(res, "Line updated.");
+   689	        }
+   690	        catch (Exception e)
+   691	        {
+   692	            _logger.LogError(e, "Exception while updating settlement line {Id}", model.FnfSettlementDetailId);
+   693	            return Fail(res, HttpStatusCode.InternalServerError, e.Message);
+   694	        }
+   695	    }
+   696	
+   697	    public async Task<ResponseModel> DeleteManualDetailAsync(long caseId, long detailId)
+   698	    {
+   699	        var res = new ResponseModel();
+   700	        var companyId = _requestMetadata.CompanyId;
+   701	        try
+   702	        {
+   703	            var existingCase = await _repository.GetCaseByIdAsync(caseId, companyId);
+   704	            if (existingCase == null) return Fail(res, HttpStatusCode.NotFound, "F&F case not found.");
+   705	            if (!CanEdit(existingCase.WorkflowStatus))
+   706	                return Fail(res, HttpStatusCode.BadRequest, $"This case is {existingCase.WorkflowStatus} - the settlement lines can no longer be edited.");
+   707	
+   708	            var existingLine = await _repository.GetDetailByIdAsync(detailId, caseId);
+   709	            if (existingLine == null) return Fail(res, HttpStatusCode.NotFound, "Settlement line not found.");
+   710	            if (existingLine.IsAuto)
+   711	                return Fail(res, HttpStatusCode.BadRequest, "This line was calculated automatically and cannot be deleted directly.");
+   712	
+   713	            await _repository.DeleteManualDetailAsync(detailId);
+   714	            await LightweightRetotalAsync(caseId);
+   715	            return Success(res, "Line removed.");
+   716	        }
+   717	        catch (Exception e)
+   718	        {
+   719	            _logger.LogError(e, "Exception while deleting settlement line {Id}", detailId);
+   720	            return Fail(res, HttpStatusCode.InternalServerError, e.Message);
+   721	        }
+   722	    }
+   723	
+   724	    /// <summary>
+   725	    /// A manual-row insert/update/delete triggers only a re-total, NOT a full Calculate() - a
+   726	    /// full recalculate would also re-read leave/loans/assets and discard the figure the user
+   727	    /// just typed. Re-sums ALL current lines (auto + manual) by Add/Deduct.
+   728	    /// </summary>
+   729	    private async Task LightweightRetotalAsync(long caseId)
+   730	    {
+   731	        var details = await _repository.GetSettlementDetailsAsync(caseId);
+   732	        var earnings = details.Where(d => d.AddDeduct == "Add").Sum(d => d.Amount);
+   733	        var deductions = details.Where(d => d.AddDeduct == "Deduct").Sum(d => d.Amount);
+   734	        var netPayable = earnings - deductions;
+   735	
+   736	        var caseHeader = await _repository.GetCaseByIdAsync(caseId, _requestMetadata.CompanyId);
+   737	        await _repository.UpdateHeaderCalculationResultsAsync(caseId,
+   738	            caseHeader?.PerDayRate ?? 0, caseHeader?.PerDayRateBasis ?? string.Empty,
+   739	            caseHeader?.LeaveEncashDays ?? 0, caseHeader?.LeaveEncashAmount ?? 0, caseHeader?.GratuityAmount ?? 0,
+   740	            earnings, deductions, netPayable);
+   741	    }
+   742	
+   743	    /// <summary>
+   744	    /// Approval Engine gate (docs/dev-tracking/approval.md Phase 11) - real, new authorization
+   745	    /// where none existed before (see the class remarks: today's ApproveAsync/RejectAsync have zero
+   746	    /// decision-level auth beyond [Authorize] + company scoping). Returns null to proceed with the
+   747	    /// legacy write, or the (status, message) to refuse the request with.
+   748	    /// </summary>
+   749	    private async Task<(HttpStatusCode Status, string Message)?> ApplyApprovalEngineGateAsync(long caseId, string decision, string? remarks)
+   750	    {
+   751	        var formDocId = await _approvalService.ResolveFormDocIdAsync(ApprovalModuleKeys.Fnf, FnfFormDocNames.Approval);
+   752	        var instanceId = formDocId is null ? null : await _approvalService.GetInstanceIdAsync(formDocId.Value, caseId);
+   753	        if (instanceId is null) return null;
+   754	
+   755	        var actionResult = await _approvalService.Action(new ApprovalActionModel
+   756	        {
+   757	            ApprovalInstanceId = instanceId.Value,
+   758	            EmployeeId = _requestMetadata.EmployeeMasterId,
+   759	            Decision = decision,
+   760	            Remarks = remarks,
+   761	        });
+   762	
+   763	        if (actionResult.IsSuccess) return null;
+   764	
+   765	        if (actionResult.Status == HttpStatusCode.Conflict)
+   766	        {
+   767	            // Most likely a stale instance from a prior reject-then-resubmit cycle for this same
+   768	            // caseId (TryCreateApprovalInstanceAsync could not create a fresh one on resubmission -
+   769	            // HR_ApprovalInstance has no "reopen" concept, same precedent as Recruitment's Reopen
+   770	            // transitions bypassing the engine entirely). Not a real double-decision race: the
+   771	            // WorkflowStatus check the caller already ran, plus ApproveCaseHeaderAsync/
+   772	            // RejectCaseAsync's own `rows == 0` optimistic-concurrency guard, already catch two
+   773	            // people deciding the SAME live pending case - so falling through here instead of
+   774	            // hard-blocking is safe.
+   775	            _logger.LogInformation(
+   776	                "F&F case {CaseId}: approval engine instance already closed (likely stale from a prior reject/resubmit cycle) - falling through to the existing WorkflowStatus check.",
+   777	                caseId);
+   778	            return null;
+   779	        }
+   780	
+   781	        return (actionResult.Status, actionResult.Message);
+   782	    }
+   783	
+   784	    /// <summary>
+   785	    /// Config mode note: there is no existing rule to preserve here (see the class remarks) - this
+   786	    /// is genuinely new authorization, not a translation of one. HR_FNFSettlement already carries
+   787	    /// per-case HrExecutiveUserMasterId/PayrollExecutiveUserMasterId/FinanceExecutiveUserMasterId/
+   788	    /// ApproverUserMasterId planning fields, but they are UserMasterIds (not EmployeeMasterIds) and
+   789	    /// are purely informational today - nothing reads them for authorization, and wiring them into
+   790	    /// the engine would need a UserMasterId -> EmployeeMasterId resolution this migration does not
+   791	    /// add. Expected initial setup: `any_one` with the actual Finance/HR/Payroll employee(s) who
+   792	    /// sign off F&amp;F cases configured explicitly as HR_ApprovalConfigApprover rows - or
+   793	    /// `default_chain` (IsReportingMgrRequired=true) if the policy is "the exiting employee's
+   794	    /// manager approves it" instead (HR_FNFSettlement.ReportingPersonId is available for this).
+   795	    /// Which is correct is a real policy decision, not something inferable from legacy code, since
+   796	    /// none existed.
+   797	    /// </summary>
+   798	    private async Task TryCreateApprovalInstanceAsync(long caseId, long requestorEmployeeId, long companyMasterId)
+   799	    {
+   800	        try
+   801	        {
+   802	            var formDocId = await _approvalService.ResolveFormDocIdAsync(ApprovalModuleKeys.Fnf, FnfFormDocNames.Approval);
+   803	            if (formDocId is null)
+   804	            {
+   805	                _logger.LogWarning("No 'FNF Approval' FormDocMaster row found - skipping approval instance creation for F&F case {CaseId}", caseId);
+   806	                return;
+   807	            }
+   808	
+   809	            var result = await _approvalService.CreateInstance(new CreateApprovalInstanceModel
+   810	            {
+   811	                FormDocId = formDocId.Value,
+   812	                TransactionRecordId = caseId,
+   813	                RequestorEmployeeId = requestorEmployeeId,
+   814	                CompanyMasterId = companyMasterId,
+   815	                BranchMasterId = null,
+   816	            });
+   817	
+   818	            if (!result.IsSuccess || result.Data == null)
+   819	                _logger.LogWarning("Could not create approval instance for F&F case {CaseId}: {Message}", caseId, result.Message);
+   820	        }
+   821	        catch (Exception ex)
+   822	        {
+   823	            _logger.LogError(ex, "Unexpected error creating approval instance for F&F case {CaseId}", caseId);
+   824	        }
+   825	    }
+   826	
+   827	    private static ResponseModel Success(ResponseModel res, string message, object? data = null)
+   828	    {
+   829	        res.IsSuccess = true; res.Status = HttpStatusCode.OK; res.Message = message; res.Data = data;
+   830	        return res;
+   831	    }
+   832	
+   833	    private static ResponseModel Fail(ResponseModel res, HttpStatusCode status, string message)
+   834	    {
+   835	        res.IsSuccess = false; res.Status = status; res.Message = message;
+   836	        return res;
+   837	    }
+   838	}

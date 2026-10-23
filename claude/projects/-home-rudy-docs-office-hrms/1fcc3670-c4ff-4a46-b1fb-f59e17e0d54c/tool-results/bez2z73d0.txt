@@ -1,0 +1,930 @@
+import { CommonModule } from '@angular/common';
+import { Component, OnInit } from '@angular/core';
+import { ActivatedRoute, Router } from '@angular/router';
+import { FormBuilder, FormGroup, ReactiveFormsModule, Validators } from '@angular/forms';
+import {
+  DxButtonModule,
+  DxDateBoxModule,
+  DxNumberBoxModule,
+  DxPopupModule,
+  DxSelectBoxModule,
+  DxTabPanelModule,
+  DxTextAreaModule,
+  DxTextBoxModule,
+} from 'devextreme-angular';
+import { finalize } from 'rxjs';
+import { CommonGridComponent } from '../../../../layout/common-grid/common-grid.component';
+import { AuthService } from '../../../../services/auth.service';
+import { ChipNavigationService } from '../../../../services/ChipNavigation.service';
+import { ToastService } from '../../../../services/toaster.service';
+import {
+  AddDeduct,
+  AddRecoveryModel,
+  CasePriority,
+  CheckKind,
+  ClearanceDepartment,
+  DuesType,
+  FnfCaseModel,
+  FnfCheckModel,
+  FnfRecoveryModel,
+  FnfSettlementDetailModel,
+  LookupOption,
+  RecoveryStatus,
+  SettlementComponentType,
+} from '../../models/fnf.model';
+import { FnfApiService } from '../../services/fnf-api.service';
+
+const CASE_PRIORITIES: CasePriority[] = ['Normal', 'Management Separation'];
+const CLEARANCE_DEPARTMENTS: ClearanceDepartment[] = ['IT', 'Admin', 'Finance', 'Manager', 'Other'];
+const DUES_TYPES: DuesType[] = ['Asset Not Returned', 'Asset Damage', 'Advance', 'Loan', 'Other'];
+const RECOVERY_STATUSES: RecoveryStatus[] = ['Confirmed', 'Waived'];
+const COMPONENT_TYPES: SettlementComponentType[] = [
+  'FinalSalary',
+  'LeaveEncashment',
+  'Gratuity',
+  'NoticePay',
+  'NoticeRecovery',
+  'LoanRecovery',
+  'AssetRecovery',
+  'OtherRecovery',
+];
+const ADD_DEDUCT: AddDeduct[] = ['Add', 'Deduct'];
+
+/** Preparer works through clearance/recovery/settlement/verification, then submits. */
+@Component({
+  selector: 'app-fnf-settlement-case',
+  standalone: true,
+  imports: [
+    CommonModule,
+    ReactiveFormsModule,
+    CommonGridComponent,
+    DxTabPanelModule,
+    DxPopupModule,
+    DxSelectBoxModule,
+    DxDateBoxModule,
+    DxNumberBoxModule,
+    DxTextAreaModule,
+    DxTextBoxModule,
+    DxButtonModule,
+  ],
+  templateUrl: './case.component.html',
+})
+export class FnfSettlementCaseComponent implements OnInit {
+  caseId = 0;
+  case: FnfCaseModel | null = null;
+  loading = false;
+  saving = false;
+  recalculating = false;
+  rechecking = false;
+  submitting = false;
+
+  casePriorities = CASE_PRIORITIES;
+  logins: LookupOption[] = [];
+  salaryHeads: LookupOption[] = [];
+
+  planningForm: FormGroup;
+
+  readinessChecks: FnfCheckModel[] = [];
+  verificationChecks: FnfCheckModel[] = [];
+  handoverChecks: FnfCheckModel[] = [];
+  readinessColumns: Record<string, unknown>[] = [];
+  verificationColumns: Record<string, unknown>[] = [];
+  handoverColumns: Record<string, unknown>[] = [];
+
+  recoveries: FnfRecoveryModel[] = [];
+  recoveryColumns: Record<string, unknown>[] = [];
+
+  settlementDetails: FnfSettlementDetailModel[] = [];
+  settlementColumns: Record<string, unknown>[] = [];
+
+  // ------------------------------------------------------------- Check popup
+  checkPopupVisible = false;
+  checkBusy = false;
+  private checkPopupKind: CheckKind = 'Readiness';
+  checkPopupRow: FnfCheckModel | null = null;
+  checkResultOptions: string[] = [];
+  checkResult: string | null = null;
+  checkRemarks = '';
+
+  // ---------------------------------------------------------- Recovery popup
+  recoveryPopupVisible = false;
+  recoveryBusy = false;
+  isRecoveryEdit = false;
+  clearanceDepartments = CLEARANCE_DEPARTMENTS;
+  duesTypes = DUES_TYPES;
+  recoveryStatuses = RECOVERY_STATUSES;
+  recoveryForm: FormGroup;
+  private editingRecoveryId: number | null = null;
+
+  // ------------------------------------------------------------- Detail popup
+  detailPopupVisible = false;
+  detailBusy = false;
+  isDetailEdit = false;
+  componentTypes = COMPONENT_TYPES;
+  addDeductOptions = ADD_DEDUCT;
+  detailForm: FormGroup;
+  private editingDetailId: number | null = null;
+
+  constructor(
+    private authService: AuthService,
+    private fnfApi: FnfApiService,
+    private toast: ToastService,
+    private route: ActivatedRoute,
+    private router: Router,
+    private fb: FormBuilder,
+    private chipService: ChipNavigationService,
+  ) {
+    this.authService.ScreenName = 'F&F Case';
+
+    this.planningForm = this.fb.group({
+      casePriority: ['Normal', Validators.required],
+      plannedCalcStartDate: [null],
+      plannedSettlementDate: [null],
+      actualCalcStartDate: [null],
+      approvalTurnaroundDays: [null],
+      hrExecutiveUserMasterId: [null],
+      payrollExecutiveUserMasterId: [null],
+      financeExecutiveUserMasterId: [null],
+      approverUserMasterId: [null],
+      remarks: [''],
+    });
+
+    this.recoveryForm = this.fb.group({
+      clearanceDepartment: ['IT', Validators.required],
+      duesType: ['Advance', Validators.required],
+      description: [''],
+      amount: [0, Validators.required],
+      recoveryStatus: ['Confirmed', Validators.required],
+      remarks: [''],
+    });
+
+    this.detailForm = this.fb.group({
+      componentType: ['OtherRecovery', Validators.required],
+      salaryHeadMasterId: [null],
+      addDeduct: ['Deduct', Validators.required],
+      amount: [0, Validators.required],
+      remarks: [''],
+    });
+  }
+
+  ngOnInit(): void {
+    this.caseId = Number(this.route.snapshot.paramMap.get('id') ?? 0);
+    this.chipService.addTab({ title: 'F&F Case', route: `/fnf/settlement/case/${this.caseId}` });
+
+    this.readinessColumns = this.buildCheckColumns();
+    this.verificationColumns = this.buildCheckColumns();
+    this.handoverColumns = this.buildCheckColumns();
+
+    this.recoveryColumns = [
+      { dataField: 'clearanceDepartment', caption: 'Department', width: 110 },
+      { dataField: 'duesType', caption: 'Dues Type', width: 150 },
+      { dataField: 'description', caption: 'Description' },
+      { dataField: 'amount', caption: 'Amount', dataType: 'number', format: { type: 'fixedPoint', precision: 2 }, width: 120 },
+      { dataField: 'recoveryStatus', caption: 'Status', width: 110 },
+      { dataField: 'remarks', caption: 'Remarks' },
+    ];
+
+    this.settlementColumns = [
+      { dataField: 'componentType', caption: 'Component' },
+      { dataField: 'addDeduct', caption: 'Add/Deduct', width: 100 },
+      { dataField: 'days', caption: 'Days', dataType: 'number', width: 80 },
+      { dataField: 'rate', caption: 'Rate', dataType: 'number', format: { type: 'fixedPoint', precision: 2 }, width: 100 },
+      { dataField: 'amount', caption: 'Amount', dataType: 'number', format: { type: 'fixedPoint', precision: 2 }, width: 120 },
+      {
+        dataField: 'isAuto',
+        caption: 'Source',
+        width: 90,
+        cellTemplate: (container: HTMLElement, options: any) => {
+          container.innerText = options.data?.isAuto ? 'Auto' : 'Manual';
+        },
+      },
+      { dataField: 'remarks', caption: 'Remarks / Basis' },
+    ];
+
+    this.fnfApi.getLogins().subscribe({ next: (list) => (this.logins = list) });
+    this.fnfApi.getSalaryHeads().subscribe({ next: (list) => (this.salaryHeads = list) });
+
+    this.load();
+  }
+
+  private buildCheckColumns(): Record<string, unknown>[] {
+    return [
+      { dataField: 'checkName', caption: 'Requirement' },
+      {
+        dataField: 'isRequired',
+        caption: 'Required',
+        width: 90,
+        cellTemplate: (container: HTMLElement, options: any) => {
+          container.innerText = options.data?.isRequired ? 'Yes' : 'No';
+        },
+      },
+      {
+        dataField: 'result',
+        caption: 'Result',
+        width: 130,
+        cellTemplate: (container: HTMLElement, options: any) => {
+          const span = document.createElement('span');
+          const result = options.data?.result;
+          const cls = result === 'Yes' || result === 'Pass' ? 'status-approved' : result === 'No' || result === 'Fail' ? 'status-rejected' : 'status-hold';
+          span.className = `status-pill ${cls}`;
+          span.innerText = result || 'Not answered';
+          container.appendChild(span);
+        },
+      },
+      { dataField: 'policyStandard', caption: 'Policy / Standard' },
+      { dataField: 'actualValue', caption: 'Actual', width: 100 },
+      { dataField: 'remarks', caption: 'Remarks' },
+    ];
+  }
+
+  get canEdit(): boolean {
+    return this.case?.workflowStatus === 'Draft';
+  }
+
+  load(): void {
+    if (!this.caseId) return;
+    this.loading = true;
+    this.fnfApi
+      .getCase(this.caseId)
+      .pipe(finalize(() => (this.loading = false)))
+      .subscribe({
+        next: (res) => {
+          if (!FnfApiService.isOk(res)) {
+            this.toast.error(FnfApiService.messageOf(res, 'Failed to load case.'));
+            return;
+          }
+          this.case = FnfApiService.dataOf<FnfCaseModel>(res);
+          this.planningForm.reset(this.case);
+        },
+        error: (err) => this.toast.error(FnfApiService.errorMessage(err, 'Failed to load case.')),
+      });
+
+    this.loadChecks('Readiness');
+    this.loadChecks('Verification');
+    this.loadChecks('Handover');
+    this.loadRecoveries();
+    this.loadSettlementDetails();
+  }
+
+  private loadChecks(kind: CheckKind): void {
+    this.fnfApi.getChecks(this.caseId, kind).subscribe({
+      next: (res) => {
+        const rows = FnfApiService.dataOf<FnfCheckModel[]>(res) ?? [];
+        const sorted = Array.isArray(rows) ? [...rows].sort((a, b) => a.sortOrder - b.sortOrder) : [];
+        if (kind === 'Readiness') this.readinessChecks = sorted;
+        else if (kind === 'Verification') this.verificationChecks = sorted;
+        else this.handoverChecks = sorted;
+      },
+    });
+  }
+
+  private loadRecoveries(): void {
+    this.fnfApi.getRecoveries(this.caseId).subscribe({
+      next: (res) => {
+        const rows = FnfApiService.dataOf<FnfRecoveryModel[]>(res);
+        this.recoveries = Array.isArray(rows) ? rows : [];
+      },
+    });
+  }
+
+  private loadSettlementDetails(): void {
+    this.fnfApi.getSettlementDetails(this.caseId).subscribe({
+      next: (res) => {
+        const rows = FnfApiService.dataOf<FnfSettlementDetailModel[]>(res);
+        this.settlementDetails = Array.isArray(rows) ? rows : [];
+      },
+    });
+  }
+
+  goBack(): void {
+    this.router.navigate(['/fnf/settlement']);
+  }
+
+  // -------------------------------------------------------------- Planning
+
+  savePlanning(): void {
+    if (!this.case) return;
+    this.saving = true;
+    this.fnfApi
+      .savePlanning({ fnfSettlementId: this.caseId, ...this.planningForm.value })
+      .pipe(finalize(() => (this.saving = false)))
+      .subscribe({
+        next: (res) => {
+          if (!FnfApiService.isOk(res)) {
+            this.toast.error(FnfApiService.messageOf(res, 'Save failed.'));
+            return;
+          }
+          this.toast.success(FnfApiService.messageOf(res, 'Saved.'));
+          this.load();
+        },
+        error: (err) => this.toast.error(FnfApiService.errorMessage(err, 'Unable to save.')),
+      });
+  }
+
+  recheck(): void {
+    this.rechecking = true;
+    this.fnfApi
+      .recheck(this.caseId)
+      .pipe(finalize(() => (this.rechecking = false)))
+      .subscribe({
+        next: (res) => {
+          this.toast[FnfApiService.isOk(res) ? 'success' : 'error'](FnfApiService.messageOf(res, 'Rechecked.'));
+          this.load();
+        },
+        error: (err) => this.toast.error(FnfApiService.errorMessage(err, 'Unable to recheck.')),
+      });
+  }
+
+  calculate(): void {
+    if (!this.case?.isClearanceReady) {
+      this.toast.error(this.case?.clearanceBlockReason || 'Clearance is not ready yet.');
+      return;
+    }
+    this.recalculating = true;
+    this.fnfApi
+      .calculate(this.caseId)
+      .pipe(finalize(() => (this.recalculating = false)))
+      .subscribe({
+        next: (res) => {
+          if (!FnfApiService.isOk(res)) {
+            this.toast.error(FnfApiService.messageOf(res, 'Calculation failed.'));
+            return;
+          }
+          this.toast.success(FnfApiService.messageOf(res, 'Calculated.'));
+          this.load();
+        },
+        error: (err) => this.toast.error(FnfApiService.errorMessage(err, 'Unable to calculate.')),
+      });
+  }
+
+  submit(): void {
+    if (!confirm('Submit this settlement for approval? It cannot be edited afterwards.')) return;
+    this.submitting = true;
+    this.fnfApi
+      .submit(this.caseId)
+      .pipe(finalize(() => (this.submitting = false)))
+      .subscribe({
+        next: (res) => {
+          if (!FnfApiService.isOk(res)) {
+            this.toast.error(FnfApiService.messageOf(res, 'Submit failed.'));
+            return;
+          }
+          this.toast.success(FnfApiService.messageOf(res, 'Submitted for approval.'));
+          this.load();
+        },
+        error: (err) => this.toast.error(FnfApiService.errorMessage(err, 'Unable to submit.')),
+      });
+  }
+
+  // ---------------------------------------------------------------- Checks
+
+  openCheckEdit(kind: CheckKind, row: FnfCheckModel): void {
+    this.checkPopupKind = kind;
+    this.checkPopupRow = row;
+    this.checkResult = row.result;
+    this.checkRemarks = row.remarks ?? '';
+    this.checkResultOptions = kind === 'Readiness' || kind === 'Handover' ? ['Yes', 'No'] : ['Pass', 'Fail', 'NA'];
+    this.checkPopupVisible = true;
+  }
+
+  saveCheck(): void {
+    if (!this.checkPopupRow) return;
+    this.checkBusy = true;
+    this.fnfApi
+      .updateCheck(this.caseId, { fnfCheckId: this.checkPopupRow.fnfCheckId, result: this.checkResult, remarks: this.checkRemarks })
+      .pipe(finalize(() => (this.checkBusy = false)))
+      .subscribe({
+        next: (res) => {
+          if (!FnfApiService.isOk(res)) {
+            this.toast.error(FnfApiService.messageOf(res, 'Could not update.'));
+            return;
+          }
+          this.checkPopupVisible = false;
+          this.loadChecks(this.checkPopupKind);
+          if (this.checkPopupKind === 'Readiness') this.load();
+        },
+        error: (err) => this.toast.error(FnfApiService.errorMessage(err, 'Could not update.')),
+      });
+  }
+
+  // -------------------------------------------------------------- Recovery
+
+  onAddRecovery(): void {
+    this.isRecoveryEdit = false;
+    this.editingRecoveryId = null;
+    this.recoveryForm.reset({
+      clearanceDepartment: 'IT',
+      duesType: 'Advance',
+      description: '',
+      amount: 0,
+      recoveryStatus: 'Confirmed',
+      remarks: '',
+    });
+    this.recoveryPopupVisible = true;
+  }
+
+  onEditRecovery(row: FnfRecoveryModel): void {
+    this.isRecoveryEdit = true;
+    this.editingRecoveryId = row.fnfRecoveryId;
+    this.recoveryForm.reset({
+      clearanceDepartment: row.clearanceDepartment,
+      duesType: row.duesType,
+      description: row.description ?? '',
+      amount: row.amount,
+      recoveryStatus: row.recoveryStatus,
+      remarks: row.remarks ?? '',
+    });
+    this.recoveryPopupVisible = true;
+  }
+
+  onDeleteRecovery(row: FnfRecoveryModel): void {
+    this.fnfApi.deleteRecovery(this.caseId, row.fnfRecoveryId).subscribe({
+      next: (res) => {
+        if (!FnfApiService.isOk(res)) {
+          this.toast.error(FnfApiService.messageOf(res, 'Delete failed.'));
+          return;
+        }
+        this.toast.success('Recovery removed.');
+        this.loadRecoveries();
+      },
+      error: (err) => this.toast.error(FnfApiService.errorMessage(err, 'Unable to delete recovery.')),
+    });
+  }
+
+  saveRecovery(): void {
+    if (this.recoveryForm.invalid) {
+      this.recoveryForm.markAllAsTouched();
+      return;
+    }
+    this.recoveryBusy = true;
+    const value: AddRecoveryModel = { fnfSettlementId: this.caseId, ...this.recoveryForm.value };
+    const request$ = this.isRecoveryEdit
+      ? this.fnfApi.updateRecovery(this.caseId, { fnfRecoveryId: this.editingRecoveryId!, ...value })
+      : this.fnfApi.addRecovery(value);
+
+    request$.pipe(finalize(() => (this.recoveryBusy = false))).subscribe({
+      next: (res) => {
+        if (!FnfApiService.isOk(res)) {
+          this.toast.error(FnfApiService.messageOf(res, 'Save failed.'));
+          return;
+        }
+        this.toast.success(FnfApiService.messageOf(res, 'Saved.'));
+        this.recoveryPopupVisible = false;
+        this.loadRecoveries();
+      },
+      error: (err) => this.toast.error(FnfApiService.errorMessage(err, 'Unable to save recovery.')),
+    });
+  }
+
+  get recoveryTotal(): number {
+    return this.recoveries
+      .filter((r) => r.recoveryStatus === 'Confirmed' || r.recoveryStatus === 'Waived')
+      .reduce((sum, r) => sum + (r.amount || 0), 0);
+  }
+
+  // -------------------------------------------------------- Settlement detail
+
+  onAddDetail(): void {
+    this.isDetailEdit = false;
+    this.editingDetailId = null;
+    this.detailForm.reset({ componentType: 'OtherRecovery', salaryHeadMasterId: null, addDeduct: 'Deduct', amount: 0, remarks: '' });
+    this.detailPopupVisible = true;
+  }
+
+  onEditDetail(row: FnfSettlementDetailModel): void {
+    if (row.isAuto) {
+      this.toast.error('This line is calculated automatically — edit the configuration or recalculate instead.');
+      return;
+    }
+    this.isDetailEdit = true;
+    this.editingDetailId = row.fnfSettlementDetailId;
+    this.detailForm.reset({
+      componentType: row.componentType,
+      salaryHeadMasterId: row.salaryHeadMasterId,
+      addDeduct: row.addDeduct,
+      amount: row.amount,
+      remarks: row.remarks ?? '',
+    });
+    this.detailPopupVisible = true;
+  }
+
+  onDeleteDetail(row: FnfSettlementDetailModel): void {
+    if (row.isAuto) {
+      this.toast.error('This line is calculated automatically — it would come back on the next Calculate. Remove its cause instead (for example waive the recovery).');
+      return;
+    }
+    this.fnfApi.deleteManualDetail(this.caseId, row.fnfSettlementDetailId).subscribe({
+      next: (res) => {
+        if (!FnfApiService.isOk(res)) {
+          this.toast.error(FnfApiService.messageOf(res, 'Delete failed.'));
+          return;
+        }
+        this.toast.success('Line removed.');
+        this.loadSettlementDetails();
+      },
+      error: (err) => this.toast.error(FnfApiService.errorMessage(err, 'Unable to delete line.')),
+    });
+  }
+
+  saveDetail(): void {
+    if (this.detailForm.invalid) {
+      this.detailForm.markAllAsTouched();
+      return;
+    }
+    this.detailBusy = true;
+    const value = this.detailForm.value;
+    const request$ = this.isDetailEdit
+      ? this.fnfApi.updateManualDetail(this.caseId, { fnfSettlementDetailId: this.editingDetailId!, ...value })
+      : this.fnfApi.addManualDetail({ fnfSettlementId: this.caseId, ...value });
+
+    request$.pipe(finalize(() => (this.detailBusy = false))).subscribe({
+      next: (res) => {
+        if (!FnfApiService.isOk(res)) {
+          this.toast.error(FnfApiService.messageOf(res, 'Save failed.'));
+          return;
+        }
+        this.toast.success(FnfApiService.messageOf(res, 'Saved.'));
+        this.detailPopupVisible = false;
+        this.loadSettlementDetails();
+        this.load();
+      },
+      error: (err) => this.toast.error(FnfApiService.errorMessage(err, 'Unable to save line.')),
+    });
+  }
+}
+<div class="page-wrapper">
+  <div class="main-card main-card--page-shell">
+    <div class="page-header">
+      <div style="display:flex; align-items:center; gap:12px;">
+        <dx-button icon="back" stylingMode="outlined" (onClick)="goBack()"></dx-button>
+        <div class="page-title">{{ case ? (case.caseNo + ' — ' + case.employeeName) : 'F&F Case' }}</div>
+      </div>
+      @if (case) {
+        <div style="display:flex; gap:8px; flex-wrap:wrap;">
+          <dx-button text="Recheck" stylingMode="outlined" [disabled]="!canEdit || rechecking" (onClick)="recheck()"></dx-button>
+          <dx-button text="Calculate" stylingMode="outlined" [disabled]="!canEdit || recalculating" (onClick)="calculate()"></dx-button>
+          <dx-button text="Submit for Approval" type="default" stylingMode="contained" [disabled]="!canEdit || submitting" (onClick)="submit()"></dx-button>
+        </div>
+      }
+    </div>
+    <hr class="divider" />
+
+    <div class="main-card-body">
+      @if (case) {
+        <div class="popup-banner mb-3" [class.ready]="case.isClearanceReady" [class.wait]="!case.isClearanceReady">
+          <div class="banner-row">
+            <div>
+              <span class="banner-label">Status</span>
+              <span class="banner-value">
+                <span class="status-pill" [ngClass]="case.workflowStatus === 'Approved' ? 'status-approved' : case.workflowStatus === 'Submitted' ? 'status-submitted' : 'status-pending'">{{ case.workflowStatus }}</span>
+              </span>
+            </div>
+            <div>
+              <span class="banner-label">Clearance</span>
+              <span class="banner-value">{{ case.isClearanceReady ? 'Ready' : (case.clearanceBlockReason || 'Not ready') }}</span>
+            </div>
+            <div>
+              <span class="banner-label">Last Working Date</span>
+              <span class="banner-value">{{ case.lastWorkingDate ? (case.lastWorkingDate | date: 'dd-MMM-yyyy') : '—' }}</span>
+            </div>
+            @if (case.netPayable !== null) {
+              <div>
+                <span class="banner-label">{{ (case.netPayable ?? 0) < 0 ? 'Recoverable from Employee' : 'Net Payable' }}</span>
+                <span class="banner-value" [style.color]="(case.netPayable ?? 0) < 0 ? '#7f1d1d' : '#14532d'">{{ ((case.netPayable ?? 0) < 0 ? -(case.netPayable ?? 0) : (case.netPayable ?? 0)) | number: '1.2-2' }}</span>
+              </div>
+            }
+          </div>
+        </div>
+
+        <dx-tab-panel [animationEnabled]="true" [swipeEnabled]="false">
+          <!-- ============================ Case & Planning ============================ -->
+          <dxi-item title="Case &amp; Planning">
+            <div class="pt-3">
+              <div class="section-card">
+                <div class="section-header">From the Employee Record</div>
+                <div class="section-body">
+                  <table class="app-table" style="border:none;">
+                    <tbody>
+                      <tr>
+                        <td><span class="hint-text">Employee</span><br /><b>{{ case.employeeCode }} — {{ case.employeeName }}</b></td>
+                        <td><span class="hint-text">Date of Joining</span><br /><b>{{ case.dateOfJoining ? (case.dateOfJoining | date: 'dd-MMM-yyyy') : '—' }}</b></td>
+                        <td><span class="hint-text">Resign Date</span><br /><b>{{ case.resignDate ? (case.resignDate | date: 'dd-MMM-yyyy') : '—' }}</b></td>
+                        <td><span class="hint-text">Last Working Date</span><br /><b>{{ case.lastWorkingDate ? (case.lastWorkingDate | date: 'dd-MMM-yyyy') : '—' }}</b></td>
+                      </tr>
+                      <tr>
+                        <td><span class="hint-text">Notice Required</span><br /><b>{{ case.noticeDaysRequired ?? '—' }} days</b></td>
+                        <td><span class="hint-text">Notice Served</span><br /><b>{{ case.noticeDaysServed ?? '—' }} days</b></td>
+                        <td><span class="hint-text">Compliance Window End</span><br /><b>{{ case.complianceWindowEnd ? (case.complianceWindowEnd | date: 'dd-MMM-yyyy') : '—' }}</b></td>
+                        <td><span class="hint-text">Settlement Date</span><br /><b>{{ case.settlementDate ? (case.settlementDate | date: 'dd-MMM-yyyy') : '—' }}</b></td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              <form [formGroup]="planningForm">
+                <div class="section-card">
+                  <div class="section-header">Case</div>
+                  <div class="section-body row g-3">
+                    <div class="col-md-4">
+                      <label class="form-label">Case Priority</label>
+                      <dx-select-box formControlName="casePriority" [dataSource]="casePriorities" [readOnly]="!canEdit"></dx-select-box>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="section-card">
+                  <div class="section-header">Planning</div>
+                  <div class="section-body row g-3">
+                    <div class="col-md-3">
+                      <label class="form-label">Planned Calc. Start</label>
+                      <dx-date-box formControlName="plannedCalcStartDate" type="date" [readOnly]="!canEdit"></dx-date-box>
+                    </div>
+                    <div class="col-md-3">
+                      <label class="form-label">Planned Settlement</label>
+                      <dx-date-box formControlName="plannedSettlementDate" type="date" [readOnly]="!canEdit"></dx-date-box>
+                    </div>
+                    <div class="col-md-3">
+                      <label class="form-label">Actual Calc. Start</label>
+                      <dx-date-box formControlName="actualCalcStartDate" type="date" [readOnly]="true"></dx-date-box>
+                    </div>
+                    <div class="col-md-3">
+                      <label class="form-label">Approval TAT (days)</label>
+                      <dx-number-box formControlName="approvalTurnaroundDays" [min]="0" [readOnly]="!canEdit"></dx-number-box>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="section-card">
+                  <div class="section-header">Responsible Team</div>
+                  <p class="hint-text section-body section-body--compact mb-0">These are application logins, not employee records.</p>
+                  <div class="section-body row g-3">
+                    <div class="col-md-3">
+                      <label class="form-label">HR Executive</label>
+                      <dx-select-box formControlName="hrExecutiveUserMasterId" [dataSource]="logins" valueExpr="id" displayExpr="name" [searchEnabled]="true" [showClearButton]="true" [readOnly]="!canEdit"></dx-select-box>
+                    </div>
+                    <div class="col-md-3">
+                      <label class="form-label">Payroll Executive</label>
+                      <dx-select-box formControlName="payrollExecutiveUserMasterId" [dataSource]="logins" valueExpr="id" displayExpr="name" [searchEnabled]="true" [showClearButton]="true" [readOnly]="!canEdit"></dx-select-box>
+                    </div>
+                    <div class="col-md-3">
+                      <label class="form-label">Finance Executive</label>
+                      <dx-select-box formControlName="financeExecutiveUserMasterId" [dataSource]="logins" valueExpr="id" displayExpr="name" [searchEnabled]="true" [showClearButton]="true" [readOnly]="!canEdit"></dx-select-box>
+                    </div>
+                    <div class="col-md-3">
+                      <label class="form-label">Approver</label>
+                      <dx-select-box formControlName="approverUserMasterId" [dataSource]="logins" valueExpr="id" displayExpr="name" [searchEnabled]="true" [showClearButton]="true" [readOnly]="!canEdit"></dx-select-box>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="section-card">
+                  <div class="section-header">Remarks</div>
+                  <div class="section-body">
+                    <dx-text-area formControlName="remarks" [height]="70" [readOnly]="!canEdit"></dx-text-area>
+                  </div>
+                </div>
+
+                @if (canEdit) {
+                  <div class="popup-actions">
+                    <dx-button text="Save" type="default" stylingMode="contained" [disabled]="saving" (onClick)="savePlanning()"></dx-button>
+                  </div>
+                }
+              </form>
+            </div>
+          </dxi-item>
+
+          <!-- ============================ Readiness ============================ -->
+          <dxi-item title="Clearance Readiness">
+            <div class="pt-3">
+              <p class="hint-text mb-2">Every required row must read Yes before this case is clearance-ready. Leave Balance and Attendance are answered automatically; clearance rows are ticked by the owning department.</p>
+              <app-common-grid
+                [dataSource]="readinessChecks"
+                [columns]="readinessColumns"
+                [storageKey]="'fnfReadinessGrid'"
+                [showAddButton]="false"
+                [allowRowEdit]="canEdit"
+                [allowRowDelete]="false"
+                [fillViewport]="false"
+                [enableStateStoring]="false"
+                (editRow)="openCheckEdit('Readiness', $event)"
+              ></app-common-grid>
+            </div>
+          </dxi-item>
+
+          <!-- ============================ Recovery ============================ -->
+          <dxi-item title="Clearance Recovery">
+            <div class="pt-3">
+              <p class="hint-text mb-2">Every Confirmed row becomes a deduction. Loan/advance rows are found automatically. Mark Waived rather than deleting, so the decision stays on record.</p>
+              <app-common-grid
+                [dataSource]="recoveries"
+                [columns]="recoveryColumns"
+                [storageKey]="'fnfRecoveryGrid'"
+                [showAddButton]="canEdit"
+                [addButtonText]="'Add Recovery'"
+                [allowRowEdit]="canEdit"
+                [allowRowDelete]="canEdit"
+                [fillViewport]="false"
+                [enableStateStoring]="false"
+                (addRow)="onAddRecovery()"
+                (editRow)="onEditRecovery($event)"
+                (deleteRow)="onDeleteRecovery($event)"
+              ></app-common-grid>
+              <p class="table-footnote mb-0">Confirmed + waived total: {{ recoveryTotal | number: '1.2-2' }}</p>
+            </div>
+          </dxi-item>
+
+          <!-- ============================ Settlement ============================ -->
+          <dxi-item title="Settlement">
+            <div class="pt-3">
+              <p class="hint-text mb-2">Press Calculate to generate lines. Rows marked Auto are recomputed every time; a row you add by hand survives recalculation.</p>
+              <app-common-grid
+                [dataSource]="settlementDetails"
+                [columns]="settlementColumns"
+                [storageKey]="'fnfSettlementDetailGrid'"
+                [showAddButton]="canEdit"
+                [addButtonText]="'Add Manual Line'"
+                [allowRowEdit]="canEdit"
+                [allowRowDelete]="canEdit"
+                [fillViewport]="false"
+                [enableStateStoring]="false"
+                (addRow)="onAddDetail()"
+                (editRow)="onEditDetail($event)"
+                (deleteRow)="onDeleteDetail($event)"
+              ></app-common-grid>
+
+              <div class="popup-banner mt-3">
+                <div class="banner-row">
+                  <div><span class="banner-label">Per-day Rate</span><span class="banner-value">{{ case.perDayRate ?? '—' }} ({{ case.perDayRateBasis || '—' }})</span></div>
+                  <div><span class="banner-label">Leave Encash Days</span><span class="banner-value">{{ case.leaveEncashDays ?? '—' }}</span></div>
+                  <div><span class="banner-label">Total Earnings</span><span class="banner-value">{{ case.totalEarnings ?? 0 | number: '1.2-2' }}</span></div>
+                  <div><span class="banner-label">Total Deductions</span><span class="banner-value">{{ case.totalDeductions ?? 0 | number: '1.2-2' }}</span></div>
+                </div>
+              </div>
+            </div>
+          </dxi-item>
+
+          <!-- ============================ Verification ============================ -->
+          <dxi-item title="Verification">
+            <div class="pt-3">
+              <p class="hint-text mb-2">Every check must read Pass (or NA) before the settlement goes for approval. These are seeded when you press Calculate.</p>
+              <app-common-grid
+                [dataSource]="verificationChecks"
+                [columns]="verificationColumns"
+                [storageKey]="'fnfVerificationGrid'"
+                [showAddButton]="false"
+                [allowRowEdit]="canEdit"
+                [allowRowDelete]="false"
+                [fillViewport]="false"
+                [enableStateStoring]="false"
+                (editRow)="openCheckEdit('Verification', $event)"
+              ></app-common-grid>
+              @if (!verificationChecks.length) {
+                <p class="form-note mt-2"><i class="fa-solid fa-circle-info"></i><span>No verification rows yet — press Calculate to seed this checklist.</span></p>
+              }
+            </div>
+          </dxi-item>
+
+          <!-- ============================ Handover ============================ -->
+          <dxi-item title="Handover">
+            <div class="pt-3">
+              <p class="hint-text mb-2">Ticked off after the settlement is paid. Form 16 and relieving/experience letters have no generator in this system yet, so those rows record that they were issued outside it.</p>
+              <app-common-grid
+                [dataSource]="handoverChecks"
+                [columns]="handoverColumns"
+                [storageKey]="'fnfHandoverGrid'"
+                [showAddButton]="false"
+                [allowRowEdit]="true"
+                [allowRowDelete]="false"
+                [fillViewport]="false"
+                [enableStateStoring]="false"
+                (editRow)="openCheckEdit('Handover', $event)"
+              ></app-common-grid>
+            </div>
+          </dxi-item>
+        </dx-tab-panel>
+      }
+    </div>
+  </div>
+</div>
+
+<!-- ============================ Check edit popup ============================ -->
+<dx-popup
+  [(visible)]="checkPopupVisible"
+  [showTitle]="true"
+  title="Update Check"
+  [width]="440"
+  [height]="'auto'"
+  [maxHeight]="'85vh'"
+  [dragEnabled]="false"
+  [showCloseButton]="!checkBusy"
+  [hideOnOutsideClick]="!checkBusy"
+>
+  @if (checkPopupRow) {
+    <div class="section-body">
+      <p class="hint-text mb-2">{{ checkPopupRow.checkName }}</p>
+      <label class="form-label">Result</label>
+      <dx-select-box [dataSource]="checkResultOptions" [(value)]="checkResult" [showClearButton]="true" placeholder="not answered"></dx-select-box>
+
+      <label class="form-label mt-2">Remarks</label>
+      <dx-text-area [(value)]="checkRemarks" [height]="70"></dx-text-area>
+
+      <div class="popup-actions">
+        <dx-button text="Cancel" stylingMode="outlined" [disabled]="checkBusy" (onClick)="checkPopupVisible = false"></dx-button>
+        <dx-button text="Save" type="default" stylingMode="contained" [disabled]="checkBusy" (onClick)="saveCheck()"></dx-button>
+      </div>
+    </div>
+  }
+</dx-popup>
+
+<!-- ============================ Recovery popup ============================ -->
+<dx-popup
+  [(visible)]="recoveryPopupVisible"
+  [showTitle]="true"
+  [title]="isRecoveryEdit ? 'Edit Recovery' : 'Add Recovery'"
+  [width]="520"
+  [height]="'auto'"
+  [maxHeight]="'85vh'"
+  [dragEnabled]="false"
+  [showCloseButton]="!recoveryBusy"
+  [hideOnOutsideClick]="!recoveryBusy"
+>
+  <form [formGroup]="recoveryForm" class="section-body">
+    <div class="row g-2 mb-2">
+      <div class="col-md-6">
+        <label class="form-label">Department</label>
+        <dx-select-box formControlName="clearanceDepartment" [dataSource]="clearanceDepartments"></dx-select-box>
+      </div>
+      <div class="col-md-6">
+        <label class="form-label">Dues Type</label>
+        <dx-select-box formControlName="duesType" [dataSource]="duesTypes"></dx-select-box>
+      </div>
+    </div>
+    <div class="mb-2">
+      <label class="form-label">Description</label>
+      <dx-text-box formControlName="description"></dx-text-box>
+    </div>
+    <div class="row g-2 mb-2">
+      <div class="col-md-6">
+        <label class="form-label">Amount</label>
+        <dx-number-box formControlName="amount" [min]="0" format="#,##0.##"></dx-number-box>
+      </div>
+      <div class="col-md-6">
+        <label class="form-label">Status</label>
+        <dx-select-box formControlName="recoveryStatus" [dataSource]="recoveryStatuses"></dx-select-box>
+      </div>
+    </div>
+    <div class="mb-2">
+      <label class="form-label">Remarks</label>
+      <dx-text-area formControlName="remarks" [height]="60"></dx-text-area>
+    </div>
+
+    <div class="popup-actions">
+      <dx-button text="Cancel" stylingMode="outlined" [disabled]="recoveryBusy" (onClick)="recoveryPopupVisible = false"></dx-button>
+      <dx-button text="Save" type="default" stylingMode="contained" [disabled]="recoveryBusy" (onClick)="saveRecovery()"></dx-button>
+    </div>
+  </form>
+</dx-popup>
+
+<!-- ============================ Manual detail popup ============================ -->
+<dx-popup
+  [(visible)]="detailPopupVisible"
+  [showTitle]="true"
+  [title]="isDetailEdit ? 'Edit Line' : 'Add Manual Line'"
+  [width]="520"
+  [height]="'auto'"
+  [maxHeight]="'85vh'"
+  [dragEnabled]="false"
+  [showCloseButton]="!detailBusy"
+  [hideOnOutsideClick]="!detailBusy"
+>
+  <form [formGroup]="detailForm" class="section-body">
+    <div class="mb-2">
+      <label class="form-label">Component</label>
+      <dx-select-box formControlName="componentType" [dataSource]="componentTypes"></dx-select-box>
+    </div>
+    <div class="mb-2">
+      <label class="form-label">Salary Head</label>
+      <dx-select-box formControlName="salaryHeadMasterId" [dataSource]="salaryHeads" valueExpr="id" displayExpr="name" [showClearButton]="true" placeholder="not set"></dx-select-box>
+    </div>
+    <div class="row g-2 mb-2">
+      <div class="col-md-6">
+        <label class="form-label">Add / Deduct</label>
+        <dx-select-box formControlName="addDeduct" [dataSource]="addDeductOptions"></dx-select-box>
+      </div>
+      <div class="col-md-6">
+        <label class="form-label">Amount</label>
+        <dx-number-box formControlName="amount" [min]="0" format="#,##0.##"></dx-number-box>
+      </div>
+    </div>
+    <div class="mb-2">
+      <label class="form-label">Remarks</label>
+      <dx-text-area formControlName="remarks" [height]="60"></dx-text-area>
+    </div>
+
+    <div class="popup-actions">
+      <dx-button text="Cancel" stylingMode="outlined" [disabled]="detailBusy" (onClick)="detailPopupVisible = false"></dx-button>
+      <dx-button text="Save" type="default" stylingMode="contained" [disabled]="detailBusy" (onClick)="saveDetail()"></dx-button>
+    </div>
+  </form>
+</dx-popup>

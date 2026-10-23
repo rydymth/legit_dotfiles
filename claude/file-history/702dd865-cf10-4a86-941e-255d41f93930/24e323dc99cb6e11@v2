@@ -1,0 +1,20 @@
+namespace SolutionOne_DataAccessLayer.Entities;
+
+/// <summary>The canteen module's settings, one row for the whole installation (ConfigId is always 1).</summary>
+public partial class HrCmsConfig
+{
+    /// <summary>Always 1 - the table holds a single row.</summary>
+    public int ConfigId { get; set; }
+
+    /// <summary>How far back the Meal Session screen lets an ordering deadline be set: 1 = the day of the
+    /// meal or the day before. Not when ordering closes - that is per meal session.</summary>
+    public int MaxOrderCutoffDaysBefore { get; set; }
+
+    public DateTime CreateDate { get; set; }
+
+    public long CreatedById { get; set; }
+
+    public DateTime? ModifiedDate { get; set; }
+
+    public long? ModifiedById { get; set; }
+}

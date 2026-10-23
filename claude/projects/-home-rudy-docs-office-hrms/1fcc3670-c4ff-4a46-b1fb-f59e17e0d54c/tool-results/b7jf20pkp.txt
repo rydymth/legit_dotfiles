@@ -1,0 +1,800 @@
+     1	using System;
+     2	using System.Collections.Generic;
+     3	using System.Data;
+     4	using System.Data.SqlClient;
+     5	using System.Web;
+     6	using DevExpress.Web;
+     7	
+     8	/// <summary>
+     9	/// Full &amp; Final settlement case screen — stages 3 to 8 of the F&amp;F flow.
+    10	///
+    11	/// List-first, the same shape as the Loans &amp; Finance screens: a grid of cases, Open
+    12	/// loads the entry form, Back returns to the list. A decided case opens READ-ONLY rather
+    13	/// than being hidden, because "what did we actually agree?" is the commonest question
+    14	/// these screens get.
+    15	///
+    16	/// All case logic lives in <see cref="FNFCaseService"/> so it can be tested against the
+    17	/// database without the site. This file is plumbing only.
+    18	/// </summary>
+    19	public partial class Payroll_FNFSettlement : System.Web.UI.Page
+    20	{
+    21	    // -- Session-backed state -------------------------------------------------
+    22	    //
+    23	    // Session, never ViewState: a DevExpress callback does not round-trip the page's
+    24	    // ViewState, so anything written there during a callback is read back as its
+    25	    // initial value on the next one.
+    26	
+    27	    private long CurrentCaseId
+    28	    {
+    29	        get { return Session["FNF_CaseId"] != null ? Convert.ToInt64(Session["FNF_CaseId"]) : 0; }
+    30	        set { Session["FNF_CaseId"] = value; }
+    31	    }
+    32	
+    33	    private string CurrentStatus
+    34	    {
+    35	        get { return Convert.ToString(Session["FNF_Status"]); }
+    36	        set { Session["FNF_Status"] = value; }
+    37	    }
+    38	
+    39	    private long CompanyId
+    40	    {
+    41	        get { return Session["CompanyID"] != null ? Convert.ToInt64(Session["CompanyID"]) : 0; }
+    42	    }
+    43	
+    44	    private int UserId
+    45	    {
+    46	        get { return Session["UserID"] != null ? Convert.ToInt32(Session["UserID"]) : 0; }
+    47	    }
+    48	
+    49	    private static SqlConnection CreateConnection()
+    50	    {
+    51	        return new SqlConnection(DbConnectionFactory.GetConnectionString());
+    52	    }
+    53	
+    54	    /// <summary>
+    55	    /// SystemName column widths are inconsistent across this schema (20 to 128) and 2014
+    56	    /// does not name the column in a truncation error, so cap it here.
+    57	    /// </summary>
+    58	    private static string HostNameCapped()
+    59	    {
+    60	        string name = null;
+    61	        try { name = System.Net.Dns.GetHostName(); } catch { /* not fatal */ }
+    62	        if (string.IsNullOrEmpty(name)) return string.Empty;
+    63	        return name.Length > 50 ? name.Substring(0, 50) : name;
+    64	    }
+    65	
+    66	    // -- Lifecycle ------------------------------------------------------------
+    67	
+    68	    protected void Page_Load(object sender, EventArgs e)
+    69	    {
+    70	        if (!IsPostBack)
+    71	        {
+    72	            CurrentCaseId = 0;
+    73	            CurrentStatus = FNFCaseService.StatusDraft;
+    74	            LoadEligibleEmployees();
+    75	            LoadUserCombos();
+    76	
+    77	            // BeforePerformDataSelect only supplies the DataSource; it fires when the grid
+    78	            // performs a select, which on a first render means never. Without this the page
+    79	            // opens empty and only fills once Refresh raises the grid's own callback.
+    80	            CaseGridView.DataBind();
+    81	        }
+    82	    }
+    83	
+    84	    // -- Combos ---------------------------------------------------------------
+    85	
+    86	    /// <summary>
+    87	    /// Fills the employee picker and returns how many employees are eligible.
+    88	    ///
+    89	    /// The count matters: an F&amp;F case can only be raised for someone who has actually
+    90	    /// resigned or left, and in this database six of the eleven companies have nobody in
+    91	    /// that state. An empty dropdown under a "pick the employee" instruction, with no
+    92	    /// reason given, is indistinguishable from a broken screen - so the caller uses the
+    93	    /// count to explain itself.
+    94	    /// </summary>
+    95	    private int LoadEligibleEmployees()
+    96	    {
+    97	        try
+    98	        {
+    99	            using (SqlConnection conn = CreateConnection())
+   100	            {
+   101	                conn.Open();
+   102	                DataTable dt = FNFCaseService.EligibleEmployees(conn, null, CompanyId);
+   103	                cmbEmployee.DataSource = dt;
+   104	                cmbEmployee.ValueType = typeof(long);
+   105	                cmbEmployee.DataBind();
+   106	                return dt.Rows.Count;
+   107	            }
+   108	        }
+   109	        catch (Exception ex)
+   110	        {
+   111	            ErrorLogHelper.Log(ex, "FNFSettlement.LoadEligible");
+   112	            return -1;      // unknown - do not claim there is nobody
+   113	        }
+   114	    }
+   115	
+   116	    /// <summary>
+   117	    /// The responsible-team pickers list LOGINS, not employees: an HR or Finance executive
+   118	    /// is often an admin-style user with no employee record at all, and these are the
+   119	    /// people who have to sign in and act on the case.
+   120	    /// </summary>
+   121	    private void LoadUserCombos()
+   122	    {
+   123	        const string sql = @"
+   124	            SELECT U.UserMasterID,
+   125	                   ISNULL(U.UserName, '') + ISNULL(' (' + NULLIF(LTRIM(RTRIM(U.Code)),'') + ')', '') AS Name
+   126	            FROM   dbo.HR_UserMaster U
+   127	            WHERE  U.Status = 1
+   128	              AND  (U.CompanyMasterID = @CompanyID OR U.CompanyMasterID IS NULL)
+   129	            ORDER  BY U.UserName";
+   130	
+   131	        try
+   132	        {
+   133	            using (SqlConnection conn = CreateConnection())
+   134	            using (var cmd = new SqlCommand(sql, conn))
+   135	            {
+   136	                cmd.Parameters.AddWithValue("@CompanyID", CompanyId);
+   137	                var dt = new DataTable();
+   138	                using (var da = new SqlDataAdapter(cmd)) da.Fill(dt);
+   139	
+   140	                foreach (ASPxComboBox combo in new[] { cmbHrExec, cmbPayrollExec, cmbFinanceExec, cmbApprover })
+   141	                {
+   142	                    combo.DataSource = dt;
+   143	                    combo.ValueType = typeof(long);
+   144	                    combo.DataBind();
+   145	                }
+   146	            }
+   147	        }
+   148	        catch (Exception ex)
+   149	        {
+   150	            ErrorLogHelper.Log(ex, "FNFSettlement.LoadUsers");
+   151	        }
+   152	    }
+   153	
+   154	    // -- List grid ------------------------------------------------------------
+   155	
+   156	    protected void CaseGridView_BeforePerformDataSelect(object sender, EventArgs e)
+   157	    {
+   158	        // Supplied here rather than only on the first request: paging, sorting, the page-size
+   159	        // picker and the filter row all raise the GRID's own callback, which passes through
+   160	        // neither Page_Load's !IsPostBack branch nor the panel handler - so a grid bound only
+   161	        // once comes back with no rows and no pager.
+   162	        CaseGridView.DataSource = LoadCases();
+   163	    }
+   164	
+   165	    private DataTable LoadCases()
+   166	    {
+   167	        // An Admin / HR Admin sees every case in the company; anyone else sees only the
+   168	        // cases they are named on. Scoped in the single query the grid runs, so the drill
+   169	        // and the toolbar cannot widen it.
+   170	        string scope = RoleHelper.IsAdmin(Session["UserRole"])
+   171	            ? string.Empty
+   172	            : @" AND (F.HRExecutiveUserMasterID = @UserID
+   173	                   OR F.PayrollExecutiveUserMasterID = @UserID
+   174	                   OR F.FinanceExecutiveUserMasterID = @UserID
+   175	                   OR F.ApproverUserMasterID = @UserID
+   176	                   OR F.EntryUserMasterID = @UserID) ";
+   177	
+   178	        string sql = @"
+   179	            SELECT F.FNFSettlementID, F.CaseNo, F.CaseDate,
+   180	                   LTRIM(ISNULL(' ' + NULLIF(LTRIM(RTRIM(EM.FirstName)),''), '') + ISNULL(' ' + NULLIF(LTRIM(RTRIM(EM.FatherName)),''), '') + ISNULL(' ' + NULLIF(LTRIM(RTRIM(EM.LastName)),''), '')) AS EmployeeName,
+   181	                   ISNULL(EM.Code, '')      AS EmployeeCode,
+   182	                   F.LastWorkingDate, F.CasePriority, F.WorkflowStatus,
+   183	                   CASE WHEN ISNULL(F.IsClearanceReady, 0) = 1 THEN 'Ready'
+   184	                        ELSE ISNULL(F.ClearanceBlockReason, 'Not checked') END AS ClearanceText
+   185	            FROM   dbo.HR_FNFSettlement F
+   186	            LEFT   JOIN dbo.HR_EmployeeMaster EM ON EM.EmployeeMasterID = F.EmployeeMasterID
+   187	            WHERE  F.Status = 1
+   188	              AND  F.CompanyMasterID = @CompanyID " + scope + @"
+   189	            ORDER  BY F.FNFSettlementID DESC";
+   190	
+   191	        var table = new DataTable();
+   192	        try
+   193	        {
+   194	            using (SqlConnection conn = CreateConnection())
+   195	            using (var cmd = new SqlCommand(sql, conn))
+   196	            {
+   197	                cmd.Parameters.AddWithValue("@CompanyID", CompanyId);
+   198	                cmd.Parameters.AddWithValue("@UserID", UserId);
+   199	                using (var da = new SqlDataAdapter(cmd)) da.Fill(table);
+   200	            }
+   201	        }
+   202	        catch (Exception ex)
+   203	        {
+   204	            ErrorLogHelper.Log(ex, "FNFSettlement.LoadCases");
+   205	        }
+   206	        return table;
+   207	    }
+   208	
+   209	    protected void CaseGridView_CustomButtonInitialize(object sender, ASPxGridViewCustomButtonEventArgs e)
+   210	    {
+   211	        if (e.VisibleIndex < 0 || e.ButtonID != "btnOpen") return;
+   212	
+   213	        string status = Convert.ToString(CaseGridView.GetRowValues(e.VisibleIndex, "WorkflowStatus"));
+   214	        e.Text = FNFCaseService.OpenButtonText(FNFCaseService.CanEdit(status));
+   215	        e.Visible = DevExpress.Utils.DefaultBoolean.True;
+   216	    }
+   217	
+   218	    protected void CaseGridView_CustomButtonCallback(object sender, ASPxGridViewCustomButtonCallbackEventArgs e)
+   219	    {
+   220	        if (e.ButtonID != "btnOpen") return;
+   221	
+   222	        // The grid's own callback can only re-render the grid, so hand the id to the browser
+   223	        // and let onCaseGridEnd load the form via the panel's own callback.
+   224	        CaseGridView.JSProperties["cpOpenId"] =
+   225	            Convert.ToString(CaseGridView.GetRowValues(e.VisibleIndex, "FNFSettlementID"));
+   226	    }
+   227	
+   228	    protected void CaseGridView_HtmlDataCellPrepared(object sender, ASPxGridViewTableDataCellEventArgs e)
+   229	    {
+   230	        if (e.DataColumn.FieldName != "WorkflowStatus") return;
+   231	
+   232	        string status = Convert.ToString(e.CellValue);
+   233	        e.Cell.Text = "<span class=\"pill " + FNFCaseService.StatusPill(status) + "\">" +
+   234	                      HttpUtility.HtmlEncode(status) + "</span>";
+   235	    }
+   236	
+   237	    // -- Panel dispatch -------------------------------------------------------
+   238	
+   239	    protected void FnfPanel_Callback(object sender, CallbackEventArgsBase e)
+   240	    {
+   241	        string[] parts = (e.Parameter ?? string.Empty).Split('|');
+   242	        if (parts.Length < 2) return;
+   243	
+   244	        string action = parts[0];
+   245	        long id;
+   246	        long.TryParse(parts[1], out id);
+   247	
+   248	        try
+   249	        {
+   250	            switch (action)
+   251	            {
+   252	                case "New":     HandleNew();          break;
+   253	                case "Create":  HandleCreate();       break;
+   254	                case "Open":    HandleOpen(id);       break;
+   255	                case "Save":      HandleSave();      break;
+   256	                case "Recheck":   HandleRecheck();   break;
+   257	                case "Calculate": HandleCalculate(); break;
+   258	                case "Submit":    HandleSubmit();    break;
+   259	            }
+   260	        }
+   261	        catch (Exception ex)
+   262	        {
+   263	            ErrorLogHelper.Log(ex, "FNFSettlement." + action);
+   264	            FnfPanel.JSProperties["cpMsg"] = ErrorLogHelper.FriendlyMessage;
+   265	        }
+   266	    }
+   267	
+   268	    private void HandleNew()
+   269	    {
+   270	        CurrentCaseId = 0;
+   271	        CurrentStatus = FNFCaseService.StatusDraft;
+   272	
+   273	        txtCaseNo.Text = string.Empty;
+   274	        txtStatus.Text = FNFCaseService.StatusDraft;
+   275	        dtCaseDate.Value = DateTime.Today;
+   276	        cmbPriority.Value = "Normal";
+   277	        cmbEmployee.Value = null;
+   278	        cmbEmployee.Enabled = true;
+   279	
+   280	        dtPlannedCalc.Value = null;
+   281	        dtPlannedSettle.Value = null;
+   282	        dtActualCalc.Value = null;
+   283	        spnTat.Value = null;
+   284	        cmbHrExec.Value = null;
+   285	        cmbPayrollExec.Value = null;
+   286	        cmbFinanceExec.Value = null;
+   287	        cmbApprover.Value = null;
+   288	        memRemarks.Text = string.Empty;
+   289	
+   290	        litBanner.Text = string.Empty;
+   291	        litSettleNotes.Text = string.Empty;
+   292	        litTotals.Text = string.Empty;
+   293	
+   294	        int eligible = LoadEligibleEmployees();
+   295	
+   296	        if (eligible == 0)
+   297	        {
+   298	            // Say WHY the list is empty and where to fix it. The eligibility rule is
+   299	            // deliberately strict - a settlement is for someone who is actually leaving -
+   300	            // so an empty list is usually correct and the user needs to know that.
+   301	            litSnapshot.Text =
+   302	                "<div class=\"fnf-banner blocked\">No employee in this company can be settled yet."
+   303	              + "</div><div class=\"fnf-kv\">An F&amp;F case needs an employee who has resigned or "
+   304	              + "left, so the list only offers people with a <b>Date Of Resign</b> or a <b>Date Of "
+   305	              + "Left</b> on their record &mdash; and anyone who already has a live case is left out."
+   306	              + "<br /><br />To settle somebody: open <b>Employee ▸ Employee</b>, set their "
+   307	              + "<b>Date Of Resign</b> (which unlocks Date Of Left and Full &amp; Final), save, then "
+   308	              + "come back here.</div>";
+   309	        }
+   310	        else
+   311	        {
+   312	            string count = eligible < 0
+   313	                ? "The employee list could not be read - check HR_ErrorLog."
+   314	                : eligible + " employee" + (eligible == 1 ? "" : "s") + " can be settled in this company.";
+   315	
+   316	            litSnapshot.Text =
+   317	                "<div class=\"fnf-kv\">" + HttpUtility.HtmlEncode(count)
+   318	              + " Pick one and press <b>Create F&amp;F Case</b>. Their department, designation, "
+   319	              + "manager, joining date, resignation date and last working day are copied from the "
+   320	              + "employee record automatically.</div>";
+   321	        }
+   322	
+   323	        FnfPanel.JSProperties["cpCreating"] = "1";
+   324	        FnfPanel.JSProperties["cpLocked"] = "0";
+   325	        FnfPanel.JSProperties["cpNoEligible"] = (eligible == 0) ? "1" : "0";
+   326	    }
+   327	
+   328	    private void HandleCreate()
+   329	    {
+   330	        if (cmbEmployee.Value == null)
+   331	        {
+   332	            FnfPanel.JSProperties["cpMsg"] = "Pick the employee to settle first.";
+   333	            return;
+   334	        }
+   335	
+   336	        long employeeId = Convert.ToInt64(cmbEmployee.Value);
+   337	        int windowDays = ComplianceWindowDaysForCompany();
+   338	        long newId;
+   339	
+   340	        using (SqlConnection conn = CreateConnection())
+   341	        {
+   342	            conn.Open();
+   343	            // One transaction for the whole thing: the header, the nine checklist rows, the
+   344	            // auto-answers, the discovered recoveries and the clearance verdict. A case must
+   345	            // never exist with a half-built checklist.
+   346	            using (SqlTransaction tx = conn.BeginTransaction())
+   347	            {
+   348	                try
+   349	                {
+   350	                    newId = FNFCaseService.CreateCase(conn, tx, employeeId, CompanyId,
+   351	                                                      UserId, HostNameCapped(), windowDays);
+   352	                    tx.Commit();
+   353	                }
+   354	                catch
+   355	                {
+   356	                    try { tx.Rollback(); } catch { /* connection already gone */ }
+   357	                    throw;
+   358	                }
+   359	            }
+   360	        }
+   361	
+   362	        LoadCase(newId);
+   363	        FnfPanel.JSProperties["cpMsg"] = "F&F case " + txtCaseNo.Text + " created.";
+   364	    }
+   365	
+   366	    /// <summary>
+   367	    /// Grievance window from this company's HR_FNFConfig. Falls back to 90 days rather than
+   368	    /// 0, because a zero-day window would silently close the moment it opened.
+   369	    /// </summary>
+   370	    private int ComplianceWindowDaysForCompany()
+   371	    {
+   372	        return 90;
+   373	    }
+   374	
+   375	    private void HandleOpen(long id)
+   376	    {
+   377	        if (id <= 0) return;
+   378	        LoadCase(id);
+   379	    }
+   380	
+   381	    private void LoadCase(long id)
+   382	    {
+   383	        const string sql = @"
+   384	            SELECT F.*,
+   385	                   LTRIM(ISNULL(' ' + NULLIF(LTRIM(RTRIM(EM.FirstName)),''), '') + ISNULL(' ' + NULLIF(LTRIM(RTRIM(EM.FatherName)),''), '') + ISNULL(' ' + NULLIF(LTRIM(RTRIM(EM.LastName)),''), '')) AS EmployeeName,
+   386	                   ISNULL(EM.Code, '')          AS EmployeeCode,
+   387	                   -- These two tables name their caption columns DepartmentName /
+   388	                   -- DesignationName, not Name. Getting that wrong made both Create and
+   389	                   -- Open throw Invalid column name Name, so the case was created but its
+   390	                   -- snapshot never loaded and the form sat on its placeholder text.
+   391	                   ISNULL(D.DepartmentName, '')  AS DepartmentName,
+   392	                   ISNULL(G.DesignationName, '') AS DesignationName,
+   393	                   LTRIM(ISNULL(' ' + NULLIF(LTRIM(RTRIM(MG.FirstName)),''), '') + ISNULL(' ' + NULLIF(LTRIM(RTRIM(MG.LastName)),''), '')) AS ManagerName,
+   394	                   EBS.BasicAmount, EBS.GrossAmount, EBS.CTCAmount
+   395	            FROM   dbo.HR_FNFSettlement F
+   396	            LEFT   JOIN dbo.HR_EmployeeMaster   EM ON EM.EmployeeMasterID   = F.EmployeeMasterID
+   397	            LEFT   JOIN dbo.HR_DepartmentMaster D  ON D.DepartmentMasterID  = F.DepartmentMasterID
+   398	            LEFT   JOIN dbo.HR_DesignationMaster G ON G.DesignationMasterID = F.DesignationMasterID
+   399	            LEFT   JOIN dbo.HR_EmployeeMaster   MG ON MG.EmployeeMasterID   = F.ReportingPersonID
+   400	            OUTER  APPLY (SELECT TOP 1 B.BasicAmount, B.GrossAmount, B.CTCAmount
+   401	                          FROM   dbo.HR_EmployeeBasicSalary B
+   402	                          WHERE  B.EmployeeMasterID = F.EmployeeMasterID
+   403	                          ORDER  BY B.FromDate DESC) EBS
+   404	            WHERE  F.FNFSettlementID = @Id";
+   405	
+   406	        DataRow row = null;
+   407	        using (SqlConnection conn = CreateConnection())
+   408	        using (var cmd = new SqlCommand(sql, conn))
+   409	        {
+   410	            cmd.Parameters.AddWithValue("@Id", id);
+   411	            var dt = new DataTable();
+   412	            using (var da = new SqlDataAdapter(cmd)) da.Fill(dt);
+   413	            if (dt.Rows.Count > 0) row = dt.Rows[0];
+   414	        }
+   415	
+   416	        if (row == null)
+   417	        {
+   418	            FnfPanel.JSProperties["cpMsg"] = "That F&F case no longer exists.";
+   419	            FnfPanel.JSProperties["cpReloadList"] = true;
+   420	            return;
+   421	        }
+   422	
+   423	        CurrentCaseId = id;
+   424	        CurrentStatus = Convert.ToString(row["WorkflowStatus"]);
+   425	
+   426	        txtCaseNo.Text = Convert.ToString(row["CaseNo"]);
+   427	        txtStatus.Text = CurrentStatus;
+   428	        dtCaseDate.Value = row["CaseDate"];
+   429	        cmbPriority.Value = Convert.ToString(row["CasePriority"]);
+   430	
+   431	        // The employee cannot be changed once the case exists - the whole snapshot was
+   432	        // taken from them. Shown for reference, locked against editing.
+   433	        cmbEmployee.Value = Convert.ToInt64(row["EmployeeMasterID"]);
+   434	        cmbEmployee.Enabled = false;
+   435	
+   436	        dtPlannedCalc.Value   = NullIfDbNull(row["PlannedCalcStartDate"]);
+   437	        dtPlannedSettle.Value = NullIfDbNull(row["PlannedSettlementDate"]);
+   438	        dtActualCalc.Value    = NullIfDbNull(row["ActualCalcStartDate"]);
+   439	        spnTat.Value          = NullIfDbNull(row["ApprovalTurnaroundDays"]);
+   440	        cmbHrExec.Value       = NullIfDbNull(row["HRExecutiveUserMasterID"]);
+   441	        cmbPayrollExec.Value  = NullIfDbNull(row["PayrollExecutiveUserMasterID"]);
+   442	        cmbFinanceExec.Value  = NullIfDbNull(row["FinanceExecutiveUserMasterID"]);
+   443	        cmbApprover.Value     = NullIfDbNull(row["ApproverUserMasterID"]);
+   444	        memRemarks.Text       = Convert.ToString(row["Remarks"]);
+   445	
+   446	        litSnapshot.Text = BuildSnapshotHtml(row);
+   447	        litBanner.Text = BuildBannerHtml(row);
+   448	
+   449	        ReadinessGrid.DataBind();
+   450	        RecoveryGrid.DataBind();
+   451	        SettleGrid.DataBind();
+   452	        VerifyGrid.DataBind();
+   453	        HandoverGrid.DataBind();
+   454	        RenderTotals();
+   455	        RenderSettlementNotes(row);
+   456	
+   457	        bool editable = FNFCaseService.CanEdit(CurrentStatus);
+   458	        FnfPanel.JSProperties["cpCreating"] = "0";
+   459	        FnfPanel.JSProperties["cpLocked"] = editable ? "0" : "1";
+   460	    }
+   461	
+   462	    private static object NullIfDbNull(object value)
+   463	    {
+   464	        return (value == null || value == DBNull.Value) ? null : value;
+   465	    }
+   466	
+   467	    private static string Cell(string label, object value)
+   468	    {
+   469	        string text = (value == null || value == DBNull.Value)
+   470	            ? "<i style=\"color:#999\">not set</i>"
+   471	            : HttpUtility.HtmlEncode(Convert.ToString(value));
+   472	
+   473	        return "<td style=\"padding:4px 14px 4px 0;white-space:nowrap\"><span style=\"color:#777\">" +
+   474	               HttpUtility.HtmlEncode(label) + "</span><br /><b>" + text + "</b></td>";
+   475	    }
+   476	
+   477	    private static string DateCell(string label, object value)
+   478	    {
+   479	        if (value == null || value == DBNull.Value) return Cell(label, null);
+   480	        return Cell(label, Convert.ToDateTime(value).ToString("dd-MM-yyyy"));
+   481	    }
+   482	
+   483	    private static string MoneyCell(string label, object value)
+   484	    {
+   485	        if (value == null || value == DBNull.Value) return Cell(label, null);
+   486	        return Cell(label, Convert.ToDecimal(value).ToString("n2"));
+   487	    }
+   488	
+   489	    private string BuildSnapshotHtml(DataRow row)
+   490	    {
+   491	        var sb = new System.Text.StringBuilder();
+   492	        sb.Append("<table class=\"fnf-kv\" style=\"border-collapse:collapse\"><tr>");
+   493	        sb.Append(Cell("Employee", row["EmployeeName"]));
+   494	        sb.Append(Cell("Code", row["EmployeeCode"]));
+   495	        sb.Append(Cell("Department", row["DepartmentName"]));
+   496	        sb.Append(Cell("Designation", row["DesignationName"]));
+   497	        sb.Append(Cell("Manager", row["ManagerName"]));
+   498	        sb.Append("</tr><tr>");
+   499	        sb.Append(DateCell("Joining Date", row["DateOfJoining"]));
+   500	        sb.Append(DateCell("Resignation Date", row["ResignDate"]));
+   501	        sb.Append(DateCell("Last Working Day", row["LastWorkingDate"]));
+   502	        sb.Append(Cell("Notice Required (days)", row["NoticeDaysRequired"]));
+   503	        sb.Append(Cell("Notice Served (days)", NoticeServedDays(row)));
+   504	        sb.Append("</tr><tr>");
+   505	        sb.Append(MoneyCell("Basic", row["BasicAmount"]));
+   506	        sb.Append(MoneyCell("Gross", row["GrossAmount"]));
+   507	        sb.Append(MoneyCell("CTC", row["CTCAmount"]));
+   508	        sb.Append(DateCell("Compliance Window Ends", row["ComplianceWindowEnd"]));
+   509	        sb.Append("</tr></table>");
+   510	        return sb.ToString();
+   511	    }
+   512	
+   513	    /// <summary>
+   514	    /// Days actually served between resignation and the last working day. Derived rather
+   515	    /// than stored: both dates are on the case, so a stored copy could only ever disagree
+   516	    /// with them.
+   517	    /// </summary>
+   518	    private static object NoticeServedDays(DataRow row)
+   519	    {
+   520	        if (row["ResignDate"] == DBNull.Value || row["LastWorkingDate"] == DBNull.Value)
+   521	            return null;
+   522	
+   523	        DateTime from = Convert.ToDateTime(row["ResignDate"]);
+   524	        DateTime to = Convert.ToDateTime(row["LastWorkingDate"]);
+   525	        int days = (int)(to.Date - from.Date).TotalDays;
+   526	        return days < 0 ? 0 : days;
+   527	    }
+   528	
+   529	    private string BuildBannerHtml(DataRow row)
+   530	    {
+   531	        bool editable = FNFCaseService.CanEdit(Convert.ToString(row["WorkflowStatus"]));
+   532	        if (!editable)
+   533	        {
+   534	            return "<div class=\"fnf-banner locked\">This case is " +
+   535	                   HttpUtility.HtmlEncode(Convert.ToString(row["WorkflowStatus"])) +
+   536	                   " and is shown read-only.</div>";
+   537	        }
+   538	
+   539	        bool ready = row["IsClearanceReady"] != DBNull.Value && Convert.ToBoolean(row["IsClearanceReady"]);
+   540	        if (ready)
+   541	        {
+   542	            return "<div class=\"fnf-banner ready\">Clearance Ready &mdash; the settlement can be " +
+   543	                   "calculated for this case.</div>";
+   544	        }
+   545	
+   546	        string reason = Convert.ToString(row["ClearanceBlockReason"]);
+   547	        if (string.IsNullOrEmpty(reason)) reason = "Readiness has not been checked yet.";
+   548	
+   549	        return "<div class=\"fnf-banner blocked\">Clearance Not Ready &mdash; " +
+   550	               HttpUtility.HtmlEncode(reason) + "</div>";
+   551	    }
+   552	
+   553	    /// <summary>
+   554	    /// Re-runs the calculation WITHOUT saving, purely to collect its notes for the screen.
+   555	    ///
+   556	    /// The notes are the difference between "gratuity is zero because service is too short"
+   557	    /// and "gratuity is zero because nobody switched it on" — a settlement that quietly
+   558	    /// skipped a component looks identical to one where it is genuinely nil, and that is the
+   559	    /// single most misleading thing this screen could do.
+   560	    /// </summary>
+   561	    private void RenderSettlementNotes(DataRow head)
+   562	    {
+   563	        litSettleNotes.Text = string.Empty;
+   564	        if (CurrentCaseId <= 0) return;
+   565	
+   566	        try
+   567	        {
+   568	            List<string> notes;
+   569	            using (SqlConnection conn = CreateConnection())
+   570	            {
+   571	                conn.Open();
+   572	                using (SqlTransaction tx = conn.BeginTransaction())
+   573	                {
+   574	                    try
+   575	                    {
+   576	                        notes = FNFSettlementService.Calculate(conn, tx, CurrentCaseId, UserId, false).Notes;
+   577	                    }
+   578	                    finally
+   579	                    {
+   580	                        // Read-only by construction: persist = false, and the transaction is
+   581	                        // always rolled back so nothing here can write.
+   582	                        try { tx.Rollback(); } catch { }
+   583	                    }
+   584	                }
+   585	            }
+   586	
+   587	            if (notes.Count == 0) return;
+   588	
+   589	            var sb = new System.Text.StringBuilder();
+   590	            sb.Append("<div class=\"fnf-banner locked\"><b>Worth knowing about this settlement</b><ul style=\"margin:6px 0 0 18px;font-weight:400\">");
+   591	            foreach (string note in notes)
+   592	                sb.Append("<li>").Append(HttpUtility.HtmlEncode(note)).Append("</li>");
+   593	            sb.Append("</ul></div>");
+   594	            litSettleNotes.Text = sb.ToString();
+   595	        }
+   596	        catch (Exception ex)
+   597	        {
+   598	            // A case with no config or no salary record must still open.
+   599	            ErrorLogHelper.Log(ex, "FNFSettlement.Notes");
+   600	        }
+   601	    }
+   602	
+   603	    private void HandleSave()
+   604	    {
+   605	        if (CurrentCaseId <= 0)
+   606	        {
+   607	            FnfPanel.JSProperties["cpMsg"] = "Create the case first.";
+   608	            return;
+   609	        }
+   610	
+   611	        // Hiding the Save button is not validation - the callback is still reachable from a
+   612	        // second tab, so the rule is re-checked here.
+   613	        if (!FNFCaseService.CanEdit(CurrentStatus))
+   614	        {
+   615	            FnfPanel.JSProperties["cpMsg"] = "This case is " + CurrentStatus + " and can no longer be changed.";
+   616	            return;
+   617	        }
+   618	
+   619	        const string sql = @"
+   620	            UPDATE dbo.HR_FNFSettlement
+   621	            SET    CasePriority                 = @Priority,
+   622	                   PlannedCalcStartDate         = @PlannedCalc,
+   623	                   PlannedSettlementDate        = @PlannedSettle,
+   624	                   ActualCalcStartDate          = @ActualCalc,
+   625	                   ApprovalTurnaroundDays       = @Tat,
+   626	                   HRExecutiveUserMasterID      = @HrExec,
+   627	                   PayrollExecutiveUserMasterID = @PayExec,
+   628	                   FinanceExecutiveUserMasterID = @FinExec,
+   629	                   ApproverUserMasterID         = @Approver,
+   630	                   Remarks                      = @Remarks,
+   631	                   EditUserMasterID             = @UserID,
+   632	                   EditUserDateTime             = GETDATE()
+   633	            WHERE  FNFSettlementID = @Id
+   634	              AND  Status = 1";
+   635	
+   636	        using (SqlConnection conn = CreateConnection())
+   637	        using (var cmd = new SqlCommand(sql, conn))
+   638	        {
+   639	            cmd.Parameters.AddWithValue("@Priority", Convert.ToString(cmbPriority.Value) ?? "Normal");
+   640	            cmd.Parameters.AddWithValue("@PlannedCalc",   DbDate(dtPlannedCalc));
+   641	            cmd.Parameters.AddWithValue("@PlannedSettle", DbDate(dtPlannedSettle));
+   642	            cmd.Parameters.AddWithValue("@ActualCalc",    DbDate(dtActualCalc));
+   643	            cmd.Parameters.AddWithValue("@Tat",      spnTat.Value == null ? (object)DBNull.Value : Convert.ToInt32(spnTat.Number));
+   644	            cmd.Parameters.AddWithValue("@HrExec",   DbLong(cmbHrExec));
+   645	            cmd.Parameters.AddWithValue("@PayExec",  DbLong(cmbPayrollExec));
+   646	            cmd.Parameters.AddWithValue("@FinExec",  DbLong(cmbFinanceExec));
+   647	            cmd.Parameters.AddWithValue("@Approver", DbLong(cmbApprover));
+   648	            cmd.Parameters.AddWithValue("@Remarks",  string.IsNullOrEmpty(memRemarks.Text) ? (object)DBNull.Value : memRemarks.Text);
+   649	            cmd.Parameters.AddWithValue("@UserID",   UserId);
+   650	            cmd.Parameters.AddWithValue("@Id",       CurrentCaseId);
+   651	
+   652	            conn.Open();
+   653	            cmd.ExecuteNonQuery();
+   654	        }
+   655	
+   656	        FnfPanel.JSProperties["cpMsg"] = "Saved.";
+   657	        FnfPanel.JSProperties["cpReloadList"] = true;
+   658	    }
+   659	
+   660	    private static object DbDate(ASPxDateEdit editor)
+   661	    {
+   662	        return editor.Value == null ? (object)DBNull.Value : editor.Date;
+   663	    }
+   664	
+   665	    private static object DbLong(ASPxComboBox combo)
+   666	    {
+   667	        return combo.Value == null ? (object)DBNull.Value : Convert.ToInt64(combo.Value);
+   668	    }
+   669	
+   670	    /// <summary>
+   671	    /// Re-reads attendance, leave and the ledgers, rescans for recoveries and recomputes the
+   672	    /// clearance verdict. Needed because all three move underneath the case: Confirm Pay may
+   673	    /// run after the case was raised, and an asset may come back later.
+   674	    /// </summary>
+   675	    private void HandleRecheck()
+   676	    {
+   677	        if (CurrentCaseId <= 0) return;
+   678	
+   679	        int found;
+   680	        using (SqlConnection conn = CreateConnection())
+   681	        {
+   682	            conn.Open();
+   683	            using (SqlTransaction tx = conn.BeginTransaction())
+   684	            {
+   685	                try
+   686	                {
+   687	                    FNFCaseService.SeedReadiness(conn, tx, CurrentCaseId);
+   688	                    FNFCaseService.AutoAnswerReadiness(conn, tx, CurrentCaseId);
+   689	                    found = FNFCaseService.DiscoverRecoveries(conn, tx, CurrentCaseId, UserId, HostNameCapped());
+   690	                    FNFCaseService.EvaluateClearance(conn, tx, CurrentCaseId);
+   691	                    tx.Commit();
+   692	                }
+   693	                catch
+   694	                {
+   695	                    try { tx.Rollback(); } catch { /* connection already gone */ }
+   696	                    throw;
+   697	                }
+   698	            }
+   699	        }
+   700	
+   701	        LoadCase(CurrentCaseId);
+   702	        FnfPanel.JSProperties["cpMsg"] = found > 0
+   703	            ? "Readiness re-checked. " + found + " new recovery row(s) found."
+   704	            : "Readiness re-checked. No new recoveries.";
+   705	    }
+   706	
+   707	    // -- Calculate and submit -------------------------------------------------
+   708	
+   709	    /// <summary>
+   710	    /// Works out the settlement and seeds the verification and handover checklists.
+   711	    ///
+   712	    /// Refuses while clearance is not ready — that is the whole point of the readiness
+   713	    /// checklist: calculating on incomplete data produces a figure somebody will believe.
+   714	    /// </summary>
+   715	    private void HandleCalculate()
+   716	    {
+   717	        if (CurrentCaseId <= 0)
+   718	        {
+   719	            FnfPanel.JSProperties["cpMsg"] = "Open a case first.";
+   720	            return;
+   721	        }
+   722	
+   723	        if (!FNFCaseService.CanEdit(CurrentStatus))
+   724	        {
+   725	            FnfPanel.JSProperties["cpMsg"] = "This case is " + CurrentStatus + " and can no longer be changed.";
+   726	            return;
+   727	        }
+   728	
+   729	        FNFSettlementService.Result result;
+   730	
+   731	        using (SqlConnection conn = CreateConnection())
+   732	        {
+   733	            conn.Open();
+   734	
+   735	            if (!IsClearanceReady(conn, null))
+   736	            {
+   737	                FnfPanel.JSProperties["cpMsg"] =
+   738	                    "Clearance is not ready yet, so the settlement was not calculated. "
+   739	                  + "Complete the Clearance Readiness tab first.";
+   740	                return;
+   741	            }
+   742	
+   743	            using (SqlTransaction tx = conn.BeginTransaction())
+   744	            {
+   745	                try
+   746	                {
+   747	                    result = FNFSettlementService.Calculate(conn, tx, CurrentCaseId, UserId, true);
+   748	                    // Seeded from the service so the approval screen and the tests do it
+   749	                    // identically - this used to be a private copy on this page.
+   750	                    FNFSettlementService.SeedVerificationAndHandover(conn, tx, CurrentCaseId, result);
+   751	                    tx.Commit();
+   752	                }
+   753	                catch
+   754	                {
+   755	                    try { tx.Rollback(); } catch { /* connection already gone */ }
+   756	                    throw;
+   757	                }
+   758	            }
+   759	        }
+   760	
+   761	        LoadCase(CurrentCaseId);
+   762	
+   763	        FnfPanel.JSProperties["cpMsg"] = "Calculated. Net payable "
+   764	            + result.NetPayable.ToString("n2")
+   765	            + (result.Notes.Count > 0 ? " - see the notes on the Settlement tab." : ".");
+   766	    }
+   767	
+   768	    private bool IsClearanceReady(SqlConnection conn, SqlTransaction tx)
+   769	    {
+   770	        using (var cmd = new SqlCommand(
+   771	            "SELECT ISNULL(CAST(IsClearanceReady AS int), 0) FROM dbo.HR_FNFSettlement WHERE FNFSettlementID = @Id",
+   772	            conn, tx))
+   773	        {
+   774	            cmd.Parameters.AddWithValue("@Id", CurrentCaseId);
+   775	            object value = cmd.ExecuteScalar();
+   776	            return value != null && value != DBNull.Value && Convert.ToInt32(value) == 1;
+   777	        }
+   778	    }
+   779	
+   780	    /// <summary>
+   781	    /// Moves the case to Submitted. Every gate is re-checked here, not just in the UI: the
+   782	    /// callback is reachable from a second tab whatever the toolbar shows.
+   783	    /// </summary>
+   784	    private void HandleSubmit()
+   785	    {
+   786	        if (CurrentCaseId <= 0) return;
+   787	
+   788	        if (!FNFCaseService.CanEdit(CurrentStatus))
+   789	        {
+   790	            FnfPanel.JSProperties["cpMsg"] = "This case is already " + CurrentStatus + ".";
+   791	            return;
+   792	        }
+   793	
+   794	        using (SqlConnection conn = CreateConnection())
+   795	        {
+   796	            conn.Open();
+   797	
+   798	            if (!IsClearanceReady(conn, null))
+   799	            {
+   800	                FnfPanel.JSProperties["cpMsg"] = "Clearance is not ready, so this case cannot be submitted.";

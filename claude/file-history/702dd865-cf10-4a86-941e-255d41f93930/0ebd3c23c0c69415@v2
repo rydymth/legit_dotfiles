@@ -1,0 +1,162 @@
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Options;
+using Moq;
+using SolutionOne_BusinessLogicLayer.Services.Canteen_Management.Implementation;
+using SolutionOne_Core.CanteenManagementModels.MealBooking;
+using SolutionOne_Core.CanteenManagementModels.MealSession;
+using SolutionOne_Core.CommonModels;
+using SolutionOne_DataAccessLayer.Entities;
+using SolutionOne_DataAccessLayer.Repositories.Canteen_Management.Interface;
+using System.Net;
+using Xunit;
+
+namespace SolutionOne_Tests;
+
+/// <summary>
+/// The ordering deadline HR types on the Meal Session screen is the one meal booking later enforces, so
+/// a deadline that can never be met must be refused at the point it is saved - not discovered by an
+/// employee who cannot order breakfast.
+/// </summary>
+public class MealSessionOrderCutoffTests
+{
+    private const int Breakfast = 1;
+    private const int MSessionId = 11;
+
+    private readonly Mock<IMealSessionRepository> _repository = new();
+    private readonly Mock<IItemMasterRepository> _itemMaster = new();
+    private readonly MealBookingSettings _settings = new();
+    private HrCmsMealSession? _saved;
+
+    public MealSessionOrderCutoffTests()
+    {
+        _repository.Setup(x => x.IsValidSessionNameIdAsync(Breakfast)).ReturnsAsync(true);
+        _repository.Setup(x => x.ExistsBySessionNameIdAsync(It.IsAny<int>(), It.IsAny<int?>())).ReturnsAsync(false);
+        _repository.Setup(x => x.AddAsync(It.IsAny<HrCmsMealSession>()))
+            .Callback<HrCmsMealSession>(x => _saved = x)
+            .Returns(Task.CompletedTask);
+        _repository.Setup(x => x.UpdateAsync(It.IsAny<HrCmsMealSession>()))
+            .Callback<HrCmsMealSession>(x => _saved = x)
+            .Returns(Task.CompletedTask);
+    }
+
+    [Fact]
+    public async Task A_deadline_on_the_day_of_the_meal_cannot_be_after_the_meal_starts()
+    {
+        // Breakfast is served from 07:30: ordering it at 08:00 that morning is an order for food already cooked.
+        var response = await Service().InsertMealSessionAsync(SaveModel(cutoff: "08:00", daysBefore: 0));
+
+        Assert.False(response.IsSuccess);
+        Assert.Equal(HttpStatusCode.BadRequest, response.Status);
+        Assert.Equal("Ordering must close by the time the meal starts (07:30). Choose an earlier time, or move the deadline to a day before the meal.", response.Message);
+        Assert.Null(_saved);
+    }
+
+    [Fact]
+    public async Task A_deadline_at_the_moment_the_meal_starts_is_allowed()
+    {
+        var response = await Service().InsertMealSessionAsync(SaveModel(cutoff: "07:30", daysBefore: 0));
+
+        Assert.True(response.IsSuccess);
+        Assert.Equal(new TimeOnly(7, 30), _saved!.OrderCutoffTime);
+        Assert.Equal(0, _saved.OrderCutoffDaysBefore);
+    }
+
+    [Fact]
+    public async Task The_same_clock_time_is_fine_once_the_deadline_moves_to_the_day_before()
+    {
+        var response = await Service().InsertMealSessionAsync(SaveModel(cutoff: "23:59", daysBefore: 1));
+
+        Assert.True(response.IsSuccess);
+        Assert.Equal(new TimeOnly(23, 59), _saved!.OrderCutoffTime);
+        Assert.Equal(1, _saved.OrderCutoffDaysBefore);
+    }
+
+    [Fact]
+    public async Task A_deadline_further_back_than_the_setting_allows_is_refused()
+    {
+        _settings.MaxOrderCutoffDaysBefore = 1;
+
+        var response = await Service().InsertMealSessionAsync(SaveModel(cutoff: "23:59", daysBefore: 2));
+
+        Assert.False(response.IsSuccess);
+        Assert.Equal("The ordering deadline can be at most 1 day before the meal.", response.Message);
+    }
+
+    [Fact]
+    public async Task Lowering_the_setting_does_not_make_the_sessions_already_saved_uneditable()
+    {
+        // Saved when 3 days were allowed; the setting has since come down to 1.
+        _repository.Setup(x => x.GetByIdAsync(MSessionId)).ReturnsAsync(Existing(daysBefore: 3));
+        _settings.MaxOrderCutoffDaysBefore = 1;
+
+        var keptAsItWas = await Service().UpdateMealSessionAsync(SaveModel(cutoff: "23:59", daysBefore: 3, mSessionId: MSessionId));
+
+        Assert.True(keptAsItWas.IsSuccess);
+        Assert.Equal(3, _saved!.OrderCutoffDaysBefore);
+
+        // ... but it cannot be moved further back still.
+        _repository.Setup(x => x.GetByIdAsync(MSessionId)).ReturnsAsync(Existing(daysBefore: 3));
+        var movedFurtherBack = await Service().UpdateMealSessionAsync(SaveModel(cutoff: "23:59", daysBefore: 4, mSessionId: MSessionId));
+
+        Assert.False(movedFurtherBack.IsSuccess);
+    }
+
+    [Fact]
+    public void The_cutoff_day_list_offered_to_the_screen_follows_the_setting()
+    {
+        _settings.MaxOrderCutoffDaysBefore = 2;
+
+        var (response, data) = Service().GetOrderCutoffDayOptions();
+
+        Assert.True(response.IsSuccess);
+        Assert.Equal(2, data.MaxDaysBefore);
+        Assert.Equal(new[] { 0, 1, 2 }, data.Options.Select(x => x.Value));
+        Assert.Equal(new[] { "Same day as the meal", "1 day before the meal", "2 days before the meal" }, data.Options.Select(x => x.Label));
+    }
+
+    [Fact]
+    public void The_cutoff_day_list_never_goes_past_the_ceiling_the_database_allows()
+    {
+        _settings.MaxOrderCutoffDaysBefore = 99;
+
+        var (_, data) = Service().GetOrderCutoffDayOptions();
+
+        Assert.Equal(MealOrderCutoff.MaxDaysBeforeCeiling, data.MaxDaysBefore);
+    }
+
+    [Theory]
+    [InlineData(0, "09:30 AM on the day of the meal")]
+    [InlineData(1, "09:30 AM the day before the meal")]
+    [InlineData(3, "09:30 AM, 3 days before the meal")]
+    public void The_deadline_reads_the_same_way_everywhere_it_is_shown(int daysBefore, string expected) =>
+        Assert.Equal(expected, MealOrderCutoff.Describe(new TimeOnly(9, 30), daysBefore));
+
+    private MealSessionService Service() => new(
+        _repository.Object,
+        _itemMaster.Object,
+        new ApplicationSession(Mock.Of<IHttpContextAccessor>()),
+        Options.Create(_settings));
+
+    /// <summary>Breakfast, served 07:30 - 09:30.</summary>
+    private static MealSessionSaveModel SaveModel(string cutoff, int daysBefore, int mSessionId = 0) => new()
+    {
+        MSessionId = mSessionId,
+        SessionNameId = Breakfast,
+        StartTime = "07:30:00",
+        EndTime = "09:30:00",
+        OrderCutoffTime = cutoff,
+        OrderCutoffDaysBefore = daysBefore,
+        IsActive = true
+    };
+
+    private static HrCmsMealSession Existing(int daysBefore) => new()
+    {
+        MSessionId = MSessionId,
+        SessionNameId = Breakfast,
+        StartTime = new TimeOnly(7, 30),
+        EndTime = new TimeOnly(9, 30),
+        OrderCutoffTime = new TimeOnly(23, 59),
+        OrderCutoffDaysBefore = daysBefore,
+        IsActive = true
+    };
+}

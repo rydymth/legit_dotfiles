@@ -1,0 +1,625 @@
+     1	using System;
+     2	using System.Collections.Generic;
+     3	using System.Data;
+     4	using System.Data.SqlClient;
+     5	using System.Globalization;
+     6	
+     7	/// <summary>
+     8	/// Full &amp; Final settlement CASE service - everything up to (but not including) the
+     9	/// money. Creating a case, its readiness checklist, and the recoveries that will
+    10	/// become deductions.
+    11	///
+    12	/// Deliberately holds no gratuity / leave-encashment / per-day-rate arithmetic: those
+    13	/// rules are still unanswered, live in HR_FNFConfig, and belong in a separate
+    14	/// FNFSettlementService so this half can ship and be used first.
+    15	///
+    16	/// Tables come from migrations 110 (HR_FNFSettlement, ...Detail, HR_FNFConfig) and
+    17	/// 111 (HR_FNFCheck, HR_FNFRecovery, HR_FNFAlumni).
+    18	///
+    19	/// Written with no dependency on System.Web so it can be compiled standalone with
+    20	/// csc.exe and driven against the live database inside a rolled-back transaction -
+    21	/// the only real verification available on this box (headless browsers are blocked by
+    22	/// machine policy).
+    23	/// </summary>
+    24	public static class FNFCaseService
+    25	{
+    26	    /// <summary>
+    27	    /// Every lifecycle date on HR_EmployeeMaster uses this as its "not set" sentinel
+    28	    /// instead of NULL, so a plain IS NOT NULL test matches every employee.
+    29	    /// </summary>
+    30	    public static readonly DateTime EpochDate = new DateTime(1900, 1, 1);
+    31	
+    32	    public const string KindReadiness         = "Readiness";
+    33	    public const string KindVerification      = "Verification";
+    34	    public const string KindApprovalParameter = "ApprovalParameter";
+    35	    public const string KindHandover          = "Handover";
+    36	
+    37	    // Workflow states, matching HR_FNFSettlement.WorkflowStatus.
+    38	    public const string StatusDraft     = "Draft";
+    39	    public const string StatusSubmitted = "Submitted";
+    40	    public const string StatusApproved  = "Approved";
+    41	    public const string StatusPaid      = "Paid";
+    42	    public const string StatusCancelled = "Cancelled";
+    43	
+    44	    // -------------------------------------------------------------------------
+    45	    //  Readiness template (stage 4 of the flow)
+    46	    // -------------------------------------------------------------------------
+    47	
+    48	    /// <summary>
+    49	    /// One entry per row of the Clearance Readiness checklist.
+    50	    ///
+    51	    /// AutoSource marks the checks this app can answer from its own data today. The
+    52	    /// other six describe a resignation-approval and exit-clearance module that does
+    53	    /// not exist yet, so HR ticks them by hand for now - which is the correct
+    54	    /// behaviour rather than a gap: the point of the checklist is that a human
+    55	    /// confirms the data is complete before payroll calculates on it.
+    56	    /// </summary>
+    57	    public sealed class ReadinessCheck
+    58	    {
+    59	        public string Code;
+    60	        public string Name;
+    61	        public bool IsRequired;
+    62	        public int SortOrder;
+    63	        public string AutoSource;   // null = manual
+    64	    }
+    65	
+    66	    public static IList<ReadinessCheck> ReadinessTemplate()
+    67	    {
+    68	        return new List<ReadinessCheck>
+    69	        {
+    70	            new ReadinessCheck { Code = "RESIGN_APPROVED", Name = "Resignation Approved by Manager",    IsRequired = true, SortOrder = 1 },
+    71	            new ReadinessCheck { Code = "EXIT_INTERVIEW",  Name = "Exit Interview Submitted",           IsRequired = true, SortOrder = 2 },
+    72	            new ReadinessCheck { Code = "IT_CLEARANCE",    Name = "IT Clearance (Asset Return)",        IsRequired = true, SortOrder = 3 },
+    73	            new ReadinessCheck { Code = "ADMIN_CLEARANCE", Name = "Admin Clearance",                    IsRequired = true, SortOrder = 4 },
+    74	            new ReadinessCheck { Code = "FIN_CLEARANCE",   Name = "Finance Clearance (No Dues)",        IsRequired = true, SortOrder = 5 },
+    75	            new ReadinessCheck { Code = "MGR_CLEARANCE",   Name = "Manager Clearance (Handover / KT)",  IsRequired = true, SortOrder = 6 },
+    76	            new ReadinessCheck { Code = "LEAVE_BAL",       Name = "Leave Balance Updated",              IsRequired = true, SortOrder = 7, AutoSource = "HR_EmployeeWiseLeave" },
+    77	            new ReadinessCheck { Code = "LOAN_LEDGER",     Name = "Loan / Advance Ledger Updated",      IsRequired = true, SortOrder = 8, AutoSource = "HR_LoanEMISchedule" },
+    78	            new ReadinessCheck { Code = "ATT_FINAL",       Name = "Attendance Finalized till LWD",      IsRequired = true, SortOrder = 9, AutoSource = "HR_MonthlyAttendance" },
+    79	        };
+    80	    }
+    81	
+    82	    // -------------------------------------------------------------------------
+    83	    //  Case number
+    84	    // -------------------------------------------------------------------------
+    85	
+    86	    /// <summary>
+    87	    /// FNF-&lt;year&gt;-&lt;00000&gt;, numbered per year. Read inside the caller's
+    88	    /// transaction with UPDLOCK/HOLDLOCK so two people pressing Create F&amp;F Case at
+    89	    /// the same moment cannot be handed the same number - the unique index on CaseNo
+    90	    /// would refuse the second one, but as a failed save rather than a queued one.
+    91	    /// </summary>
+    92	    public static string NextCaseNo(SqlConnection conn, SqlTransaction tx, int year)
+    93	    {
+    94	        string prefix = "FNF-" + year.ToString(CultureInfo.InvariantCulture) + "-";
+    95	
+    96	        using (var cmd = new SqlCommand(@"
+    97	            SELECT MAX(CAST(RIGHT(CaseNo, 5) AS int))
+    98	            FROM   dbo.HR_FNFSettlement WITH (UPDLOCK, HOLDLOCK)
+    99	            WHERE  CaseNo LIKE @Prefix + '[0-9][0-9][0-9][0-9][0-9]'", conn, tx))
+   100	        {
+   101	            cmd.Parameters.AddWithValue("@Prefix", prefix);
+   102	            object max = cmd.ExecuteScalar();
+   103	            int next = (max == null || max == DBNull.Value) ? 1 : Convert.ToInt32(max) + 1;
+   104	            return prefix + next.ToString("00000", CultureInfo.InvariantCulture);
+   105	        }
+   106	    }
+   107	
+   108	    // -------------------------------------------------------------------------
+   109	    //  Who can have a case
+   110	    // -------------------------------------------------------------------------
+   111	
+   112	    /// <summary>
+   113	    /// Employees who have resigned or left and do not already have a live case.
+   114	    ///
+   115	    /// Accepts anyone with a real ResignDate OR DateOfLeft - not JobStatus = 'Left' -
+   116	    /// because a case is normally raised during the notice period, while the employee
+   117	    /// is still Active. Both dates carry the 1900-01-01 sentinel, so both need the
+   118	    /// epoch test.
+   119	    /// </summary>
+   120	    /// <summary>
+   121	    /// Adds the Exit Formality gate to the eligibility query when this company requires it
+   122	    /// (HR_FNFConfig.RequireExitFormality, on by default): no settlement until the exit
+   123	    /// interview is done, every asset is back and every department has cleared.
+   124	    ///
+   125	    /// Returns an empty string when the exit tables are absent or the company has the gate
+   126	    /// switched off, so the caller can splice it in unconditionally. It has to be appended
+   127	    /// rather than written inline because SQL naming a missing table fails at PARSE time,
+   128	    /// and a tenant database may not have migration 114 yet.
+   129	    /// </summary>
+   130	    private static string ExitFormalityGate(SqlConnection conn, SqlTransaction tx, long companyId)
+   131	    {
+   132	        if (!ExitFormalityService.SchemaReady(conn, tx)) return string.Empty;
+   133	
+   134	        bool required;
+   135	        using (var cmd = new SqlCommand(@"
+   136	            SELECT ISNULL(MAX(CAST(RequireExitFormality AS int)), 1)
+   137	            FROM   dbo.HR_FNFConfig
+   138	            WHERE  CompanyMasterID = @CompanyID AND Status = 1", conn, tx))
+   139	        {
+   140	            cmd.Parameters.AddWithValue("@CompanyID", companyId);
+   141	            object value = cmd.ExecuteScalar();
+   142	            required = (value == null || value == DBNull.Value) || Convert.ToInt32(value) == 1;
+   143	        }
+   144	
+   145	        if (!required) return string.Empty;
+   146	
+   147	        return @"
+   148	              AND EXISTS (SELECT 1 FROM dbo.HR_ExitFormality X
+   149	                          WHERE  X.EmployeeMasterID = EM.EmployeeMasterID
+   150	                            AND  X.Status = 1
+   151	                            AND  X.IsComplete = 1) ";
+   152	    }
+   153	
+   154	    /// <param name="tx">Pass null outside a transaction. Required when the connection
+   155	    /// already has one open, otherwise ADO.NET refuses the read with "ExecuteReader
+   156	    /// requires the command to have a transaction".</param>
+   157	    public static DataTable EligibleEmployees(SqlConnection conn, SqlTransaction tx, long companyId)
+   158	    {
+   159	        const string sql = @"
+   160	            SELECT EM.EmployeeMasterID,
+   161	                   LTRIM(ISNULL(' ' + NULLIF(LTRIM(RTRIM(EM.FirstName)),''), '') + ISNULL(' ' + NULLIF(LTRIM(RTRIM(EM.FatherName)),''), '') + ISNULL(' ' + NULLIF(LTRIM(RTRIM(EM.LastName)),''), ''))
+   162	                       + ' (' + ISNULL(EM.Code, '') + ')' AS Name
+   163	            FROM   dbo.HR_EmployeeMaster EM
+   164	            WHERE  EM.Status = 1
+   165	              AND  EM.CompanyMasterID = @CompanyID
+   166	              AND  ( (EM.ResignDate IS NOT NULL AND EM.ResignDate > @Epoch)
+   167	                  OR (EM.DateOfLeft IS NOT NULL AND EM.DateOfLeft > @Epoch) )
+   168	              AND  NOT EXISTS (SELECT 1 FROM dbo.HR_FNFSettlement F
+   169	                               WHERE  F.EmployeeMasterID = EM.EmployeeMasterID
+   170	                                 AND  F.Status = 1
+   171	                                 AND  F.WorkflowStatus <> @Cancelled)";
+   172	
+   173	        // Exit Formality must be complete first, when the company requires it. Appended
+   174	        // because it references tables a tenant database may not have yet.
+   175	        string gated = sql + ExitFormalityGate(conn, tx, companyId) + " ORDER BY EM.Code";
+   176	
+   177	        using (var cmd = new SqlCommand(gated, conn, tx))
+   178	        {
+   179	            cmd.Parameters.AddWithValue("@CompanyID", companyId);
+   180	            cmd.Parameters.AddWithValue("@Epoch", EpochDate);
+   181	            cmd.Parameters.AddWithValue("@Cancelled", StatusCancelled);
+   182	
+   183	            var dt = new DataTable();
+   184	            using (var da = new SqlDataAdapter(cmd)) da.Fill(dt);
+   185	            return dt;
+   186	        }
+   187	    }
+   188	
+   189	    // -------------------------------------------------------------------------
+   190	    //  Create case
+   191	    // -------------------------------------------------------------------------
+   192	
+   193	    /// <summary>
+   194	    /// Creates the case, copies the employee snapshot, seeds the readiness checklist,
+   195	    /// auto-answers the checks this app can answer, discovers the recoveries it can
+   196	    /// see, and evaluates the clearance verdict.
+   197	    ///
+   198	    /// The CALLER owns the transaction - all six steps must commit together or a case
+   199	    /// exists with a half-built checklist, and a caller-owned transaction is also what
+   200	    /// makes this testable against the live database without writing to it.
+   201	    /// </summary>
+   202	    public static long CreateCase(SqlConnection conn, SqlTransaction tx, long employeeId,
+   203	                                  long companyId, int userId, string systemName,
+   204	                                  int complianceWindowDays)
+   205	    {
+   206	        if (conn == null) throw new ArgumentNullException("conn");
+   207	        if (employeeId <= 0) throw new ArgumentException("employeeId is required.", "employeeId");
+   208	
+   209	        {
+   210	            {
+   211	                DateTime caseDate = DateTime.Today;
+   212	                string caseNo = NextCaseNo(conn, tx, caseDate.Year);
+   213	                long caseId;
+   214	
+   215	                // The snapshot is taken from the employee here and never re-read: a
+   216	                // later transfer or re-designation must not change what was settled.
+   217	                using (var cmd = new SqlCommand(@"
+   218	                    INSERT INTO dbo.HR_FNFSettlement
+   219	                        (CaseNo, EmployeeMasterID, CaseDate, CasePriority, WorkflowStatus,
+   220	                         ResignDate, LastWorkingDate, DateOfJoining,
+   221	                         DepartmentMasterID, DesignationMasterID, ReportingPersonID,
+   222	                         NoticeDaysRequired,
+   223	                         CategoryMasterID, BranchMasterID, CompanyMasterID,
+   224	                         ComplianceWindowDays, Status,
+   225	                         EntryUserMasterID, EntryUserDateTime, SystemName)
+   226	                    SELECT @CaseNo, EM.EmployeeMasterID, @CaseDate, 'Normal', @Draft,
+   227	                           NULLIF(EM.ResignDate, @Epoch), NULLIF(EM.DateOfLeft, @Epoch),
+   228	                           NULLIF(EM.DateOfJoining, @Epoch),
+   229	                           EM.DepartmentMasterID, EM.DesignationMasterID, EM.ReportingPersonID,
+   230	                           EM.NoticePeriodDays,
+   231	                           EM.CategoryMasterID, EM.BranchMasterID, @CompanyID,
+   232	                           @WindowDays, 1,
+   233	                           @UserID, GETDATE(), @SystemName
+   234	                    FROM   dbo.HR_EmployeeMaster EM
+   235	                    WHERE  EM.EmployeeMasterID = @EmpID;
+   236	                    SELECT CAST(SCOPE_IDENTITY() AS bigint);", conn, tx))
+   237	                {
+   238	                    cmd.Parameters.AddWithValue("@CaseNo", caseNo);
+   239	                    cmd.Parameters.AddWithValue("@CaseDate", caseDate);
+   240	                    cmd.Parameters.AddWithValue("@Draft", StatusDraft);
+   241	                    cmd.Parameters.AddWithValue("@Epoch", EpochDate);
+   242	                    cmd.Parameters.AddWithValue("@CompanyID", companyId);
+   243	                    cmd.Parameters.AddWithValue("@WindowDays", complianceWindowDays);
+   244	                    cmd.Parameters.AddWithValue("@UserID", userId);
+   245	                    cmd.Parameters.AddWithValue("@SystemName", Trunc(systemName, 50));
+   246	                    cmd.Parameters.AddWithValue("@EmpID", employeeId);
+   247	
+   248	                    object idObj = cmd.ExecuteScalar();
+   249	                    if (idObj == null || idObj == DBNull.Value)
+   250	                        throw new InvalidOperationException(
+   251	                            "Employee " + employeeId + " was not found, so no F&F case was created.");
+   252	
+   253	                    caseId = Convert.ToInt64(idObj);
+   254	                }
+   255	
+   256	                SeedReadiness(conn, tx, caseId);
+   257	                AutoAnswerReadiness(conn, tx, caseId);
+   258	                DiscoverRecoveries(conn, tx, caseId, userId, systemName);
+   259	                EvaluateClearance(conn, tx, caseId);
+   260	
+   261	                return caseId;
+   262	            }
+   263	        }
+   264	    }
+   265	
+   266	    /// <summary>
+   267	    /// Writes any checklist row the case is missing. Safe to re-run - the unique
+   268	    /// index on (case, kind, code) is what the NOT EXISTS guard protects, and a
+   269	    /// re-seed must never wipe an answer somebody already gave.
+   270	    /// </summary>
+   271	    public static int SeedReadiness(SqlConnection conn, SqlTransaction tx, long caseId)
+   272	    {
+   273	        int added = 0;
+   274	
+   275	        foreach (ReadinessCheck chk in ReadinessTemplate())
+   276	        {
+   277	            using (var cmd = new SqlCommand(@"
+   278	                INSERT INTO dbo.HR_FNFCheck
+   279	                    (FNFSettlementID, CheckKind, CheckCode, CheckName, IsRequired, SortOrder)
+   280	                SELECT @CaseID, @Kind, @Code, @Name, @Req, @Sort
+   281	                WHERE  NOT EXISTS (SELECT 1 FROM dbo.HR_FNFCheck
+   282	                                   WHERE FNFSettlementID = @CaseID
+   283	                                     AND CheckKind = @Kind
+   284	                                     AND CheckCode = @Code);", conn, tx))
+   285	            {
+   286	                cmd.Parameters.AddWithValue("@CaseID", caseId);
+   287	                cmd.Parameters.AddWithValue("@Kind", KindReadiness);
+   288	                cmd.Parameters.AddWithValue("@Code", chk.Code);
+   289	                cmd.Parameters.AddWithValue("@Name", chk.Name);
+   290	                cmd.Parameters.AddWithValue("@Req", chk.IsRequired);
+   291	                cmd.Parameters.AddWithValue("@Sort", chk.SortOrder);
+   292	                added += cmd.ExecuteNonQuery();
+   293	            }
+   294	        }
+   295	
+   296	        return added;
+   297	    }
+   298	
+   299	    /// <summary>
+   300	    /// Answers the three checks this app has data for, and only those.
+   301	    ///
+   302	    ///   LEAVE_BAL  - does the employee have leave rows at all? An objective
+   303	    ///                existence test; the remark carries the balance so the human
+   304	    ///                can sanity-check it.
+   305	    ///   ATT_FINAL  - is there an HR_MonthlyAttendance row for the last working
+   306	    ///                month? This is the one that genuinely gates the calculation.
+   307	    ///   LOAN_LEDGER- deliberately left for Finance to tick. Whether a ledger is
+   308	    ///                "updated" is a judgement, not a query. The outstanding figure
+   309	    ///                goes in the remark so they are ticking something informed.
+   310	    ///
+   311	    /// Never overwrites an answer a person has already given.
+   312	    /// </summary>
+   313	    public static void AutoAnswerReadiness(SqlConnection conn, SqlTransaction tx, long caseId)
+   314	    {
+   315	        // --- Leave balance ---------------------------------------------------
+   316	        using (var cmd = new SqlCommand(@"
+   317	            UPDATE C
+   318	            SET    C.Result  = CASE WHEN L.LeaveRows > 0 THEN 'Yes' ELSE 'No' END,
+   319	                   C.Remarks = CASE WHEN L.LeaveRows > 0
+   320	                                    THEN CAST(L.LeaveRows AS varchar(10)) + ' leave type(s), balance '
+   321	                                         + CAST(CAST(ISNULL(L.TotalBalance,0) AS decimal(18,2)) AS varchar(20))
+   322	                                    ELSE 'No leave rows found for this employee.' END,
+   323	                   C.ActionedOn = GETDATE()
+   324	            FROM   dbo.HR_FNFCheck C
+   325	            INNER  JOIN dbo.HR_FNFSettlement F ON F.FNFSettlementID = C.FNFSettlementID
+   326	            CROSS  APPLY (SELECT COUNT(*) AS LeaveRows, SUM(EWL.Balance) AS TotalBalance
+   327	                          FROM   dbo.HR_EmployeeWiseLeave EWL
+   328	                          WHERE  EWL.EmployeeMasterID = F.EmployeeMasterID
+   329	                            AND  ISNULL(EWL.IsActive, 1) = 1) L
+   330	            WHERE  C.FNFSettlementID = @CaseID
+   331	              AND  C.CheckKind = @Kind
+   332	              AND  C.CheckCode = 'LEAVE_BAL'
+   333	              AND  C.Result IS NULL", conn, tx))
+   334	        {
+   335	            cmd.Parameters.AddWithValue("@CaseID", caseId);
+   336	            cmd.Parameters.AddWithValue("@Kind", KindReadiness);
+   337	            cmd.ExecuteNonQuery();
+   338	        }
+   339	
+   340	        // --- Attendance finalized till LWD -----------------------------------
+   341	        // No last working day yet means the question cannot be answered at all -
+   342	        // left unanswered rather than failed, so the reason shown is the missing
+   343	        // date rather than a misleading "attendance not done".
+   344	        using (var cmd = new SqlCommand(@"
+   345	            UPDATE C
+   346	            SET    C.Result  = CASE WHEN F.LastWorkingDate IS NULL THEN NULL
+   347	                                    WHEN A.Rows > 0 THEN 'Yes' ELSE 'No' END,
+   348	                   C.Remarks = CASE WHEN F.LastWorkingDate IS NULL
+   349	                                    THEN 'Last working day is not set on the employee yet.'
+   350	                                    WHEN A.Rows > 0
+   351	                                    THEN 'Monthly attendance confirmed for '
+   352	                                         + RIGHT('00' + CAST(MONTH(F.LastWorkingDate) AS varchar(2)), 2) + '/'
+   353	                                         + CAST(YEAR(F.LastWorkingDate) AS varchar(4))
+   354	                                    ELSE 'No HR_MonthlyAttendance row for '
+   355	                                         + RIGHT('00' + CAST(MONTH(F.LastWorkingDate) AS varchar(2)), 2) + '/'
+   356	                                         + CAST(YEAR(F.LastWorkingDate) AS varchar(4))
+   357	                                         + ' - run Confirm Pay for the final month first.' END,
+   358	                   C.ActionedOn = GETDATE()
+   359	            FROM   dbo.HR_FNFCheck C
+   360	            INNER  JOIN dbo.HR_FNFSettlement F ON F.FNFSettlementID = C.FNFSettlementID
+   361	            CROSS  APPLY (SELECT COUNT(*) AS Rows
+   362	                          FROM   dbo.HR_MonthlyAttendance MA
+   363	                          WHERE  MA.EmployeeMasterID = F.EmployeeMasterID
+   364	                            AND  F.LastWorkingDate IS NOT NULL
+   365	                            AND  MA.AttendMonth = MONTH(F.LastWorkingDate)
+   366	                            AND  MA.AttendYear  = YEAR(F.LastWorkingDate)) A
+   367	            WHERE  C.FNFSettlementID = @CaseID
+   368	              AND  C.CheckKind = @Kind
+   369	              AND  C.CheckCode = 'ATT_FINAL'
+   370	              AND  C.Result IS NULL", conn, tx))
+   371	        {
+   372	            cmd.Parameters.AddWithValue("@CaseID", caseId);
+   373	            cmd.Parameters.AddWithValue("@Kind", KindReadiness);
+   374	            cmd.ExecuteNonQuery();
+   375	        }
+   376	
+   377	        // --- Loan ledger: informational remark only, no verdict --------------
+   378	        using (var cmd = new SqlCommand(@"
+   379	            UPDATE C
+   380	            SET    C.Remarks = 'Outstanding from unpaid EMI schedule: '
+   381	                             + CAST(CAST(ISNULL(O.Outstanding,0) AS decimal(18,2)) AS varchar(20))
+   382	                             + '. Finance to confirm the ledger is up to date.'
+   383	            FROM   dbo.HR_FNFCheck C
+   384	            INNER  JOIN dbo.HR_FNFSettlement F ON F.FNFSettlementID = C.FNFSettlementID
+   385	            CROSS  APPLY (SELECT SUM(S.EMIAmount) AS Outstanding
+   386	                          FROM   dbo.HR_LoanEMISchedule S
+   387	                          WHERE  S.EmployeeMasterID = F.EmployeeMasterID
+   388	                            AND  S.IsPaid = 0
+   389	                            AND  S.Status = 1) O
+   390	            WHERE  C.FNFSettlementID = @CaseID
+   391	              AND  C.CheckKind = @Kind
+   392	              AND  C.CheckCode = 'LOAN_LEDGER'
+   393	              AND  C.Result IS NULL", conn, tx))
+   394	        {
+   395	            cmd.Parameters.AddWithValue("@CaseID", caseId);
+   396	            cmd.Parameters.AddWithValue("@Kind", KindReadiness);
+   397	            cmd.ExecuteNonQuery();
+   398	        }
+   399	    }
+   400	
+   401	    // -------------------------------------------------------------------------
+   402	    //  Recoveries (stage 7)
+   403	    // -------------------------------------------------------------------------
+   404	
+   405	    /// <summary>
+   406	    /// Writes the recovery rows this app can find by itself: the unpaid loan / advance
+   407	    /// schedule, and every asset the employee still holds.
+   408	    ///
+   409	    /// Guarded by NOT EXISTS on the same (case, department, dues type, source id), so
+   410	    /// re-running after an asset is returned adds nothing and - importantly - does not
+   411	    /// resurrect a row somebody Waived.
+   412	    ///
+   413	    /// Asset balance follows the module's own rule: QtyIssued minus the quantity
+   414	    /// returned on ACTIVE returns, counting only approved issues. Never IsReturned,
+   415	    /// which is a derived cache.
+   416	    /// </summary>
+   417	    public static int DiscoverRecoveries(SqlConnection conn, SqlTransaction tx, long caseId,
+   418	                                         int userId, string systemName)
+   419	    {
+   420	        int added = 0;
+   421	
+   422	        // --- Loan / advance outstanding --------------------------------------
+   423	        using (var cmd = new SqlCommand(@"
+   424	            INSERT INTO dbo.HR_FNFRecovery
+   425	                (FNFSettlementID, ClearanceDepartment, DuesType, Description, Amount,
+   426	                 RecoveryStatus, Status, EntryUserMasterID, EntryUserDateTime, SystemName)
+   427	            SELECT @CaseID, 'Finance', 'Loan',
+   428	                   'Unpaid loan / advance installments (' + CAST(O.Cnt AS varchar(10)) + ')',
+   429	                   O.Outstanding, 'Confirmed', 1, @UserID, GETDATE(), @SystemName
+   430	            FROM   dbo.HR_FNFSettlement F
+   431	            CROSS  APPLY (SELECT COUNT(*) AS Cnt, SUM(S.EMIAmount) AS Outstanding
+   432	                          FROM   dbo.HR_LoanEMISchedule S
+   433	                          WHERE  S.EmployeeMasterID = F.EmployeeMasterID
+   434	                            AND  S.IsPaid = 0
+   435	                            AND  S.Status = 1) O
+   436	            WHERE  F.FNFSettlementID = @CaseID
+   437	              AND  O.Outstanding > 0
+   438	              AND  NOT EXISTS (SELECT 1 FROM dbo.HR_FNFRecovery R
+   439	                               WHERE R.FNFSettlementID = @CaseID
+   440	                                 AND R.DuesType = 'Loan'
+   441	                                 AND R.AssetIssueDetailID IS NULL);", conn, tx))
+   442	        {
+   443	            cmd.Parameters.AddWithValue("@CaseID", caseId);
+   444	            cmd.Parameters.AddWithValue("@UserID", userId);
+   445	            cmd.Parameters.AddWithValue("@SystemName", Trunc(systemName, 50));
+   446	            added += cmd.ExecuteNonQuery();
+   447	        }
+   448	
+   449	        // --- Assets still held ------------------------------------------------
+   450	        // Amount is left at 0 on purpose: what an unreturned laptop is worth is a
+   451	        // human decision, and putting a guessed figure into a settlement is worse
+   452	        // than leaving it for someone to fill in.
+   453	        using (var cmd = new SqlCommand(@"
+   454	            INSERT INTO dbo.HR_FNFRecovery
+   455	                (FNFSettlementID, ClearanceDepartment, DuesType, Description, Amount,
+   456	                 RecoveryStatus, AssetItemID, AssetIssueDetailID,
+   457	                 Status, EntryUserMasterID, EntryUserDateTime, SystemName)
+   458	            SELECT @CaseID, 'IT', 'Asset Not Returned',
+   459	                   ISNULL(AID.AssetName, '')
+   460	                     + CASE WHEN ISNULL(AID.SerialNo,'') <> '' THEN ' [' + AID.SerialNo + ']' ELSE '' END
+   461	                     + ' - outstanding qty ' + CAST(Bal.Balance AS varchar(20))
+   462	                     + ' (issue ' + ISNULL(AI.IssueNo,'') + ')',
+   463	                   0, 'Confirmed', AID.AssetItemID, AID.ID,
+   464	                   1, @UserID, GETDATE(), @SystemName
+   465	            FROM   dbo.HR_FNFSettlement F
+   466	            INNER  JOIN dbo.HR_AssetIssue AI
+   467	                   ON  AI.EmployeeMasterID = F.EmployeeMasterID
+   468	                   AND AI.Status = 1
+   469	                   AND AI.ApprovalStatus = 'Approved'
+   470	            INNER  JOIN dbo.HR_AssetIssueDetail AID ON AID.IssueID = AI.ID
+   471	            CROSS  APPLY (SELECT ISNULL(AID.QtyIssued, 0) - ISNULL((
+   472	                              SELECT SUM(ARD.Qty)
+   473	                              FROM   dbo.HR_AssetReturnDetail ARD
+   474	                              INNER  JOIN dbo.HR_AssetReturn AR ON AR.ID = ARD.ReturnID
+   475	                              WHERE  ARD.IssueDetailID = AID.ID
+   476	                                AND  AR.Status = 1), 0) AS Balance) Bal
+   477	            WHERE  F.FNFSettlementID = @CaseID
+   478	              AND  Bal.Balance > 0
+   479	              AND  NOT EXISTS (SELECT 1 FROM dbo.HR_FNFRecovery R
+   480	                               WHERE R.FNFSettlementID = @CaseID
+   481	                                 AND R.AssetIssueDetailID = AID.ID);", conn, tx))
+   482	        {
+   483	            cmd.Parameters.AddWithValue("@CaseID", caseId);
+   484	            cmd.Parameters.AddWithValue("@UserID", userId);
+   485	            cmd.Parameters.AddWithValue("@SystemName", Trunc(systemName, 50));
+   486	            added += cmd.ExecuteNonQuery();
+   487	        }
+   488	
+   489	        return added;
+   490	    }
+   491	
+   492	    /// <summary>Confirmed recoveries only - a Waived row is kept for the audit trail
+   493	    /// but must never reach the deductions.</summary>
+   494	    public static decimal ConfirmedRecoveryTotal(SqlConnection conn, SqlTransaction tx, long caseId)
+   495	    {
+   496	        using (var cmd = new SqlCommand(@"
+   497	            SELECT ISNULL(SUM(Amount), 0)
+   498	            FROM   dbo.HR_FNFRecovery
+   499	            WHERE  FNFSettlementID = @CaseID
+   500	              AND  Status = 1
+   501	              AND  RecoveryStatus = 'Confirmed'", conn, tx))
+   502	        {
+   503	            cmd.Parameters.AddWithValue("@CaseID", caseId);
+   504	            return Convert.ToDecimal(cmd.ExecuteScalar());
+   505	        }
+   506	    }
+   507	
+   508	    // -------------------------------------------------------------------------
+   509	    //  Clearance verdict (stage 4)
+   510	    // -------------------------------------------------------------------------
+   511	
+   512	    /// <summary>
+   513	    /// Recomputes IsClearanceReady and the block reason on the header, cached there so
+   514	    /// the LIST grid can show the verdict without re-reading nine checklist rows for
+   515	    /// every case on the page.
+   516	    ///
+   517	    /// The reason names the FIRST outstanding requirement in checklist order, which is
+   518	    /// what makes the message actionable ("Finance clearance pending.") instead of a
+   519	    /// count of failures.
+   520	    /// </summary>
+   521	    public static bool EvaluateClearance(SqlConnection conn, SqlTransaction tx, long caseId)
+   522	    {
+   523	        string blockReason = null;
+   524	        int outstanding;
+   525	
+   526	        using (var cmd = new SqlCommand(@"
+   527	            SELECT TOP 1 CheckName
+   528	            FROM   dbo.HR_FNFCheck
+   529	            WHERE  FNFSettlementID = @CaseID
+   530	              AND  CheckKind = @Kind
+   531	              AND  IsRequired = 1
+   532	              AND  ISNULL(Result, '') <> 'Yes'
+   533	            ORDER  BY SortOrder, FNFCheckID", conn, tx))
+   534	        {
+   535	            cmd.Parameters.AddWithValue("@CaseID", caseId);
+   536	            cmd.Parameters.AddWithValue("@Kind", KindReadiness);
+   537	            object first = cmd.ExecuteScalar();
+   538	            if (first != null && first != DBNull.Value)
+   539	                blockReason = Convert.ToString(first) + " is pending.";
+   540	        }
+   541	
+   542	        using (var cmd = new SqlCommand(@"
+   543	            SELECT COUNT(*)
+   544	            FROM   dbo.HR_FNFCheck
+   545	            WHERE  FNFSettlementID = @CaseID
+   546	              AND  CheckKind = @Kind
+   547	              AND  IsRequired = 1
+   548	              AND  ISNULL(Result, '') <> 'Yes'", conn, tx))
+   549	        {
+   550	            cmd.Parameters.AddWithValue("@CaseID", caseId);
+   551	            cmd.Parameters.AddWithValue("@Kind", KindReadiness);
+   552	            outstanding = Convert.ToInt32(cmd.ExecuteScalar());
+   553	        }
+   554	
+   555	        if (outstanding > 1)
+   556	            blockReason = blockReason + " (" + outstanding + " requirements outstanding)";
+   557	
+   558	        bool ready = (outstanding == 0);
+   559	
+   560	        using (var cmd = new SqlCommand(@"
+   561	            UPDATE dbo.HR_FNFSettlement
+   562	            SET    IsClearanceReady     = @Ready,
+   563	                   ClearanceBlockReason = @Reason
+   564	            WHERE  FNFSettlementID = @CaseID", conn, tx))
+   565	        {
+   566	            cmd.Parameters.AddWithValue("@CaseID", caseId);
+   567	            cmd.Parameters.AddWithValue("@Ready", ready);
+   568	            cmd.Parameters.AddWithValue("@Reason", (object)blockReason ?? DBNull.Value);
+   569	            cmd.ExecuteNonQuery();
+   570	        }
+   571	
+   572	        return ready;
+   573	    }
+   574	
+   575	    // -------------------------------------------------------------------------
+   576	    //  Workflow rules - the single source of "who may still change what"
+   577	    // -------------------------------------------------------------------------
+   578	
+   579	    /// <summary>A case is editable only while it is a draft. Once submitted it opens
+   580	    /// read-only rather than disappearing, because "what did we actually agree?" is
+   581	    /// the commonest question these screens get.</summary>
+   582	    public static bool CanEdit(string workflowStatus)
+   583	    {
+   584	        return string.Equals(workflowStatus, StatusDraft, StringComparison.OrdinalIgnoreCase)
+   585	            || string.IsNullOrEmpty(workflowStatus);
+   586	    }
+   587	
+   588	    public static bool CanSubmit(string workflowStatus, bool clearanceReady)
+   589	    {
+   590	        return CanEdit(workflowStatus) && clearanceReady;
+   591	    }
+   592	
+   593	    public static string OpenButtonText(bool editable)
+   594	    {
+   595	        return editable ? "Open" : "View";
+   596	    }
+   597	
+   598	    /// <summary>CSS class for the status pill. Matches the vocabulary the loan screens
+   599	    /// already use, so one stylesheet serves both.</summary>
+   600	    public static string StatusPill(string workflowStatus)
+   601	    {
+   602	        switch ((workflowStatus ?? string.Empty).Trim().ToLowerInvariant())
+   603	        {
+   604	            case "draft":     return "Pending";
+   605	            case "submitted": return "Pending";
+   606	            case "approved":  return "Approved";
+   607	            case "paid":      return "Approved";
+   608	            case "cancelled": return "Cancelled";
+   609	            default:          return "Cancelled";
+   610	        }
+   611	    }
+   612	
+   613	    // -------------------------------------------------------------------------
+   614	
+   615	    /// <summary>
+   616	    /// SystemName column widths are inconsistent across this schema (20 to 128), and
+   617	    /// an over-long machine name makes every save fail with "String or binary data
+   618	    /// would be truncated" - which on 2014 does not name the column.
+   619	    /// </summary>
+   620	    private static string Trunc(string value, int max)
+   621	    {
+   622	        if (string.IsNullOrEmpty(value)) return string.Empty;
+   623	        return value.Length <= max ? value : value.Substring(0, max);
+   624	    }
+   625	}

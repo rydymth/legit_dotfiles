@@ -1,0 +1,113 @@
+/*
+    Canteen: per-meal ordering deadline
+    Date   : 2026-10-23
+
+    WHAT IT ADDS
+      HR_CMS_MealSession gets the deadline by which a meal has to be ordered:
+        OrderCutoffTime       TIME - the clock time ordering closes
+        OrderCutoffDaysBefore INT  - 0 = that same clock time on the day of the meal,
+                                     1 = the day before, 2 = two days before ...
+      Breakfast ordered "up to 11:59 PM the night before" is 23:59 + 1. Lunch ordered "by 9:30 in the
+      morning" is 09:30 + 0. Both columns are NOT NULL: every meal session carries its own deadline,
+      there is no "not configured" state.
+
+    WHAT IT REPLACES
+      Until now the deadline was appsettings.json MealBooking.BookingCloseHours (every meal closed
+      2 hours before it started) and MealBooking.CancelCutoffHours (24 hours to cancel). Both settings
+      are gone from the code: ordering AND cancelling now stop at the session's own cutoff.
+      Existing rows are backfilled with StartTime minus 2 hours - the rule that was in force - so on the
+      day this is deployed nothing changes for any employee. Set the real deadlines afterwards with
+      Update_CanteenMealSession_OrderCutoff_20261023.sql, or on the Meal Session screen.
+
+    THE TWO RULES THE CHECK CONSTRAINTS KEEP
+      - 0 to 7 days before, nothing else. The Meal Session screen offers fewer than that by default:
+        HR_CMS_Config.MaxOrderCutoffDaysBefore (default 1 = same day or the day before), added by
+        Migration_CanteenConfig_20261023.sql. Raise that row to open up more days, up to the 7 allowed here.
+      - A same-day cutoff can never be after the meal starts. Breakfast served 07:30-09:30 cannot be
+        ordered at 08:00 on the day; the cutoff has to be 07:30 or earlier, or move to a day before.
+
+    Run BEFORE deploying the code. Idempotent - safe to run more than once.
+    SQL Server 2014 compatible.
+*/
+
+SET NOCOUNT ON;
+
+IF OBJECT_ID(N'[dbo].[HR_CMS_MealSession]', N'U') IS NULL
+BEGIN
+    PRINT N'ABORTED - HR_CMS_MealSession does not exist in this database.';
+    SET NOEXEC ON;
+END
+GO
+
+/* ── The columns ──────────────────────────────────────────────────────────────────────────────────
+   Added with a default because the table has rows and the columns are NOT NULL; the real values come
+   from the backfill below. */
+
+IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HR_CMS_MealSession]') AND name = N'OrderCutoffTime')
+BEGIN
+    ALTER TABLE [dbo].[HR_CMS_MealSession] ADD [OrderCutoffTime] TIME(0) NOT NULL
+        CONSTRAINT DF_HR_CMS_MealSession_OrderCutoffTime DEFAULT ('00:00:00')
+END
+GO
+
+/* The backfill rides inside the second column's IF NOT EXISTS, so it runs exactly once - on the run
+   that creates the columns - and never overwrites a deadline HR has set since.
+   StartTime minus 2 hours, the old BookingCloseHours. Lunch at 12:00 becomes 10:00 on the day of the
+   meal. Breakfast at 01:00 would land at 23:00 "yesterday", so it becomes 23:00 with DaysBefore = 1.
+   (Dynamic SQL: the new columns do not exist yet when this batch is compiled.) */
+IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HR_CMS_MealSession]') AND name = N'OrderCutoffDaysBefore')
+BEGIN
+    ALTER TABLE [dbo].[HR_CMS_MealSession] ADD [OrderCutoffDaysBefore] INT NOT NULL
+        CONSTRAINT DF_HR_CMS_MealSession_OrderCutoffDaysBefore DEFAULT (0)
+
+    EXEC(N'
+    DECLARE @OldBookingCloseHours INT = 2;
+
+    ;WITH cutoff AS (
+        SELECT [MSessionId],
+               [Deadline] = DATEADD(HOUR, -@OldBookingCloseHours, CAST([StartTime] AS DATETIME))
+        FROM [dbo].[HR_CMS_MealSession]
+    )
+    UPDATE ms
+       SET ms.[OrderCutoffTime]       = CAST(c.[Deadline] AS TIME(0)),
+           ms.[OrderCutoffDaysBefore] = CASE WHEN CAST(c.[Deadline] AS DATE) < CAST(''1900-01-01'' AS DATE) THEN 1 ELSE 0 END
+    FROM [dbo].[HR_CMS_MealSession] ms
+    INNER JOIN cutoff c ON c.[MSessionId] = ms.[MSessionId];
+
+    PRINT N''Ordering deadlines backfilled from the old 2-hour rule: '' + CAST(@@ROWCOUNT AS NVARCHAR(10)) + N'' meal session(s).'';
+    ')
+END
+GO
+
+/* ── The two rules ────────────────────────────────────────────────────────────────────────────── */
+
+IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = N'CK_HR_CMS_MealSession_OrderCutoffDaysBefore')
+    ALTER TABLE [dbo].[HR_CMS_MealSession] WITH CHECK ADD CONSTRAINT CK_HR_CMS_MealSession_OrderCutoffDaysBefore
+        CHECK ([OrderCutoffDaysBefore] BETWEEN 0 AND 7)
+GO
+
+-- A cutoff on the day of the meal has to be at or before the moment the meal starts; a cutoff on an
+-- earlier day is always in time, whatever the clock says.
+IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = N'CK_HR_CMS_MealSession_OrderCutoffBeforeStart')
+    ALTER TABLE [dbo].[HR_CMS_MealSession] WITH CHECK ADD CONSTRAINT CK_HR_CMS_MealSession_OrderCutoffBeforeStart
+        CHECK ([OrderCutoffDaysBefore] > 0 OR [OrderCutoffTime] <= [StartTime])
+GO
+
+/* ── What every meal session now says ─────────────────────────────────────────────────────────── */
+
+SELECT n.[SessionName],
+       [Served]   = CONVERT(CHAR(5), ms.[StartTime], 108) + N' - ' + CONVERT(CHAR(5), ms.[EndTime], 108),
+       [Order by] = CONVERT(CHAR(5), ms.[OrderCutoffTime], 108)
+                  + CASE ms.[OrderCutoffDaysBefore]
+                        WHEN 0 THEN N' on the day of the meal'
+                        WHEN 1 THEN N' the day before'
+                        ELSE N', ' + CAST(ms.[OrderCutoffDaysBefore] AS NVARCHAR(10)) + N' days before'
+                    END,
+       ms.[IsActive]
+FROM [dbo].[HR_CMS_MealSession] ms
+INNER JOIN [dbo].[HR_CMS_SessionName] n ON n.[SessionNameId] = ms.[SessionNameId]
+ORDER BY n.[SortOrder], n.[SessionName];
+GO
+
+SET NOEXEC OFF;
+GO

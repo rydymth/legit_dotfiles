@@ -1,0 +1,91 @@
+<app-common-grid
+  [dataSource]="data"
+  [columns]="columns"
+  [storageKey]="'fnfAlumniGrid'"
+  [gridTitle]="'Alumni Register'"
+  [gridIcon]="'fa-solid fa-user-clock'"
+  [gridSubtitle]="gridSubtitle"
+  [showAddButton]="true"
+  [addButtonText]="'Add Record'"
+  [showRefreshButton]="true"
+  [refreshDisabled]="isLoading"
+  [fillViewport]="true"
+  (refresh)="load()"
+  (addRow)="onAdd()"
+  (editRow)="onEdit($event)"
+  (deleteRow)="onDelete($event)"
+></app-common-grid>
+
+<dx-popup
+  [(visible)]="popupVisible"
+  [showTitle]="true"
+  [title]="isEditMode ? 'Edit Alumni Record' : 'Add Alumni Record'"
+  [width]="600"
+  [height]="'auto'"
+  [maxHeight]="'90vh'"
+  [dragEnabled]="true"
+  [showCloseButton]="!saving"
+  [hideOnOutsideClick]="!saving"
+>
+  <div class="app-popup-body-scroll section-body">
+    <form [formGroup]="form">
+      <div class="mb-3">
+        <label class="form-label">Employee <span class="text-danger">*</span></label>
+        <app-employee-picker
+          [items]="employees"
+          [value]="form.value.employeeMasterId"
+          (valueChange)="form.patchValue({ employeeMasterId: $event })"
+          [disabled]="isEditMode"
+          placeholder="Select an employee who has left"
+          [isValid]="!hasError('employeeMasterId', 'required')"
+        ></app-employee-picker>
+        @if (hasError('employeeMasterId', 'required')) {
+          <div class="field-error">Employee is required.</div>
+        }
+      </div>
+
+      <div class="mb-3">
+        <label class="form-label">Reason for Leaving</label>
+        <dx-select-box formControlName="reasonForLeaving" [dataSource]="reasonOptions" [acceptCustomValue]="true" [searchEnabled]="true" placeholder="Select or type a reason"></dx-select-box>
+      </div>
+
+      <div class="mb-3">
+        <label class="form-label">Eligible for Rehire?</label>
+        <dx-select-box
+          formControlName="eligibleForRehire"
+          [dataSource]="rehireOptions"
+          valueExpr="value"
+          displayExpr="text"
+          [showClearButton]="true"
+          placeholder="Not assessed"
+        ></dx-select-box>
+      </div>
+
+      <div class="mb-3">
+        <dx-check-box formControlName="blacklistFlag" text="Blacklisted"></dx-check-box>
+      </div>
+
+      @if (needsBlacklistReason) {
+        <div class="mb-3">
+          <label class="form-label">Blacklist Reason <span class="text-danger">*</span></label>
+          <dx-text-box formControlName="blacklistReason" placeholder="Why this person is blacklisted"></dx-text-box>
+        </div>
+      }
+
+      <div class="mb-3">
+        <label class="form-label">Manager Feedback</label>
+        <dx-text-area formControlName="managerFeedback" [height]="70"></dx-text-area>
+      </div>
+
+      <div class="mb-3">
+        <label class="form-label">HR Remarks</label>
+        <dx-text-area formControlName="hrRemarks" [height]="70"></dx-text-area>
+      </div>
+    </form>
+  </div>
+
+  <div class="popup-actions section-body">
+    <dx-button text="Cancel" stylingMode="outlined" [disabled]="saving" (onClick)="popupVisible = false"></dx-button>
+    <dx-button text="Save" type="default" stylingMode="contained" [disabled]="saving" (onClick)="save()"></dx-button>
+  </div>
+</dx-popup>

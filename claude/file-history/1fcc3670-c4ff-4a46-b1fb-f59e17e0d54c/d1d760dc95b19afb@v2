@@ -1,0 +1,65 @@
+<div class="app-grid-wrapper app-grid-wrapper--compact">
+  @if (gridTitle || canAdd) {
+    <div class="app-grid-toolbar">
+      <div class="app-grid-toolbar-left">
+        @if (gridTitle) {
+          <div class="app-grid-toolbar-heading">
+            <h6 class="app-grid-title">
+              <i class="fa fa-pen-to-square"></i>
+              <span>{{ gridTitle }}</span>
+            </h6>
+            @if (gridSubtitle) {
+              <p class="app-grid-subtitle">{{ gridSubtitle }}</p>
+            }
+          </div>
+        }
+      </div>
+      <div class="app-grid-toolbar-right">
+        @if (canAdd) {
+          <dx-button [text]="addButtonText" icon="add" stylingMode="contained" class="app-primary-btn" (onClick)="onAddClick()"></dx-button>
+        }
+      </div>
+    </div>
+  }
+
+  <div class="app-grid-body app-grid-scroll-host app-grid-scroll-host--fit">
+    <dx-data-grid
+      class="app-data-grid editable-grid"
+      [class.editable-grid--on]="editingConfig['allowUpdating']"
+      [dataSource]="dataSource"
+      [columns]="columns"
+      [keyExpr]="keyExpr"
+      [height]="'auto'"
+      [width]="'100%'"
+      [loadPanel]="{ enabled: false }"
+      [editing]="editingConfig"
+      [showBorders]="true"
+      [showRowLines]="true"
+      [columnAutoWidth]="true"
+      [wordWrapEnabled]="true"
+      [rowAlternationEnabled]="true"
+      [allowColumnResizing]="true"
+      columnResizingMode="widget"
+      [remoteOperations]="false"
+      [searchPanel]="{ visible: true, width: 240, placeholder: 'Search...' }"
+      [pager]="{ showPageSizeSelector: true, allowedPageSizes: [5, 10, 20, 50], showInfo: true, showNavigationButtons: true }"
+      [paging]="{ pageSize: 10 }"
+      (onCellPrepared)="onCellPrepared && onCellPrepared($event)"
+      (onInitNewRow)="onInitNewRow($event)"
+      (onEditingStart)="onEditingStart($event)"
+      (onRowUpdating)="onRowUpdating($event)"
+      (onRowInserting)="onRowInserting($event)"
+      (onRowRemoving)="onRowRemoving($event)"
+    ></dx-data-grid>
+  </div>
+</div>
+
+<dx-popup title="Confirm Delete" [(visible)]="isDeletePopupVisible" [width]="350" [height]="200" [showCloseButton]="true">
+  <div class="delete-popup-body">
+    <p>Are you sure you want to delete this record?</p>
+    <div class="popup-actions">
+      <dx-button text="No" stylingMode="outlined" (onClick)="cancelDelete()"></dx-button>
+      <dx-button text="Yes" type="danger" stylingMode="contained" (onClick)="confirmDelete()"></dx-button>
+    </div>
+  </div>
+</dx-popup>

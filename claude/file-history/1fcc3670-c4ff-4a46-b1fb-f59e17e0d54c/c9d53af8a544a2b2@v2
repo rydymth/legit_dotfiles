@@ -1,0 +1,9 @@
+// Hint that a cell is click-to-edit. A caller marks its editable columns with
+// `cssClass: 'editable-cell'`; read-only columns get no hint. Off when the grid isn't editable.
+:host ::ng-deep .editable-grid--on .dx-data-row > td.editable-cell {
+  cursor: text;
+}
+
+:host ::ng-deep .editable-grid--on .dx-data-row > td.editable-cell:hover {
+  box-shadow: inset 0 0 0 1px var(--bs-primary, #0d6efd);
+}

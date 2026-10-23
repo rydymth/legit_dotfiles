@@ -1,0 +1,77 @@
+/*
+    Canteen: module settings table
+    Date   : 2026-10-23
+
+    WHAT IT ADDS
+      HR_CMS_Config - the canteen module's own settings, one row for the whole installation (the row is
+      pinned to ConfigId = 1 by a CHECK constraint, so there can never be a second one to disagree with
+      the first). It starts with a single setting:
+
+        MaxOrderCutoffDaysBefore   how far back the Meal Session screen lets an ordering deadline be set.
+                                   1 (the default) = the deadline may fall on the day of the meal or the
+                                   day before. 2 = also two days before, and so on up to 7.
+
+      This is NOT when ordering closes - that is per meal session (HR_CMS_MealSession.OrderCutoffTime /
+      OrderCutoffDaysBefore, set on the Meal Session screen). This is only how many choices that screen's
+      "Cutoff Day" list offers. It lives here rather than in appsettings.json so it can be changed without
+      touching a config file or restarting the API: the screen reads this row every time it is opened.
+
+    HOW TO CHANGE IT
+      Let the kitchen be told up to three days ahead:
+
+        UPDATE dbo.HR_CMS_Config
+           SET MaxOrderCutoffDaysBefore = 3, ModifiedDate = GETDATE(), ModifiedById = 1
+         WHERE ConfigId = 1;
+
+      Anyone on the Meal Session screen sees the longer list the next time they open it - no deploy, no
+      restart. Lowering it again never invalidates a meal session already saved with a longer notice:
+      that session keeps its deadline and still saves, it just cannot be moved further back.
+      0 to 7 only - CK_HR_CMS_MealSession_OrderCutoffDaysBefore will not store a deadline beyond 7 days.
+
+    Run BEFORE deploying the code. Idempotent - safe to run more than once.
+    SQL Server 2014 compatible.
+*/
+
+SET NOCOUNT ON;
+
+IF OBJECT_ID(N'[dbo].[HR_CMS_Config]', N'U') IS NULL
+BEGIN
+    CREATE TABLE [dbo].[HR_CMS_Config]
+    (
+        [ConfigId]                 INT      NOT NULL CONSTRAINT PK_HR_CMS_Config PRIMARY KEY CLUSTERED,
+        [MaxOrderCutoffDaysBefore] INT      NOT NULL CONSTRAINT DF_HR_CMS_Config_MaxOrderCutoffDaysBefore DEFAULT (1),
+        [CreateDate]               DATETIME NOT NULL CONSTRAINT DF_HR_CMS_Config_CreateDate DEFAULT (GETDATE()),
+        [CreatedById]              BIGINT   NOT NULL,
+        [ModifiedDate]             DATETIME NULL,
+        [ModifiedById]             BIGINT   NULL,
+        -- One installation, one row: no second row can exist to contradict this one.
+        CONSTRAINT CK_HR_CMS_Config_SingleRow CHECK ([ConfigId] = 1),
+        -- The same ceiling the meal session's own deadline is held to.
+        CONSTRAINT CK_HR_CMS_Config_MaxOrderCutoffDaysBefore CHECK ([MaxOrderCutoffDaysBefore] BETWEEN 0 AND 7)
+    )
+
+    PRINT N'HR_CMS_Config created.';
+END
+GO
+
+-- The settings row. Seeded with 1 - the day of the meal, or the day before - which is what the code
+-- falls back to if this row is ever missing, so seeding it changes nothing by itself.
+IF NOT EXISTS (SELECT 1 FROM [dbo].[HR_CMS_Config] WHERE [ConfigId] = 1)
+BEGIN
+    INSERT INTO [dbo].[HR_CMS_Config] ([ConfigId], [MaxOrderCutoffDaysBefore], [CreatedById])
+    VALUES (1, 1, 1);
+
+    PRINT N'HR_CMS_Config seeded with MaxOrderCutoffDaysBefore = 1.';
+END
+GO
+
+SELECT [ConfigId],
+       [MaxOrderCutoffDaysBefore],
+       [The Cutoff Day list offers] = CASE [MaxOrderCutoffDaysBefore]
+                                          WHEN 0 THEN N'the day of the meal only'
+                                          WHEN 1 THEN N'the day of the meal, or the day before'
+                                          ELSE N'the day of the meal, up to ' + CAST([MaxOrderCutoffDaysBefore] AS NVARCHAR(10)) + N' days before'
+                                      END,
+       [ModifiedDate]
+FROM [dbo].[HR_CMS_Config];
+GO

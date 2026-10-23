@@ -1,0 +1,52 @@
+using System.Globalization;
+
+namespace SolutionOne_Core.CanteenManagementModels.MealSession;
+
+/// <summary>
+/// The deadline by which a meal has to be ordered, held on the meal session as a clock time plus the
+/// number of days before the meal that clock time falls on (0 = the day of the meal, 1 = the day
+/// before). The same deadline governs cancelling: once it passes the count is final.
+/// Everything that states or enforces the deadline goes through here, so the sentence the employee
+/// reads on the Meal Session screen and the moment meal booking actually refuses are never two
+/// different rules.
+/// </summary>
+public static class MealOrderCutoff
+{
+    /// <summary>The furthest back a deadline may sit, matching CK_HR_CMS_MealSession_OrderCutoffDaysBefore.
+    /// How many of those days the Meal Session screen actually offers is HR_CMS_Config.MaxOrderCutoffDaysBefore.</summary>
+    public const int MaxDaysBeforeCeiling = 7;
+
+    /// <summary>When ordering for <paramref name="mealDate"/> closes, in the canteen's own local time.</summary>
+    public static DateTime LocalDeadline(DateOnly mealDate, TimeOnly cutoffTime, int daysBefore) =>
+        mealDate.AddDays(-daysBefore).ToDateTime(cutoffTime);
+
+    /// <summary>"Same day as the meal", "1 day before the meal", "3 days before the meal" - the label
+    /// of one choice in the Cutoff Day list.</summary>
+    public static string DayLabel(int daysBefore) => daysBefore switch
+    {
+        0 => "Same day as the meal",
+        1 => "1 day before the meal",
+        _ => $"{daysBefore} days before the meal"
+    };
+
+    /// <summary>The rule in words: "11:59 PM the day before the meal". Shown wherever an employee is told
+    /// when they have to order by.</summary>
+    public static string Describe(TimeOnly cutoffTime, int daysBefore) => daysBefore switch
+    {
+        0 => $"{FormatTime(cutoffTime)} on the day of the meal",
+        1 => $"{FormatTime(cutoffTime)} the day before the meal",
+        _ => $"{FormatTime(cutoffTime)}, {daysBefore} days before the meal"
+    };
+
+    /// <summary>The one deadline that was missed, as a date an employee can check against a calendar:
+    /// "11:59 PM on 23 Oct 2026".</summary>
+    public static string DescribeFor(DateOnly mealDate, TimeOnly cutoffTime, int daysBefore)
+    {
+        var deadline = LocalDeadline(mealDate, cutoffTime, daysBefore);
+        return $"{FormatTime(TimeOnly.FromDateTime(deadline))} on {deadline.ToString("dd MMM yyyy", CultureInfo.InvariantCulture)}";
+    }
+
+    /// <summary>12-hour, because this is read by employees, not typed by them. The Meal Session screen's
+    /// own input stays on the 24-hour HH:mm its Start Time and End Time use.</summary>
+    public static string FormatTime(TimeOnly time) => time.ToString("hh:mm tt", CultureInfo.InvariantCulture);
+}
