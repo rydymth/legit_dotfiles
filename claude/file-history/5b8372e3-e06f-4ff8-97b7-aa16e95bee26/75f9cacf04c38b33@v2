@@ -1,0 +1,246 @@
+package steps
+
+import (
+	"archive/tar"
+	"compress/gzip"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"io"
+	"io/fs"
+	"os"
+	"path"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/klauspost/compress/zstd"
+
+	"github.com/rudy/deployer/internal/config"
+	"github.com/rudy/deployer/internal/engine"
+)
+
+// packStep turns the artifact directory into a single compressed tarball.
+type packStep struct {
+	cfg  *config.Config
+	p    *config.Project
+	st   *state
+	opts Options
+
+	path string // the archive we wrote, removed in Cleanup
+}
+
+func (s *packStep) Name() string { return "pack" }
+
+func (s *packStep) Run(ctx context.Context, em *engine.Emitter) error {
+	if s.opts.DryRun {
+		em.Log("would pack %s as %s", s.st.artifactDir, s.p.Archive)
+		if len(s.p.Exclude) > 0 {
+			em.Log("excluding: %s", strings.Join(s.p.Exclude, ", "))
+		}
+		s.st.archivePath = fmt.Sprintf("%s.%s", s.p.Name, s.p.Archive)
+		return nil
+	}
+
+	root := s.st.artifactDir
+
+	// Size the job first so the UI can show a real bar rather than a spinner.
+	// This is a stat-only pass and cheap next to the compression that follows.
+	total, files, err := measure(root, s.p.Exclude)
+	if err != nil {
+		return err
+	}
+	em.Log("packing %d files, %s", files, humanBytes(total))
+
+	name := fmt.Sprintf("%s-%s.%s", s.p.Name, time.Now().Format("20060102-150405"), s.p.Archive)
+	out, err := os.CreateTemp("", "deployer-*-"+name)
+	if err != nil {
+		return err
+	}
+	s.path = out.Name()
+	s.st.archivePath = out.Name()
+
+	// Hash while writing so verifying the upload later costs nothing extra.
+	hash := sha256.New()
+	sink := io.MultiWriter(out, hash)
+
+	var zw io.WriteCloser
+	switch s.p.Archive {
+	case "tar.gz":
+		zw = gzip.NewWriter(sink)
+	default:
+		// Default zstd level: on a few hundred megabytes of JS it beats gzip
+		// on both ratio and speed, and the extra ratio from higher levels is
+		// not worth the wall-clock on every deploy.
+		zw, err = zstd.NewWriter(sink)
+		if err != nil {
+			out.Close()
+			return err
+		}
+	}
+
+	tw := tar.NewWriter(zw)
+
+	var done int64
+	werr := walk(root, s.p.Exclude, func(rel string, fi fs.FileInfo, full string) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		link := ""
+		if fi.Mode()&os.ModeSymlink != 0 {
+			if link, err = os.Readlink(full); err != nil {
+				return err
+			}
+		}
+
+		hdr, err := tar.FileInfoHeader(fi, link)
+		if err != nil {
+			return err
+		}
+		hdr.Name = rel
+		if fi.IsDir() {
+			hdr.Name += "/"
+		}
+
+		if err := tw.WriteHeader(hdr); err != nil {
+			return err
+		}
+		if !fi.Mode().IsRegular() {
+			return nil
+		}
+
+		f, err := os.Open(full)
+		if err != nil {
+			return err
+		}
+		n, err := io.Copy(tw, f)
+		f.Close()
+		if err != nil {
+			return err
+		}
+
+		done += n
+		em.Progress(done, total)
+		return nil
+	})
+
+	// Close in order so that errors from flushing are not lost behind the
+	// walk error, and so a failed pack still releases the file handle.
+	cerr := tw.Close()
+	zerr := zw.Close()
+	ferr := out.Close()
+
+	for _, e := range []error{werr, cerr, zerr, ferr} {
+		if e != nil {
+			_ = os.Remove(s.path)
+			s.path, s.st.archivePath = "", ""
+			return fmt.Errorf("pack %s: %w", root, e)
+		}
+	}
+
+	st, err := os.Stat(s.path)
+	if err != nil {
+		return err
+	}
+	ratio := 100.0
+	if total > 0 {
+		ratio = float64(st.Size()) / float64(total) * 100
+	}
+	em.Log("archive %s (%s, %.0f%% of source)", name, humanBytes(st.Size()), ratio)
+	em.Log("sha256 %s", hex.EncodeToString(hash.Sum(nil)))
+	return nil
+}
+
+// Cleanup removes the local archive once it has been shipped.
+func (s *packStep) Cleanup() {
+	if s.path != "" && !s.opts.KeepArchive {
+		_ = os.Remove(s.path)
+	}
+}
+
+// walk visits every non-excluded entry under root, handing back paths relative
+// to root with forward slashes so the archive is identical whichever OS packed it.
+func walk(root string, exclude []string, fn func(rel string, fi fs.FileInfo, full string) error) error {
+	return filepath.WalkDir(root, func(full string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, full)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		rel = filepath.ToSlash(rel)
+
+		if excluded(rel, exclude) {
+			// Pruning the whole subtree is both faster and the only way an
+			// exclude on a directory can mean what people expect it to.
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		fi, err := d.Info()
+		if err != nil {
+			return err
+		}
+		return fn(rel, fi, full)
+	})
+}
+
+// measure totals the bytes and files that walk would visit.
+func measure(root string, exclude []string) (bytes int64, files int, err error) {
+	err = walk(root, exclude, func(_ string, fi fs.FileInfo, _ string) error {
+		if fi.Mode().IsRegular() {
+			bytes += fi.Size()
+			files++
+		}
+		return nil
+	})
+	return bytes, files, err
+}
+
+// excluded reports whether a path relative to the artifact root should be
+// left out of the archive.
+//
+// A pattern matches three ways, in order of how people tend to mean them: an
+// exact path or anything beneath it ("wwwroot/OfferLetters"), a glob against
+// the whole relative path ("logs/*.txt"), or a glob against the file name
+// alone ("*.pdb"). The first form is what keeps live user data on the server
+// from being overwritten by a deploy.
+func excluded(rel string, patterns []string) bool {
+	for _, pat := range patterns {
+		pat = strings.Trim(filepath.ToSlash(pat), "/")
+		if pat == "" {
+			continue
+		}
+		if rel == pat || strings.HasPrefix(rel, pat+"/") {
+			return true
+		}
+		if ok, _ := path.Match(pat, rel); ok {
+			return true
+		}
+		if ok, _ := path.Match(pat, path.Base(rel)); ok {
+			return true
+		}
+	}
+	return false
+}
+
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for v := n / unit; v >= unit; v /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "KMGTPE"[exp])
+}

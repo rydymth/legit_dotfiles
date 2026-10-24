@@ -1,3 +1,4 @@
 - [Two migration folders in HRMS](hrms-two-migration-folders.md) — SolutionOneWeb ports need a backend SqlScripts counterpart, or EF throws "Invalid column name".
 - [Stale script numbers in comments](hrms-stale-script-numbers-in-comments.md) — "script 035/036" in backend comments actually mean SolutionOneWeb 239/240.
 - [User runs builds, not Claude](hrms-user-runs-builds.md) — never run dotnet build/test or ng build here; say what went unverified instead.
+- [Multi-tenancy phase state](hrms-multitenancy-phase-state.md) — catalog+key switch built and inert; migration consolidation deferred to the team.

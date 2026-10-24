@@ -1,0 +1,33 @@
+[17:29:26 ERR] An exception occurred while iterating over the results of a query for context type 'SolutionOne_DataAccessLayer.Entities.HrmsystemContext'.
+System.Data.SqlTypes.SqlNullValueException: Data is Null. This method or property cannot be called on Null values.
+   at Microsoft.Data.SqlClient.SqlBuffer.ThrowIfNull()
+   at Microsoft.Data.SqlClient.SqlBuffer.get_Int64()
+   at Microsoft.Data.SqlClient.SqlDataReader.GetInt64(Int32 i)
+   at lambda_method259(Closure, QueryContext, DbDataReader, ResultContext, SingleQueryResultCoordinator)
+   at Microsoft.EntityFrameworkCore.Query.Internal.SingleQueryingEnumerable`1.AsyncEnumerator.MoveNextAsync()
+System.Data.SqlTypes.SqlNullValueException: Data is Null. This method or property cannot be called on Null values.
+   at Microsoft.Data.SqlClient.SqlBuffer.ThrowIfNull()
+   at Microsoft.Data.SqlClient.SqlBuffer.get_Int64()
+   at Microsoft.Data.SqlClient.SqlDataReader.GetInt64(Int32 i)
+   at lambda_method259(Closure, QueryContext, DbDataReader, ResultContext, SingleQueryResultCoordinator)
+   at Microsoft.EntityFrameworkCore.Query.Internal.SingleQueryingEnumerable`1.AsyncEnumerator.MoveNextAsync()
+[17:29:26 DBG] EFCore: fail: 10/24/2026 17:29:26.924 CoreEventId.QueryIterationFailed[10100] (Microsoft.EntityFrameworkCore.Query)
+      An exception occurred while iterating over the results of a query for context type 'SolutionOne_DataAccessLayer.Entities.HrmsystemContext'.
+      System.Data.SqlTypes.SqlNullValueException: Data is Null. This method or property cannot be called on Null values.
+         at Microsoft.Data.SqlClient.SqlBuffer.ThrowIfNull()
+         at Microsoft.Data.SqlClient.SqlBuffer.get_Int64()
+         at Microsoft.Data.SqlClient.SqlDataReader.GetInt64(Int32 i)
+         at lambda_method259(Closure, QueryContext, DbDataReader, ResultContext, SingleQueryResultCoordinator)
+         at Microsoft.EntityFrameworkCore.Query.Internal.SingleQueryingEnumerable`1.AsyncEnumerator.MoveNextAsync()
+[17:29:26 DBG]
+Request completed.
+Elapsed: 4580 ms
+Path: /api/Login/LoginAuthentication
+Query:
+Request:
+{"userName":"ADMIN","passwordHash":"#**^w!2v","productKey":"SO1-6G5YH-ES9Z3-EDD5D-TWX3S-83HC9"}
+Headers:
+{"Accept": "application/json, text/plain, */*", "Connection": "keep-alive", "Host": "localhost:5043", "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36", "Accept-Encoding": "gzip, deflate, br, zstd", "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8", "Content-Type": "application/json", "Origin": "http://localhost:4200", "Referer": "http://localhost:4200/", "Content-Length": "95", "X-Product-Key": "SO1-6G5YH-ES9Z3-EDD5D-TWX3S-83HC9", "sec-ch-ua-platform": "\"Windows\"", "sec-ch-ua": "\"Not:A-Brand\";v=\"8\", \"Chromium\";v=\"156\", \"Google Chrome\";v=\"156\"", "sec-ch-ua-mobile": "?0", "Sec-Fetch-Site": "same-site", "Sec-Fetch-Mode": "cors", "Sec-Fetch-Dest": "empty"}
+Status Code: 401
+Response:
+{"isSuccess":false,"status":500,"message":"An error occurred while logging in. Data is Null. This method or property cannot be called on Null values."}

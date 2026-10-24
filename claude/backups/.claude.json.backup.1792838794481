@@ -1,26 +1,26 @@
 {
-  "numStartups": 11,
+  "numStartups": 18,
   "installMethod": "native",
   "autoUpdates": false,
   "tipsHistory": {
-    "artifact-publish-plan": 1,
-    "agents-view-multiclauding": 2,
+    "artifact-publish-plan": 11,
+    "agents-view-multiclauding": 18,
     "new-user-warmup": 2,
-    "plan-mode-for-complex-tasks": 2,
-    "color-when-multi-clauding": 2,
-    "memory-command": 2,
+    "plan-mode-for-complex-tasks": 17,
+    "color-when-multi-clauding": 12,
+    "memory-command": 17,
     "theme-command": 3,
     "status-line": 3,
     "prompt-queue": 3,
     "enter-to-steer-in-relatime": 3,
-    "install-github-app": 3,
-    "install-slack-app": 4,
-    "frontend-design-plugin": 4,
-    "drag-and-drop-images": 5,
-    "double-esc-code-restore": 5,
-    "artifact-duplicate": 6,
-    "continue": 7,
-    "shift-tab": 8,
+    "install-github-app": 14,
+    "install-slack-app": 16,
+    "frontend-design-plugin": 17,
+    "drag-and-drop-images": 16,
+    "double-esc-code-restore": 16,
+    "artifact-duplicate": 16,
+    "continue": 17,
+    "shift-tab": 18,
     "image-paste": 8,
     "web-app": 9,
     "voice-mode": 10,
@@ -30,7 +30,8 @@
     "permissions": 11,
     "rename-conversation": 11,
     "workflow-size-prompting-ambient": 11,
-    "feedback-command": 11
+    "feedback-command": 11,
+    "team-onboarding-share": 16
   },
   "promptQueueUseCount": 4,
   "cachedGrowthBookFeatures": {
@@ -322,7 +323,7 @@
     "tengu_buzzing_falcon": false,
     "tengu_buzzing_lightning": false,
     "tengu_buzzing_pike": 0,
-    "tengu_buzzing_river": false,
+    "tengu_buzzing_river": true,
     "tengu_byte_stream_idle_timeout_ms": 180000,
     "tengu_c4e_slash_upsell": true,
     "tengu_c4w_usage_limit_notifications_enabled": true,
@@ -331,6 +332,7 @@
     "tengu_calm_nautilus": true,
     "tengu_calm_osprey": true,
     "tengu_calm_seal": null,
+    "tengu_calm_waffle": false,
     "tengu_canary": {},
     "tengu_carved_slate": true,
     "tengu_ccr_bridge": true,
@@ -437,6 +439,7 @@
     "tengu_compass_dial": true,
     "tengu_compiled_acorn": true,
     "tengu_composed_quail": true,
+    "tengu_composed_treehouse": false,
     "tengu_concurrent_candle": false,
     "tengu_concurrent_moonbeam": false,
     "tengu_context_usage_bulk_counts": false,
@@ -453,6 +456,7 @@
     "tengu_cork_m4q": true,
     "tengu_cosmic_crayon": false,
     "tengu_cosmic_shore": true,
+    "tengu_cosmic_sketch": true,
     "tengu_cowork_auto_mode_include_allowed_write_mcp": true,
     "tengu_cowork_chrome_automode_default": true,
     "tengu_cozy_crane": "enforce",
@@ -474,13 +478,16 @@
     "tengu_dapper_dawn": true,
     "tengu_dapper_dusk": true,
     "tengu_dapper_lagoon": false,
+    "tengu_dapper_truffle": "off",
+    "tengu_dappled_oar": true,
     "tengu_dash_flame": true,
     "tengu_dazzling_floyd": true,
     "tengu_deep_shore": true,
     "tengu_deferred_stub_tool": true,
     "tengu_delegated_quail": {
       "mode": "shadow",
-      "served": "primary"
+      "served": "primary",
+      "published": "off"
     },
     "tengu_delightful_goblet": true,
     "tengu_desktop_upsell": {
@@ -506,7 +513,7 @@
     "tengu_dune_wren": false,
     "tengu_dunwich_bell": false,
     "tengu_eager_pillow": true,
-    "tengu_eager_raccoon": false,
+    "tengu_eager_raccoon": true,
     "tengu_elegant_ocean": true,
     "tengu_elegant_pancake": true,
     "tengu_ember_latch": false,
@@ -583,10 +590,11 @@
     },
     "tengu_fizzy_grove": false,
     "tengu_fizzy_petal": true,
-    "tengu_fizzy_widget": false,
+    "tengu_fizzy_widget": true,
     "tengu_flax_grouse": false,
     "tengu_fleet_needs_input_nudge": true,
     "tengu_fleet_past_sessions": false,
+    "tengu_flickering_lagoon": true,
     "tengu_flickering_rain": true,
     "tengu_flint_harbor": true,
     "tengu_flint_harbor_prompt": {
@@ -689,6 +697,7 @@
     "tengu_jazzy_bird": true,
     "tengu_jazzy_goblet": true,
     "tengu_jazzy_taco": false,
+    "tengu_jiggly_blossom": "off",
     "tengu_jiggly_quilt": false,
     "tengu_jolly_aurora": false,
     "tengu_jolly_dewdrop": true,
@@ -742,11 +751,13 @@
     "tengu_lapis_thicket": false,
     "tengu_larch_pavise": false,
     "tengu_lazy_dove": true,
+    "tengu_lazy_river": true,
     "tengu_lexical_crystal": true,
     "tengu_lexical_glade": true,
     "tengu_lichen_compass": false,
     "tengu_lilac_dune": false,
     "tengu_lilac_loom": null,
+    "tengu_linear_quail": 0,
     "tengu_linen_osprey": false,
     "tengu_lively_beaver": true,
     "tengu_lively_waffle": true,
@@ -760,6 +771,7 @@
     "tengu_loop_noop_fold": true,
     "tengu_loud_sugary_rock": false,
     "tengu_loud_sugary_rock2": false,
+    "tengu_lovely_rain": false,
     "tengu_lovely_umbrella": false,
     "tengu_lucid_anchor": true,
     "tengu_lucky_brooks": false,
@@ -810,6 +822,7 @@
     "tengu_marl_cormorant": true,
     "tengu_max_version_config": {},
     "tengu_mcp_claudeai_eligibility_gate": true,
+    "tengu_mcp_directory_visibility": null,
     "tengu_mcp_drop_invalid_tool_schemas": [
       "*"
     ],
@@ -854,6 +867,7 @@
     "tengu_miraculo_the_bard": false,
     "tengu_misty_anchor": false,
     "tengu_misty_aurora": 0,
+    "tengu_misty_spindle_enabled": true,
     "tengu_misty_sunbeam": false,
     "tengu_misty_twilight": true,
     "tengu_mocha_barista": true,
@@ -861,10 +875,12 @@
     "tengu_modular_seal": false,
     "tengu_moonlit_panda": true,
     "tengu_moss_anchor": false,
+    "tengu_mossy_anchor": false,
     "tengu_mossy_gray": false,
     "tengu_mossy_lantern": true,
     "tengu_mossy_wirth": false,
     "tengu_moth_copse": false,
+    "tengu_nankeen_kestrel": false,
     "tengu_native_cursor": true,
     "tengu_negative_interaction_transcript_ask_config": {
       "probability": 0
@@ -895,7 +911,19 @@
     "tengu_orderly_lantern": false,
     "tengu_orford_ness": false,
     "tengu_org_config_required": {
-      "enabled": false
+      "enabled": true,
+      "plans": [
+        "team",
+        "enterprise"
+      ],
+      "percent": 1,
+      "graceTtlHours": 24,
+      "budgetMs": 10000,
+      "exemptReasons": [
+        "not_attempted"
+      ],
+      "refuseNotEntitled": false,
+      "hostTokens": false
     },
     "tengu_osprey_lantern": false,
     "tengu_otk_slot_v1": false,
@@ -910,6 +938,7 @@
     },
     "tengu_penguins_enabled": true,
     "tengu_peppy_riddle": true,
+    "tengu_peppy_spindle": false,
     "tengu_peppy_stardust": {},
     "tengu_peppy_zephyr": true,
     "tengu_per_turn_effort": true,
@@ -964,6 +993,7 @@
     },
     "tengu_prompt_cache_diagnostics": true,
     "tengu_prompt_suggestion": true,
+    "tengu_proud_honey": false,
     "tengu_quarry_skiff": false,
     "tengu_quartz_meadow": false,
     "tengu_quartz_pipit": true,
@@ -1049,13 +1079,9 @@
     "tengu_sdk_mcp_manifests": true,
     "tengu_sepia_cormorant": [],
     "tengu_sepia_moth": false,
-    "tengu_sequential_cloud": {
-      "enabled": true,
-      "touchIntervalSeconds": 30,
-      "activityWindowMinutes": 60,
-      "resumeTouches": true
-    },
+    "tengu_sequential_cloud": false,
     "tengu_sequential_summit": false,
+    "tengu_serene_curry": false,
     "tengu_serene_frog": true,
     "tengu_serialized_petal": 0,
     "tengu_session_memory": false,
@@ -1139,7 +1165,15 @@
     "tengu_starry_locket": true,
     "tengu_starry_waterfall": {
       "enabled": true,
-      "version": 1
+      "version": 2,
+      "menuSuffixPctOff": "at least {pct}% off one purchase · {days} left",
+      "hintPctOff": "Usage credits are at least {pct}% off for one purchase · {days} left · /usage-credits",
+      "bannerPillPctOff": "At least {pct}% off one usage-credit purchase · {days} left",
+      "dialogHeaderPctOff": "Limited-time offer: at least {pct}% off one purchase · {days} left",
+      "menuSuffixExtraCredit": "at least {pct}% extra credit on one purchase · {days} left",
+      "hintExtraCredit": "Buy usage credits once and get at least {pct}% extra · {days} left · /usage-credits",
+      "bannerPillExtraCredit": "At least {pct}% extra on one usage-credit purchase · {days} left",
+      "dialogHeaderExtraCredit": "Limited-time offer: at least {pct}% extra credit on one purchase · {days} left"
     },
     "tengu_startup_announcements": [
       {
@@ -1219,6 +1253,7 @@
       "mode": "one_step"
     },
     "tengu_tidy_origami": false,
+    "tengu_tidy_shelf": "off",
     "tengu_timber_lark": "copy_a",
     "tengu_tingly_hopper": true,
     "tengu_tingly_pike": null,
@@ -1248,6 +1283,7 @@
     "tengu_twinkling_swan": 60000,
     "tengu_twinkly_prism": false,
     "tengu_typed_koala": true,
+    "tengu_typed_trinket": 0,
     "tengu_ultraplan_config": {
       "enabled": false
     },
@@ -1341,6 +1377,7 @@
     "tengu_violin_finetuner": true,
     "tengu_violin_fingerboard": true,
     "tengu_violin_fret": true,
+    "tengu_violin_frog": true,
     "tengu_violin_gauge": {
       "sessionMiB": 2048,
       "uploadMiB": 400,
@@ -1377,6 +1414,7 @@
     "tengu_violin_strad": false,
     "tengu_violin_table": true,
     "tengu_violin_tailgut": true,
+    "tengu_violin_tailpiece": true,
     "tengu_violin_tip": true,
     "tengu_violin_varnish": true,
     "tengu_violin_volute": true,
@@ -1385,6 +1423,7 @@
     "tengu_violin_winding": true,
     "tengu_violin_wood": false,
     "tengu_virtual_pancake": true,
+    "tengu_virtual_toast": false,
     "tengu_vscode_feedback_survey": true,
     "tengu_vscode_integrated_browser": false,
     "tengu_vscode_onboarding": true,
@@ -1420,6 +1459,7 @@
     "tengu_witty_firefly": true,
     "tengu_wobbly_dahl": false,
     "tengu_wobbly_dewdrop": false,
+    "tengu_wobbly_petal": null,
     "tengu_wondrous_acorn": {
       "enabled": true,
       "min_continues": 3
@@ -1432,6 +1472,7 @@
     "tengu_woven_harbor": false,
     "tengu_xq7_marble_zephyr": false,
     "tengu_xterm_atlas_reset": true,
+    "tengu_zany_pike": "off",
     "tengu_zinc_harbor": false,
     "tengu_zippy_gosling": 0
   },
@@ -1444,7 +1485,7 @@
   "hasResetAutoModeOptInForDefaultOffer": true,
   "migrationVersion": 14,
   "userID": "d515342473394793ee92a36e318cf8d4d735d1b054b3ed929933d9520d364d46",
-  "changelogLastFetched": 1792744859093,
+  "changelogLastFetched": 1792822169742,
   "oauthAccount": {
     "accountUuid": "a8d3c977-f705-4955-a099-828d3dc31d95",
     "emailAddress": "rudra.p@fortunesys.com",
@@ -1469,6 +1510,19 @@
   },
   "claudeCodeFirstTokenDate": "2026-07-15T04:30:34.853774Z",
   "clientDataCacheSlots": {
+    "bi1-f550c347a1422a9e": {
+      "data": {
+        "cedar_lagoon": {
+          "claude-fable": true,
+          "claude-mythos": true
+        },
+        "cedar_basin": "2027-08-31"
+      },
+      "at": 1792822169734,
+      "entrypoint": "cli",
+      "model": "claude-opus-5",
+      "org": "4e3336c0-a037-4e94-9bec-3fd4c97c1cf7"
+    },
     "bi1-da4213908fb73b62": {
       "data": {
         "cedar_lagoon": {
@@ -1503,7 +1557,7 @@
       "description": "Fable 5.1 · Most capable for your hardest and longest-running tasks"
     }
   ],
-  "additionalModelOptionsAnsweredAt": 1792745024739,
+  "additionalModelOptionsAnsweredAt": 1792822169735,
   "additionalModelCostsCache": {},
   "modelAccessCache": [],
   "orgModelDefaultCache": null,
@@ -1521,44 +1575,63 @@
       "hasClaudeMdExternalIncludesApproved": false,
       "hasClaudeMdExternalIncludesWarningShown": false,
       "lastGracefulShutdown": false,
-      "lastVersionBase": "2.1.309",
-      "lastCost": 0,
-      "lastAPIDuration": 0,
-      "lastAPIDurationWithoutRetries": 0,
-      "lastToolDuration": 0,
-      "lastDuration": 9832,
-      "lastStartTime": 1792753560412,
+      "lastVersionBase": "2.1.310",
+      "lastCost": 16.262997650000003,
+      "lastAPIDuration": 2016704,
+      "lastAPIDurationWithoutRetries": 2015605,
+      "lastToolDuration": 9919,
+      "lastDuration": 6607765,
+      "lastStartTime": 1792825027792,
       "lastLinesAdded": 0,
       "lastLinesRemoved": 0,
-      "lastTotalInputTokens": 0,
-      "lastTotalOutputTokens": 0,
-      "lastTotalCacheCreationInputTokens": 0,
-      "lastTotalCacheReadInputTokens": 0,
+      "lastTotalInputTokens": 5151,
+      "lastTotalOutputTokens": 156053,
+      "lastTotalCacheCreationInputTokens": 272964,
+      "lastTotalCacheReadInputTokens": 19235688,
       "lastTotalWebSearchRequests": 0,
-      "lastModelUsage": {},
-      "lastSessionId": "6ba0be36-1301-43d2-8f2d-69c2ab651734",
+      "lastModelUsage": {
+        "claude-haiku-5-5": {
+          "inputTokens": 1259,
+          "outputTokens": 158,
+          "thinkingTokens": 139,
+          "cacheReadInputTokens": 0,
+          "cacheCreationInputTokens": 0,
+          "webSearchRequests": 0,
+          "costUSD": 0.0002049
+        },
+        "claude-opus-5": {
+          "inputTokens": 3892,
+          "outputTokens": 155895,
+          "thinkingTokens": 43145,
+          "cacheReadInputTokens": 19235688,
+          "cacheCreationInputTokens": 272964,
+          "webSearchRequests": 0,
+          "costUSD": 16.262792750000003
+        }
+      },
+      "lastSessionId": "1b741c30-90ff-4188-90f7-c5c279b1646d",
       "lastSessionMetrics": {
-        "frame_duration_ms_count": 4828,
-        "frame_duration_ms_min": 0.10056399973109365,
-        "frame_duration_ms_max": 200.68353200005367,
-        "frame_duration_ms_avg": 1.092110006420527,
-        "frame_duration_ms_p50": 0.832473500049673,
-        "frame_duration_ms_p95": 2.113197699992451,
-        "frame_duration_ms_p99": 8.517199490009805,
-        "pre_tool_hook_duration_ms_count": 22,
+        "frame_duration_ms_count": 4115,
+        "frame_duration_ms_min": 0.07115200004773214,
+        "frame_duration_ms_max": 11.40722299999993,
+        "frame_duration_ms_avg": 0.6191009594166997,
+        "frame_duration_ms_p50": 0.5634804999863263,
+        "frame_duration_ms_p95": 1.2100780999612195,
+        "frame_duration_ms_p99": 2.3880993099638723,
+        "pre_tool_hook_duration_ms_count": 43,
         "pre_tool_hook_duration_ms_min": 1,
-        "pre_tool_hook_duration_ms_max": 32,
-        "pre_tool_hook_duration_ms_avg": 3.409090909090909,
+        "pre_tool_hook_duration_ms_max": 6,
+        "pre_tool_hook_duration_ms_avg": 1.7674418604651163,
         "pre_tool_hook_duration_ms_p50": 2,
         "pre_tool_hook_duration_ms_p95": 3,
-        "pre_tool_hook_duration_ms_p99": 25.909999999999975,
-        "hook_duration_ms_count": 22,
+        "pre_tool_hook_duration_ms_p99": 5.579999999999998,
+        "hook_duration_ms_count": 42,
         "hook_duration_ms_min": 0,
-        "hook_duration_ms_max": 14,
-        "hook_duration_ms_avg": 1.8181818181818181,
-        "hook_duration_ms_p50": 1,
-        "hook_duration_ms_p95": 10.549999999999994,
-        "hook_duration_ms_p99": 13.369999999999997
+        "hook_duration_ms_max": 2,
+        "hook_duration_ms_avg": 0.35714285714285715,
+        "hook_duration_ms_p50": 0,
+        "hook_duration_ms_p95": 1,
+        "hook_duration_ms_p99": 1.5899999999999963
       }
     },
     "/home/rudy/docs/office/hrms/HRMS_FrontEnd": {
@@ -1570,8 +1643,8 @@
       "hasTrustDialogAccepted": true,
       "hasClaudeMdExternalIncludesApproved": false,
       "hasClaudeMdExternalIncludesWarningShown": false,
-      "lastGracefulShutdown": true,
-      "lastVersionBase": "2.1.309",
+      "lastGracefulShutdown": false,
+      "lastVersionBase": "2.1.310",
       "hasUnseenTeamArtifacts": false,
       "exampleFiles": [
         "environment.development.ts",
@@ -1585,8 +1658,8 @@
       "lastAPIDuration": 0,
       "lastAPIDurationWithoutRetries": 0,
       "lastToolDuration": 0,
-      "lastDuration": 887015,
-      "lastStartTime": 1792753614854,
+      "lastDuration": 6889,
+      "lastStartTime": 1792822167437,
       "lastLinesAdded": 0,
       "lastLinesRemoved": 0,
       "lastTotalInputTokens": 0,
@@ -1594,10 +1667,8 @@
       "lastTotalCacheCreationInputTokens": 0,
       "lastTotalCacheReadInputTokens": 0,
       "lastTotalWebSearchRequests": 0,
-      "lastFpsAverage": 0.03,
-      "lastFpsLow1Pct": 50.16,
       "lastModelUsage": {},
-      "lastSessionId": "7db882a2-80e3-4d6c-9a8b-e30a4ad5f039"
+      "lastSessionId": "57e3d886-208e-445a-9d90-5cb50d6fe03a"
     },
     "/home/rudy/docs/office": {
       "allowedTools": [],
@@ -1608,8 +1679,70 @@
       "hasTrustDialogAccepted": true,
       "hasClaudeMdExternalIncludesApproved": false,
       "hasClaudeMdExternalIncludesWarningShown": false,
+      "lastGracefulShutdown": true,
+      "lastVersionBase": "2.1.310",
+      "lastCost": 5.214688000000001,
+      "lastAPIDuration": 837730,
+      "lastAPIDurationWithoutRetries": 836948,
+      "lastToolDuration": 1221,
+      "lastDuration": 3147671,
+      "lastStartTime": 1792822711345,
+      "lastLinesAdded": 2686,
+      "lastLinesRemoved": 22,
+      "lastTotalInputTokens": 264,
+      "lastTotalOutputTokens": 67337,
+      "lastTotalCacheCreationInputTokens": 120967,
+      "lastTotalCacheReadInputTokens": 4640546,
+      "lastTotalWebSearchRequests": 0,
+      "lastModelUsage": {
+        "claude-opus-5": {
+          "inputTokens": 264,
+          "outputTokens": 67337,
+          "thinkingTokens": 24233,
+          "cacheReadInputTokens": 4640546,
+          "cacheCreationInputTokens": 120967,
+          "webSearchRequests": 0,
+          "costUSD": 5.214688000000001
+        }
+      },
+      "lastSessionId": "5b8372e3-e06f-4ff8-97b7-aa16e95bee26",
+      "lastFpsAverage": 2.55,
+      "lastFpsLow1Pct": 482.92,
+      "lastSessionMetrics": {
+        "frame_duration_ms_count": 8027,
+        "frame_duration_ms_min": 0.0736809999216348,
+        "frame_duration_ms_max": 31.350731000013184,
+        "frame_duration_ms_avg": 0.6184196702381054,
+        "frame_duration_ms_p50": 0.5534360000165179,
+        "frame_duration_ms_p95": 1.284851149996393,
+        "frame_duration_ms_p99": 2.3062301600158386,
+        "pre_tool_hook_duration_ms_count": 37,
+        "pre_tool_hook_duration_ms_min": 0,
+        "pre_tool_hook_duration_ms_max": 24,
+        "pre_tool_hook_duration_ms_avg": 2.081081081081081,
+        "pre_tool_hook_duration_ms_p50": 1,
+        "pre_tool_hook_duration_ms_p95": 4,
+        "pre_tool_hook_duration_ms_p99": 16.80000000000001,
+        "hook_duration_ms_count": 37,
+        "hook_duration_ms_min": 0,
+        "hook_duration_ms_max": 2,
+        "hook_duration_ms_avg": 0.5945945945945946,
+        "hook_duration_ms_p50": 1,
+        "hook_duration_ms_p95": 1,
+        "hook_duration_ms_p99": 1.6400000000000006
+      }
+    },
+    "/home/rudy/docs/office/subscription_portal": {
+      "allowedTools": [],
+      "mcpContextUris": [],
+      "mcpServers": {},
+      "enabledMcpjsonServers": [],
+      "disabledMcpjsonServers": [],
+      "hasTrustDialogAccepted": false,
+      "hasClaudeMdExternalIncludesApproved": false,
+      "hasClaudeMdExternalIncludesWarningShown": false,
       "lastGracefulShutdown": false,
-      "lastVersionBase": "2.1.309"
+      "lastVersionBase": "2.1.310"
     }
   },
   "cachedExperimentFeatures": [
@@ -1677,8 +1810,8 @@
       }
     }
   },
-  "cachedGrowthBookFeaturesAt": 1792753956495,
-  "lastReleaseNotesSeen": "2.1.309",
+  "cachedGrowthBookFeaturesAt": 1792831075308,
+  "lastReleaseNotesSeen": "2.1.310",
   "hasSeenAutoDefaultNotice": true,
   "pluginUsage": {
     "cc-plugin-sec-default@builtin": {
@@ -1707,7 +1840,7 @@
       "lastUsedNumStartups": 1
     }
   },
-  "closedIssuesLastChecked": 1792744895149,
+  "closedIssuesLastChecked": 1792832563952,
   "cachedExtraUsageDisabledReason": "org_level_disabled",
   "autoUpdatesProtectedForNative": true,
   "claudeAiMcpEverConnected": [
@@ -1716,24 +1849,24 @@
   "officialMarketplaceAutoInstallAttempted": true,
   "officialMarketplaceAutoInstalled": true,
   "tipLifetimeShownCounts": {
-    "artifact-publish-plan": 1,
-    "agents-view-multiclauding": 1,
+    "artifact-publish-plan": 2,
+    "agents-view-multiclauding": 5,
     "new-user-warmup": 1,
-    "plan-mode-for-complex-tasks": 1,
-    "color-when-multi-clauding": 1,
-    "memory-command": 1,
+    "plan-mode-for-complex-tasks": 3,
+    "color-when-multi-clauding": 2,
+    "memory-command": 2,
     "theme-command": 1,
     "status-line": 1,
     "prompt-queue": 1,
     "enter-to-steer-in-relatime": 1,
-    "install-github-app": 1,
-    "install-slack-app": 1,
-    "frontend-design-plugin": 1,
-    "drag-and-drop-images": 1,
-    "double-esc-code-restore": 1,
-    "artifact-duplicate": 1,
-    "continue": 1,
-    "shift-tab": 1,
+    "install-github-app": 2,
+    "install-slack-app": 2,
+    "frontend-design-plugin": 2,
+    "drag-and-drop-images": 2,
+    "double-esc-code-restore": 2,
+    "artifact-duplicate": 2,
+    "continue": 2,
+    "shift-tab": 2,
     "image-paste": 1,
     "web-app": 1,
     "voice-mode": 1,
@@ -1743,13 +1876,14 @@
     "permissions": 1,
     "rename-conversation": 1,
     "workflow-size-prompting-ambient": 1,
-    "feedback-command": 1
+    "feedback-command": 1,
+    "team-onboarding-share": 1
   },
-  "lastClawdEntranceVersion": "2.1.309",
+  "lastClawdEntranceVersion": "2.1.310",
   "announcementImpressions": {
     "opus-5-5-default": 3,
     "opus-5-5-launch": 6,
-    "sonnet-5-5-launch": 1
+    "sonnet-5-5-launch": 2
   },
   "cachedArtifactRoster": {
     "accountUuid": "a8d3c977-f705-4955-a099-828d3dc31d95",
@@ -1774,14 +1908,14 @@
   "metricsStatusCacheByPrincipal": {
     "acct:a8d3c977-f705-4955-a099-828d3dc31d95/4e3336c0-a037-4e94-9bec-3fd4c97c1cf7": {
       "enabled": true,
-      "timestamp": 1792745195255
+      "timestamp": 1792831629854
     }
   },
   "remoteControlUpsellSeenCount": 3,
   "tipsHistoryByCommand": {
     "memory": {
       "tipId": "memory-command",
-      "numStartups": 2
+      "numStartups": 17
     },
     "statusline": {
       "tipId": "status-line",
@@ -1789,15 +1923,15 @@
     },
     "install-github-app": {
       "tipId": "install-github-app",
-      "numStartups": 3
+      "numStartups": 14
     },
     "install-slack-app": {
       "tipId": "install-slack-app",
-      "numStartups": 4
+      "numStartups": 16
     },
     "plugin": {
-      "tipId": "you-should-know-plugin",
-      "numStartups": 10
+      "tipId": "frontend-design-plugin",
+      "numStartups": 17
     },
     "voice": {
       "tipId": "voice-mode",
@@ -1814,23 +1948,27 @@
     "config": {
       "tipId": "workflow-size-prompting-ambient",
       "numStartups": 11
+    },
+    "team-onboarding": {
+      "tipId": "team-onboarding-share",
+      "numStartups": 16
     }
   },
   "cachedUsageUtilization": {
-    "fetchedAtMs": 1792747084853,
+    "fetchedAtMs": 1792838003329,
     "accountUuid": "a8d3c977-f705-4955-a099-828d3dc31d95",
     "utilization": {
       "five_hour": {
-        "utilization": 40,
-        "resets_at": "2026-10-23T09:20:00.152829+00:00",
+        "utilization": 13,
+        "resets_at": "2026-10-24T15:00:00.243550+00:00",
         "limit_dollars": null,
         "used_dollars": null,
         "remaining_dollars": null,
         "locked_reason": null
       },
       "seven_day": {
-        "utilization": 7,
-        "resets_at": "2026-10-29T23:00:00.152853+00:00",
+        "utilization": 34,
+        "resets_at": "2026-10-29T23:00:00.243568+00:00",
         "limit_dollars": null,
         "used_dollars": null,
         "remaining_dollars": null,
@@ -1877,20 +2015,20 @@
         {
           "kind": "session",
           "group": "session",
-          "percent": 40,
+          "percent": 13,
           "severity": "normal",
-          "resets_at": "2026-10-23T09:20:00.152829+00:00",
+          "resets_at": "2026-10-24T15:00:00.243550+00:00",
           "scope": null,
-          "is_active": true
+          "is_active": false
         },
         {
           "kind": "weekly_all",
           "group": "weekly",
-          "percent": 7,
+          "percent": 34,
           "severity": "normal",
-          "resets_at": "2026-10-29T23:00:00.152853+00:00",
+          "resets_at": "2026-10-29T23:00:00.243568+00:00",
           "scope": null,
-          "is_active": false
+          "is_active": true
         }
       ],
       "spend": {

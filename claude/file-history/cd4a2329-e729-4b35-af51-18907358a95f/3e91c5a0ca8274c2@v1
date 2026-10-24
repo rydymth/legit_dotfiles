@@ -1,0 +1,167 @@
+﻿using System.Text;
+using System.Text.Json.Serialization;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.IdentityModel.Tokens;
+using SubscriptionPortal.BusinessLogicLayer.Security;
+using SubscriptionPortal.BusinessLogicLayer.Services.Account.Implementation;
+using SubscriptionPortal.BusinessLogicLayer.Services.Account.Interface;
+using SubscriptionPortal.BusinessLogicLayer.Services.Dashboard.Implementation;
+using SubscriptionPortal.BusinessLogicLayer.Services.Dashboard.Interface;
+using SubscriptionPortal.BusinessLogicLayer.Services.EmailConfigurations.Implementation;
+using SubscriptionPortal.BusinessLogicLayer.Services.EmailConfigurations.Interface;
+using SubscriptionPortal.BusinessLogicLayer.Services.Lifecycle.Implementation;
+using SubscriptionPortal.BusinessLogicLayer.Services.Lifecycle.Interface;
+using SubscriptionPortal.BusinessLogicLayer.Services.Notifications.Implementation;
+using SubscriptionPortal.BusinessLogicLayer.Services.Notifications.Interface;
+using SubscriptionPortal.BusinessLogicLayer.Services.Payment.Implementation;
+using SubscriptionPortal.BusinessLogicLayer.Services.Payment.Interface;
+using SubscriptionPortal.BusinessLogicLayer.Services.Provisioning.Implementation;
+using SubscriptionPortal.BusinessLogicLayer.Services.Provisioning.Interface;
+using SubscriptionPortal.BusinessLogicLayer.Services.RoleRights.Implementation;
+using SubscriptionPortal.BusinessLogicLayer.Services.RoleRights.Interface;
+using SubscriptionPortal.BusinessLogicLayer.Services.Roles.Implementation;
+using SubscriptionPortal.BusinessLogicLayer.Services.Roles.Interface;
+using SubscriptionPortal.BusinessLogicLayer.Services.Subscriptions.Implementation;
+using SubscriptionPortal.BusinessLogicLayer.Services.Subscriptions.Interface;
+using SubscriptionPortal.BusinessLogicLayer.Services.Users.Implementation;
+using SubscriptionPortal.BusinessLogicLayer.Services.Users.Interface;
+using SubscriptionPortal.Core.CommonModels;
+using SubscriptionPortal.Core.Security;
+using SubscriptionPortal.DataAccessLayer.Context;
+using SubscriptionPortal.DataAccessLayer.Repositories.Account.Implementation;
+using SubscriptionPortal.DataAccessLayer.Repositories.Account.Interface;
+using SubscriptionPortal.DataAccessLayer.Repositories.Dashboard.Implementation;
+using SubscriptionPortal.DataAccessLayer.Repositories.Dashboard.Interface;
+using SubscriptionPortal.DataAccessLayer.Repositories.EmailConfigurations.Implementation;
+using SubscriptionPortal.DataAccessLayer.Repositories.EmailConfigurations.Interface;
+using SubscriptionPortal.DataAccessLayer.Repositories.EmailLogs.Implementation;
+using SubscriptionPortal.DataAccessLayer.Repositories.EmailLogs.Interface;
+using SubscriptionPortal.DataAccessLayer.Repositories.Payments.Implementation;
+using SubscriptionPortal.DataAccessLayer.Repositories.Payments.Interface;
+using SubscriptionPortal.DataAccessLayer.Repositories.RoleRights.Implementation;
+using SubscriptionPortal.DataAccessLayer.Repositories.RoleRights.Interface;
+using SubscriptionPortal.DataAccessLayer.Repositories.Roles.Implementation;
+using SubscriptionPortal.DataAccessLayer.Repositories.Roles.Interface;
+using SubscriptionPortal.DataAccessLayer.Repositories.Subscriptions.Implementation;
+using SubscriptionPortal.DataAccessLayer.Repositories.Subscriptions.Interface;
+using SubscriptionPortal.DataAccessLayer.Repositories.TenantDatabases.Implementation;
+using SubscriptionPortal.DataAccessLayer.Repositories.TenantDatabases.Interface;
+using SubscriptionPortal.DataAccessLayer.Repositories.Users.Implementation;
+using SubscriptionPortal.DataAccessLayer.Repositories.Users.Interface;
+using SubscriptionPortal.WebAPI.BackgroundServices;
+
+var builder = WebApplication.CreateBuilder(args);
+
+// Add services to the container.
+
+builder.Services.AddControllers()
+    .AddJsonOptions(options =>
+        options.JsonSerializerOptions.Converters.Add(new JsonStringEnumConverter()));
+// Learn more about configuring Swagger/OpenAPI at https://aka.ms/aspnetcore/swashbuckle
+builder.Services.AddEndpointsApiExplorer();
+builder.Services.AddSwaggerGen();
+
+// ---------- Decrypt the SQL connection string once at startup ----------
+// Matches the SOPPS/OMS projects' Program.cs exactly: the AES key is a plain literal here, not
+// config, and appsettings.json's ConnectionStrings section holds only the encrypted text.
+const string connectionEncryptionKey = "Gsspl@2024Gsspl@";
+var encryptedConnectionString = builder.Configuration["ConnectionStrings:EncryptedSubscriptionPortalConnection"]
+    ?? throw new InvalidOperationException("ConnectionStrings:EncryptedSubscriptionPortalConnection is missing.");
+var resolvedConnectionString = AesCrypto.Decrypt(encryptedConnectionString, connectionEncryptionKey);
+
+builder.Services.AddDbContext<SubscriptionPortalDbContext>(options =>
+    options.UseSqlServer(resolvedConnectionString));
+
+builder.Services.AddScoped<IAccountRepository, AccountRepository>();
+builder.Services.AddScoped<IAccountService, AccountService>();
+builder.Services.AddScoped<ISubscriptionRepository, SubscriptionRepository>();
+builder.Services.AddScoped<ISubscriptionService, SubscriptionService>();
+builder.Services.AddScoped<ISubscriptionLifecycleRepository, SubscriptionLifecycleRepository>();
+builder.Services.AddScoped<ISubscriptionLifecycleService, SubscriptionLifecycleService>();
+builder.Services.AddMemoryCache();
+builder.Services.AddHttpClient();
+builder.Services.AddScoped<IEmailConfigurationRepository, EmailConfigurationRepository>();
+builder.Services.AddScoped<IEmailSendLogRepository, EmailSendLogRepository>();
+builder.Services.AddScoped<IEmailConfigurationService, EmailConfigurationService>();
+builder.Services.AddScoped<IEmailService, DatabaseEmailService>();
+builder.Services.AddHostedService<TrialLifecycleBackgroundService>();
+builder.Services.AddScoped<IUserManagementRepository, UserManagementRepository>();
+builder.Services.AddScoped<IUserManagementService, UserManagementService>();
+
+// Owner-only portal overview - read-only aggregation over data that already exists.
+builder.Services.AddScoped<IDashboardRepository, DashboardRepository>();
+builder.Services.AddScoped<IDashboardService, DashboardService>();
+
+builder.Services.AddScoped<IRoleRepository, RoleRepository>();
+builder.Services.AddScoped<IRoleService, RoleService>();
+builder.Services.AddScoped<IRoleRightsRepository, RoleRightsRepository>();
+builder.Services.AddScoped<IRoleRightsService, RoleRightsService>();
+builder.Services.AddSingleton<IJwtTokenGenerator, JwtTokenGenerator>();
+
+builder.Services.AddScoped<IPaymentRepository, PaymentRepository>();
+builder.Services.AddScoped<IPaymentService, PaymentService>();
+// TODO: swap for RazorpayPaymentGatewayService once Razorpay:KeyId/KeySecret are configured.
+builder.Services.AddScoped<IPaymentGatewayService, NotConfiguredPaymentGatewayService>();
+builder.Services.Configure<RazorpaySettings>(builder.Configuration.GetSection("Razorpay"));
+
+builder.Services.AddScoped<ITenantDatabaseRepository, TenantDatabaseRepository>();
+builder.Services.AddScoped<IDatabaseProvisioningService, DatabaseProvisioningService>();
+builder.Services.Configure<HrmsProvisioningSettings>(builder.Configuration.GetSection("HrmsProvisioning"));
+
+builder.Services.Configure<JwtSettings>(builder.Configuration.GetSection("Jwt"));
+var jwtSettings = builder.Configuration.GetSection("Jwt").Get<JwtSettings>()
+    ?? throw new InvalidOperationException("Jwt configuration section is missing.");
+
+builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer(options =>
+    {
+        // Without this, the handler silently rewrites short claim names like "sub" into long
+        // legacy URIs (e.g. sub -> .../nameidentifier) before controllers ever see them, which
+        // breaks any User.FindFirst("sub"/JwtRegisteredClaimNames.Sub) lookup.
+        options.MapInboundClaims = false;
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuer = true,
+            ValidIssuer = jwtSettings.Issuer,
+            ValidateAudience = true,
+            ValidAudience = jwtSettings.Audience,
+            ValidateLifetime = true,
+            ValidateIssuerSigningKey = true,
+            IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtSettings.SigningKey)),
+            ClockSkew = TimeSpan.FromSeconds(30)
+        };
+    });
+builder.Services.AddAuthorization();
+
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("SubscriptionPortalFrontend", policy =>
+    {
+        policy.WithOrigins("http://localhost:4200")
+              .AllowAnyHeader()
+              .AllowAnyMethod();
+    });
+});
+
+var app = builder.Build();
+
+// Configure the HTTP request pipeline.
+if (app.Environment.IsDevelopment())
+{
+    app.UseSwagger();
+    app.UseSwaggerUI();
+}
+
+// No UseHttpsRedirection(): the Angular app always calls this API over plain HTTP on a fixed
+// port (see API_BASE_URL). Forcing an HTTPS redirect here made behavior depend on which launch
+// profile started the API (http-only vs https) - same http:// URL would 307 redirect to the
+// https port under one profile but not the other, breaking the frontend inconsistently.
+app.UseCors("SubscriptionPortalFrontend");
+
+app.UseAuthentication();
+app.UseAuthorization();
+
+app.MapControllers();
+
+app.Run();

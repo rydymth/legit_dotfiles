@@ -1,0 +1,84 @@
+package transport
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path"
+	"path/filepath"
+
+	"github.com/pkg/sftp"
+)
+
+// sftpTransport uploads over the SFTP subsystem of the existing SSH
+// connection.
+//
+// This is the default, for two reasons. We own the byte stream, so progress is
+// exact rather than scraped from another program's output; and it never needs
+// a shell on the far side, which matters on Windows targets where the default
+// shell is anybody's guess.
+type sftpTransport struct{}
+
+func (sftpTransport) Name() string { return "sftp" }
+
+func (sftpTransport) Send(ctx context.Context, c *Client, localPath, remoteDir string, progress ProgressFn) error {
+	// Concurrent writes pipeline many requests instead of waiting for each
+	// round trip. On a fat artifact over a long link this is the difference
+	// between minutes and tens of seconds.
+	sc, err := sftp.NewClient(c.SSH(),
+		sftp.UseConcurrentWrites(true),
+		sftp.MaxConcurrentRequestsPerFile(64),
+	)
+	if err != nil {
+		return fmt.Errorf("open sftp subsystem: %w", err)
+	}
+	defer sc.Close()
+
+	if err := sc.MkdirAll(remoteDir); err != nil {
+		return fmt.Errorf("mkdir %s: %w", remoteDir, err)
+	}
+
+	src, err := os.Open(localPath)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+
+	st, err := src.Stat()
+	if err != nil {
+		return err
+	}
+
+	// SFTP paths are always forward-slashed, including against Windows servers.
+	dst := path.Join(remoteDir, filepath.Base(localPath))
+
+	// Upload beside the real name, then rename into place. An interrupted
+	// transfer leaves a .part file rather than a truncated archive that looks
+	// complete to whatever unpacks it next.
+	tmp := dst + ".part"
+
+	rf, err := sc.Create(tmp)
+	if err != nil {
+		return fmt.Errorf("create %s: %w", tmp, err)
+	}
+
+	pr := &progressReader{r: src, ctx: ctx, fn: progress, total: st.Size()}
+	if _, err := rf.ReadFrom(pr); err != nil {
+		rf.Close()
+		_ = sc.Remove(tmp)
+		return fmt.Errorf("upload %s: %w", dst, err)
+	}
+	if err := rf.Close(); err != nil {
+		_ = sc.Remove(tmp)
+		return fmt.Errorf("close %s: %w", tmp, err)
+	}
+
+	// Rename will not clobber an existing file on every server, so clear the
+	// way first. A missing file here is the normal case, not an error.
+	_ = sc.Remove(dst)
+	if err := sc.Rename(tmp, dst); err != nil {
+		return fmt.Errorf("rename %s -> %s: %w", tmp, dst, err)
+	}
+
+	return nil
+}

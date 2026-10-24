@@ -1,0 +1,346 @@
+// Package tui renders the deploy as a live terminal interface.
+//
+// It is a consumer of the engine's event stream and nothing more. It holds no
+// deploy logic, cannot affect the outcome of a run beyond cancelling it, and
+// can be swapped for the plain renderer without either side noticing.
+package tui
+
+import (
+	"context"
+	"time"
+
+	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/viewport"
+	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/rudy/deployer/internal/engine"
+)
+
+// maxLogLines caps the scrollback. A noisy build can emit a hundred thousand
+// lines and we would rather drop the oldest than grow without bound.
+const maxLogLines = 20000
+
+type step struct {
+	name        string
+	status      engine.Status
+	sent, total int64
+}
+
+type project struct {
+	name       string
+	status     engine.Status
+	steps      []*step
+	byStep     map[string]*step
+	start, end time.Time
+	err        error
+}
+
+func (p *project) elapsed() time.Duration {
+	if p.start.IsZero() {
+		return 0
+	}
+	if p.end.IsZero() {
+		return time.Since(p.start)
+	}
+	return p.end.Sub(p.start)
+}
+
+// active returns the step currently running, or nil.
+func (p *project) active() *step {
+	for _, s := range p.steps {
+		if s.status == engine.Running {
+			return s
+		}
+	}
+	return nil
+}
+
+type logLine struct {
+	project string
+	step    string
+	text    string
+}
+
+// Model is the Bubble Tea model for a run.
+type Model struct {
+	events <-chan engine.Event
+
+	// cancel stops the engine. The first interrupt uses it, a second one
+	// quits outright, because a deploy that will not cancel cleanly must
+	// still be escapable.
+	cancel context.CancelFunc
+
+	projects []*project
+	byName   map[string]*project
+
+	logs []logLine
+
+	sel       int
+	followAll bool
+
+	vp    viewport.Model
+	sp    spinner.Model
+	ready bool
+	w, h  int
+
+	start     time.Time
+	finished  bool
+	cancelled bool
+	failures  int
+}
+
+// New builds the model. cancel is called when the user interrupts the run.
+func New(events <-chan engine.Event, cancel context.CancelFunc) *Model {
+	sp := spinner.New()
+	sp.Spinner = spinner.MiniDot
+	sp.Style = styleAccent
+
+	return &Model{
+		events:    events,
+		cancel:    cancel,
+		byName:    map[string]*project{},
+		sp:        sp,
+		start:     time.Now(),
+		followAll: true,
+	}
+}
+
+func (m *Model) Init() tea.Cmd {
+	return tea.Batch(m.sp.Tick, waitFor(m.events))
+}
+
+type eventsBatchMsg struct {
+	events []engine.Event
+	closed bool
+}
+
+type autoQuitMsg struct{}
+
+// waitFor blocks for one event, then drains whatever else is already queued.
+//
+// Taking a batch per frame matters: a build emitting thousands of lines a
+// second would otherwise outrun a one-event-per-render loop and the UI would
+// fall steadily further behind the work it is meant to be showing.
+func waitFor(ch <-chan engine.Event) tea.Cmd {
+	return func() tea.Msg {
+		ev, ok := <-ch
+		if !ok {
+			return eventsBatchMsg{closed: true}
+		}
+
+		batch := []engine.Event{ev}
+		for len(batch) < 512 {
+			select {
+			case e, open := <-ch:
+				if !open {
+					return eventsBatchMsg{events: batch, closed: true}
+				}
+				batch = append(batch, e)
+			default:
+				return eventsBatchMsg{events: batch}
+			}
+		}
+		return eventsBatchMsg{events: batch}
+	}
+}
+
+func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+
+	case tea.WindowSizeMsg:
+		m.w, m.h = msg.Width, msg.Height
+		m.layout()
+		return m, nil
+
+	case tea.KeyMsg:
+		return m.handleKey(msg)
+
+	case spinner.TickMsg:
+		var cmd tea.Cmd
+		m.sp, cmd = m.sp.Update(msg)
+		return m, cmd
+
+	case autoQuitMsg:
+		return m, tea.Quit
+
+	case eventsBatchMsg:
+		atBottom := !m.ready || m.vp.AtBottom()
+
+		for _, ev := range msg.events {
+			m.apply(ev)
+		}
+
+		if msg.closed {
+			m.finished = true
+			// A clean run needs no further attention, so get out of the
+			// user's way. A failed one stays up: that log is the reason
+			// they ran this in the first place.
+			if m.failures == 0 && !m.cancelled {
+				return m, tea.Tick(1200*time.Millisecond, func(time.Time) tea.Msg {
+					return autoQuitMsg{}
+				})
+			}
+			m.refreshLogs(atBottom)
+			return m, nil
+		}
+
+		m.refreshLogs(atBottom)
+		return m, waitFor(m.events)
+	}
+
+	return m, nil
+}
+
+func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+
+	case "ctrl+c", "q", "esc":
+		if m.finished || m.cancelled {
+			return m, tea.Quit
+		}
+		// First interrupt asks the engine to stop; steps unwind, scratch
+		// directories get cleaned up, partial uploads get removed.
+		m.cancelled = true
+		m.cancel()
+		return m, nil
+
+	case "up", "k":
+		if m.sel > 0 {
+			m.sel--
+			m.followAll = false
+			m.refreshLogs(true)
+		}
+		return m, nil
+
+	case "down", "j":
+		if m.sel < len(m.projects)-1 {
+			m.sel++
+			m.followAll = false
+			m.refreshLogs(true)
+		}
+		return m, nil
+
+	case "a":
+		m.followAll = !m.followAll
+		m.refreshLogs(true)
+		return m, nil
+
+	case "g", "home":
+		m.vp.GotoTop()
+		return m, nil
+
+	case "G", "end":
+		m.vp.GotoBottom()
+		return m, nil
+	}
+
+	var cmd tea.Cmd
+	m.vp, cmd = m.vp.Update(msg)
+	return m, cmd
+}
+
+// apply folds one event into the model.
+func (m *Model) apply(ev engine.Event) {
+	p := m.project(ev.Project)
+
+	switch ev.Kind {
+	case engine.KindProject:
+		p.status = ev.Status
+		switch ev.Status {
+		case engine.Running:
+			p.start = time.Now()
+		case engine.Done, engine.Failed, engine.Skipped:
+			p.end = time.Now()
+			if ev.Status == engine.Failed {
+				p.err = ev.Err
+				m.failures++
+			}
+		}
+
+	case engine.KindStep:
+		s := p.step(ev.Step)
+		s.status = ev.Status
+
+	case engine.KindProgress:
+		s := p.step(ev.Step)
+		s.sent, s.total = ev.Sent, ev.Total
+
+	case engine.KindLog:
+		m.logs = append(m.logs, logLine{project: ev.Project, step: ev.Step, text: ev.Line})
+		if len(m.logs) > maxLogLines {
+			// Drop the oldest quarter at once rather than reslicing on every
+			// line, which would copy the whole buffer each time.
+			m.logs = m.logs[len(m.logs)/4:]
+		}
+	}
+}
+
+// project finds or creates a project row, preserving first-seen order so the
+// list does not reshuffle itself mid-run.
+func (m *Model) project(name string) *project {
+	if p, ok := m.byName[name]; ok {
+		return p
+	}
+	p := &project{name: name, byStep: map[string]*step{}}
+	m.byName[name] = p
+	m.projects = append(m.projects, p)
+	return p
+}
+
+func (p *project) step(name string) *step {
+	if s, ok := p.byStep[name]; ok {
+		return s
+	}
+	s := &step{name: name}
+	p.byStep[name] = s
+	p.steps = append(p.steps, s)
+	return s
+}
+
+// layout sizes the viewport around the fixed chrome.
+func (m *Model) layout() {
+	h := m.h - m.chromeHeight()
+	if h < 3 {
+		h = 3
+	}
+	w := m.w - 2
+	if w < 20 {
+		w = 20
+	}
+
+	if !m.ready {
+		m.vp = viewport.New(w, h)
+		m.ready = true
+	} else {
+		m.vp.Width, m.vp.Height = w, h
+	}
+	m.refreshLogs(true)
+}
+
+// refreshLogs rebuilds the viewport contents, sticking to the bottom if that
+// is where the user already was. Scrolling up to read something should not be
+// undone by the next line of build output.
+func (m *Model) refreshLogs(stick bool) {
+	if !m.ready {
+		return
+	}
+
+	// The project list grows as projects appear, so the viewport has to be
+	// resized as well as refilled.
+	if h := m.h - m.chromeHeight(); h >= 3 && h != m.vp.Height {
+		m.vp.Height = h
+	}
+
+	m.vp.SetContent(m.renderLogs())
+	if stick {
+		m.vp.GotoBottom()
+	}
+}
+
+// selected is the project whose logs are shown, or nil in follow-all mode.
+func (m *Model) selected() *project {
+	if m.followAll || m.sel >= len(m.projects) {
+		return nil
+	}
+	return m.projects[m.sel]
+}

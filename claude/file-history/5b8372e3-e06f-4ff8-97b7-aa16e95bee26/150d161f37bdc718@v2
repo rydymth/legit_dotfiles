@@ -1,0 +1,67 @@
+// Package steps implements the four things a deploy does: build the artifact,
+// pack it, ship it, and hand off to whatever runs it on the far side.
+//
+// Each step is an engine.Step. They share a small per-project state so the
+// archive path found by one is the file uploaded by the next, and the engine
+// stays ignorant of all of it.
+package steps
+
+import (
+	"github.com/rudy/deployer/internal/config"
+	"github.com/rudy/deployer/internal/engine"
+	"github.com/rudy/deployer/internal/transport"
+)
+
+// Options tweak how a pipeline behaves without changing its shape.
+type Options struct {
+	// DryRun walks the whole plan and reports what each step would do
+	// without building, uploading or running anything remote.
+	DryRun bool
+
+	// KeepArchive leaves the packed archive on disk instead of deleting it,
+	// for when you want to inspect or hand-copy it.
+	KeepArchive bool
+}
+
+// state is the baton passed between a project's steps.
+type state struct {
+	// outDir is the scratch directory given to the build via {out}.
+	outDir string
+
+	// artifactDir is what gets packed.
+	artifactDir string
+
+	// archivePath is the packed file on local disk.
+	archivePath string
+
+	// client is the SSH connection, opened by ship and reused by hook.
+	client *transport.Client
+}
+
+// Pipeline assembles the steps for one project.
+//
+// Steps are added only when they have something to do: a project with a
+// prebuilt artifact gets no build step, and one with no post_ship hook gets no
+// hook step, so the UI never shows a row that is going to be a no-op.
+func Pipeline(cfg *config.Config, p *config.Project, opts Options) engine.Pipeline {
+	st := &state{}
+
+	var steps []engine.Step
+	if p.Build != "" {
+		steps = append(steps, &buildStep{cfg: cfg, p: p, st: st, opts: opts})
+	} else {
+		// Nothing to build, so resolve the artifact directory up front.
+		steps = append(steps, &resolveStep{cfg: cfg, p: p, st: st})
+	}
+
+	steps = append(steps,
+		&packStep{cfg: cfg, p: p, st: st, opts: opts},
+		&shipStep{cfg: cfg, p: p, st: st, opts: opts},
+	)
+
+	if p.PostShip != "" {
+		steps = append(steps, &hookStep{cfg: cfg, p: p, st: st, opts: opts})
+	}
+
+	return engine.Pipeline{Project: p.Name, Steps: steps}
+}

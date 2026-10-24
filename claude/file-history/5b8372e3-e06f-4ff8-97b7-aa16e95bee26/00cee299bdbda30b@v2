@@ -1,0 +1,76 @@
+package steps
+
+import (
+	"context"
+	"fmt"
+	"path"
+	"path/filepath"
+	"time"
+
+	"github.com/rudy/deployer/internal/config"
+	"github.com/rudy/deployer/internal/engine"
+	"github.com/rudy/deployer/internal/transport"
+)
+
+// shipStep opens the SSH connection and sends the archive over whichever
+// transport the project asked for.
+//
+// It also owns the connection for the rest of the pipeline: the handoff hook
+// reuses it rather than dialling a second time.
+type shipStep struct {
+	cfg  *config.Config
+	p    *config.Project
+	st   *state
+	opts Options
+}
+
+func (s *shipStep) Name() string { return "ship" }
+
+func (s *shipStep) Run(ctx context.Context, em *engine.Emitter) error {
+	target, ok := s.cfg.Targets[s.p.Target]
+	if !ok {
+		return fmt.Errorf("unknown target %q", s.p.Target)
+	}
+
+	tr, err := transport.Get(s.p.Transport)
+	if err != nil {
+		return err
+	}
+
+	remote := path.Join(s.p.Remote, filepath.Base(s.st.archivePath))
+
+	if s.opts.DryRun {
+		em.Log("would send via %s to %s@%s:%d", tr.Name(), target.User, target.Host, target.Port)
+		em.Log("  -> %s", remote)
+		return nil
+	}
+
+	start := time.Now()
+
+	client, err := transport.Dial(ctx, target)
+	if err != nil {
+		return err
+	}
+	// Held open for the handoff step; closed in Cleanup once the whole
+	// pipeline has finished.
+	s.st.client = client
+
+	em.Log("connected to %s@%s:%d (%s)", target.User, target.Host, target.Port, tr.Name())
+
+	if err := tr.Send(ctx, client, s.st.archivePath, s.p.Remote, em.Progress); err != nil {
+		return err
+	}
+
+	elapsed := time.Since(start)
+	em.Log("delivered %s in %s", remote, elapsed.Round(time.Millisecond))
+	return nil
+}
+
+// Cleanup closes the SSH connection. Steps are cleaned up in reverse order, so
+// this runs after the handoff hook has had its turn with the client.
+func (s *shipStep) Cleanup() {
+	if s.st.client != nil {
+		_ = s.st.client.Close()
+		s.st.client = nil
+	}
+}

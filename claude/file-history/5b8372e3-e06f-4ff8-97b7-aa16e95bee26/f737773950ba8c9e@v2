@@ -1,0 +1,244 @@
+// Package transport opens SSH connections and moves artifacts over them.
+//
+// The file-sending half sits behind the Transport interface so a project can
+// choose how its archive travels. The connection half is shared: every deploy
+// needs a remote mkdir and most need a post-ship hook, whichever sender runs.
+package transport
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"fmt"
+	"net"
+	"os"
+	"strings"
+	"time"
+
+	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/agent"
+	"golang.org/x/crypto/ssh/knownhosts"
+
+	"github.com/rudy/deployer/internal/config"
+)
+
+// Client is a live SSH connection to one target.
+type Client struct {
+	ssh    *ssh.Client
+	target *config.Target
+}
+
+// Dial connects to the target, authenticating with its key file if one is
+// configured and falling back to the SSH agent otherwise.
+func Dial(ctx context.Context, t *config.Target) (*Client, error) {
+	auth, err := authMethods(t)
+	if err != nil {
+		return nil, err
+	}
+
+	hostKey, err := hostKeyCallback(t)
+	if err != nil {
+		return nil, err
+	}
+
+	user := t.User
+	if user == "" {
+		user = os.Getenv("USER")
+	}
+
+	cfg := &ssh.ClientConfig{
+		User:            user,
+		Auth:            auth,
+		HostKeyCallback: hostKey,
+		Timeout:         15 * time.Second,
+	}
+
+	addr := net.JoinHostPort(t.Host, fmt.Sprint(t.Port))
+
+	// Dial through a context-aware dialer so a hung connect is cancellable
+	// rather than pinning the whole deploy for the full timeout.
+	d := net.Dialer{Timeout: cfg.Timeout}
+	conn, err := d.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("dial %s: %w", addr, err)
+	}
+
+	sshConn, chans, reqs, err := ssh.NewClientConn(conn, addr, cfg)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("ssh handshake with %s: %w", addr, err)
+	}
+
+	return &Client{ssh: ssh.NewClient(sshConn, chans, reqs), target: t}, nil
+}
+
+// Target is the configuration this client connected with. Transports that
+// shell out to an external binary need it to rebuild the command line.
+func (c *Client) Target() *config.Target { return c.target }
+
+// SSH exposes the underlying connection for transports that layer a
+// subsystem on top of it, such as SFTP.
+func (c *Client) SSH() *ssh.Client { return c.ssh }
+
+// Close hangs up.
+func (c *Client) Close() error { return c.ssh.Close() }
+
+// Run executes a command on the target and returns its combined output.
+//
+// The command is wrapped for the target's shell, so a post_ship hook can be
+// written the same way whether it lands on a Linux box or a Windows one.
+func (c *Client) Run(ctx context.Context, cmd string) (string, error) {
+	sess, err := c.ssh.NewSession()
+	if err != nil {
+		return "", err
+	}
+	defer sess.Close()
+
+	var out bytes.Buffer
+	sess.Stdout = &out
+	sess.Stderr = &out
+
+	done := make(chan error, 1)
+	go func() { done <- sess.Run(c.wrap(cmd)) }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			return out.String(), fmt.Errorf("%w: %s", err, strings.TrimSpace(out.String()))
+		}
+		return out.String(), nil
+	case <-ctx.Done():
+		// Signalling is best-effort; some servers ignore it, so close the
+		// session too and let the goroutine unwind.
+		_ = sess.Signal(ssh.SIGKILL)
+		return out.String(), ctx.Err()
+	}
+}
+
+// MkdirAll creates a remote directory and any missing parents.
+func (c *Client) MkdirAll(ctx context.Context, dir string) error {
+	var cmd string
+	switch c.target.Shell {
+	case "powershell":
+		cmd = fmt.Sprintf("New-Item -ItemType Directory -Force -Path %s | Out-Null", psQuote(dir))
+	case "cmd":
+		cmd = fmt.Sprintf(`if not exist %q mkdir %q`, dir, dir)
+	default:
+		cmd = fmt.Sprintf("mkdir -p %s", shQuote(dir))
+	}
+	if _, err := c.Run(ctx, cmd); err != nil {
+		return fmt.Errorf("mkdir %s: %w", dir, err)
+	}
+	return nil
+}
+
+// wrap adapts a command to the target's shell.
+func (c *Client) wrap(cmd string) string {
+	switch c.target.Shell {
+	case "powershell":
+		// -EncodedCommand takes UTF-16LE base64, which sidesteps the quoting
+		// problem entirely: the command can contain quotes, newlines and
+		// ampersands without any of them having to survive two shells.
+		return "powershell -NoProfile -NonInteractive -EncodedCommand " + psEncode(cmd)
+	case "cmd":
+		return "cmd /c " + cmdQuote(cmd)
+	default:
+		return cmd
+	}
+}
+
+// psEncode renders a command as UTF-16LE base64 for PowerShell's
+// -EncodedCommand.
+func psEncode(cmd string) string {
+	runes := []rune(cmd)
+	buf := make([]byte, 0, len(runes)*2)
+	for _, r := range runes {
+		if r > 0xFFFF {
+			// Outside the BMP: emit a surrogate pair.
+			r -= 0x10000
+			hi := 0xD800 + (r >> 10)
+			lo := 0xDC00 + (r & 0x3FF)
+			buf = append(buf, byte(hi), byte(hi>>8), byte(lo), byte(lo>>8))
+			continue
+		}
+		buf = append(buf, byte(r), byte(r>>8))
+	}
+	return base64.StdEncoding.EncodeToString(buf)
+}
+
+// shQuote wraps a string in single quotes for a POSIX shell.
+func shQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// psQuote wraps a string in single quotes for PowerShell, where a literal
+// single quote is doubled.
+func psQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
+// cmdQuote wraps a string in double quotes for cmd.exe. Its quoting rules are
+// genuinely inconsistent; this covers the paths we generate and nothing more,
+// which is one more reason powershell is the better setting for a Windows target.
+func cmdQuote(s string) string {
+	return `"` + strings.ReplaceAll(s, `"`, `\"`) + `"`
+}
+
+func authMethods(t *config.Target) ([]ssh.AuthMethod, error) {
+	var methods []ssh.AuthMethod
+
+	if t.Key != "" {
+		raw, err := os.ReadFile(t.Key)
+		if err != nil {
+			return nil, fmt.Errorf("read key %s: %w", t.Key, err)
+		}
+		signer, err := ssh.ParsePrivateKey(raw)
+		if err != nil {
+			if _, ok := err.(*ssh.PassphraseMissingError); ok {
+				return nil, fmt.Errorf(
+					"key %s is passphrase-protected; add it to your agent "+
+						"(ssh-add %s) and drop the key setting from the target",
+					t.Key, t.Key)
+			}
+			return nil, fmt.Errorf("parse key %s: %w", t.Key, err)
+		}
+		methods = append(methods, ssh.PublicKeys(signer))
+	}
+
+	// The agent is always worth offering as well: it covers passphrase-protected
+	// keys and forwarded credentials without any configuration.
+	if sock := os.Getenv("SSH_AUTH_SOCK"); sock != "" {
+		if conn, err := net.Dial("unix", sock); err == nil {
+			methods = append(methods, ssh.PublicKeysCallback(agent.NewClient(conn).Signers))
+		}
+	}
+
+	if len(methods) == 0 {
+		return nil, fmt.Errorf("no SSH credentials: set a key on the target or start an agent")
+	}
+	return methods, nil
+}
+
+func hostKeyCallback(t *config.Target) (ssh.HostKeyCallback, error) {
+	if t.InsecureSkipHostKeyCheck {
+		return ssh.InsecureIgnoreHostKey(), nil
+	}
+
+	kh := t.KnownHosts
+	if kh == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return nil, err
+		}
+		kh = home + "/.ssh/known_hosts"
+	}
+
+	cb, err := knownhosts.New(kh)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"read %s: %w (connect once by hand to record the host key, or set "+
+				"insecure_skip_host_key_check on the target for a throwaway box)",
+			kh, err)
+	}
+	return cb, nil
+}

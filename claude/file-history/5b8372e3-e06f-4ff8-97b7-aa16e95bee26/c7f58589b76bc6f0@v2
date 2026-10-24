@@ -1,0 +1,60 @@
+# Test plan, pointed at the throwaway container in compose.yml.
+#
+# The builds here are deliberately trivial: this plan exists to exercise the
+# pack / ship / handoff path, not to compile anything real. Swap a build line
+# for a real one when you want to test a genuine artifact end to end.
+
+jobs = 3
+
+[targets.local-test]
+host = "127.0.0.1"
+port = 2222
+user = "deploy"
+key  = "~/.local/keys/ssh/id_ed25519"
+# The container is rebuilt constantly, so its host key changes constantly.
+insecure_skip_host_key_check = true
+
+
+# A handful of small files: checks the happy path quickly.
+[[projects]]
+name  = "tiny"
+build = "mkdir -p {out}/nested && echo hello > {out}/a.txt && echo world > {out}/nested/b.txt && echo secret > {out}/nested/skipme.txt"
+exclude = ["nested/skipme.txt"]
+archive   = "tar.zst"
+transport = "sftp"
+target    = "local-test"
+remote    = "/config/artifacts/tiny"
+post_ship = "tar --zstd -tvf {archive}"
+
+
+# ~120 MB of incompressible data: checks that progress reporting, concurrent
+# SFTP writes and the .part rename all behave on something non-trivial.
+[[projects]]
+name  = "bulky"
+build = "mkdir -p {out} && head -c 120000000 /dev/urandom > {out}/blob.bin"
+archive   = "tar.zst"
+transport = "sftp"
+target    = "local-test"
+remote    = "/config/artifacts/bulky"
+post_ship = "ls -lh {archive}"
+
+
+# Same payload over the fallback transport, to keep the scp path honest.
+[[projects]]
+name  = "tiny-scp"
+build = "mkdir -p {out} && echo via-scp > {out}/a.txt"
+archive   = "tar.gz"
+transport = "scp"
+target    = "local-test"
+remote    = "/config/artifacts/tiny-scp"
+post_ship = "tar -tvf {archive}"
+
+
+# Expected to fail: confirms that one broken project does not take the other
+# three down with it, and that the interface shows the failure clearly.
+[[projects]]
+name      = "broken"
+build     = "echo 'about to fail' && exit 3"
+target    = "local-test"
+remote    = "/config/artifacts/broken"
+enabled   = false

@@ -1,0 +1,7 @@
+package steps
+
+import "path/filepath"
+
+func isAbs(p string) bool { return filepath.IsAbs(p) }
+
+func joinPath(base, p string) string { return filepath.Join(base, p) }

@@ -1,0 +1,297 @@
+[11:56:15 DBG] EFCore: info: 10/24/2026 11:56:15.865 RelationalEventId.CommandExecuted[20101] (Microsoft.EntityFrameworkCore.Database.Command)
+      Executed DbCommand (5ms) [Parameters=[@__companyMasterId_Value_0='1'], CommandType='Text', CommandTimeout='30']
+      SELECT [h].[Id], [h].[CategoryMasterID], [h].[CompanyMasterID], [h].[Description], [h].[EditUserDateTime], [h].[EditUserMasterId], [h].[EntryUserDateTime], [h].[EntryUserMasterId], [h].[Name], [h].[Status], [h].[SystemName]
+      FROM [HR_DefaultSalaryStructureTemplate] AS [h]
+      WHERE [h].[CompanyMasterID] = @__companyMasterId_Value_0
+      ORDER BY [h].[Name]
+[11:56:15 DBG]
+Request completed.
+Elapsed: 34 ms
+Path: /api/DefaultSalaryStructureTemplate/GetAll
+Query:
+Request:
+
+Headers:
+{"Accept": "application/json, text/plain, */*", "Connection": "keep-alive", "Host": "localhost:5043", "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1", "Accept-Encoding": "gzip, deflate, br, zstd", "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8", "Origin": "http://localhost:4200", "Referer": "http://localhost:4200/", "sec-ch-ua-platform": "\"iOS\"", "sec-ch-ua": "\"Not:A-Brand\";v=\"8\", \"Chromium\";v=\"156\", \"Google Chrome\";v=\"156\"", "sec-ch-ua-mobile": "?1", "Sec-Fetch-Site": "same-site", "Sec-Fetch-Mode": "cors", "Sec-Fetch-Dest": "empty"}
+Status Code: 200
+Response:
+{"isSuccess":true,"message":"Templates retrieved successfully.","templates":[{"id":1,"name":"Default Template for DeviTurnomatics","description":"Default template for FIX EMP DAILY sal structure","status":true,"companyMasterId":1},{"id":2,"name":"Devi Salary Offer Structure","status":true,"companyMasterId":1}]}
+
+[11:56:15 ERR] An exception occurred while iterating over the results of a query for context type 'SolutionOne_DataAccessLayer.Entities.HrmsystemContext'.
+Microsoft.Data.SqlClient.SqlException (0x80131904): Invalid object name 'HR_SalaryTotalLine'.
+   at System.Threading.Tasks.ContinuationResultTaskFromResultTask`2.InnerInvoke()
+   at System.Threading.ExecutionContext.RunInternal(ExecutionContext executionContext, ContextCallback callback, Object state)
+--- End of stack trace from previous location ---
+   at System.Threading.ExecutionContext.RunInternal(ExecutionContext executionContext, ContextCallback callback, Object state)
+   at System.Threading.Tasks.Task.ExecuteWithThreadLocal(Task& currentTaskSlot, Thread threadPoolThread)
+--- End of stack trace from previous location ---
+   at Microsoft.EntityFrameworkCore.Storage.RelationalCommand.ExecuteReaderAsync(RelationalCommandParameterObject parameterObject, CancellationToken cancellationToken)
+   at Microsoft.EntityFrameworkCore.Storage.RelationalCommand.ExecuteReaderAsync(RelationalCommandParameterObject parameterObject, CancellationToken cancellationToken)
+   at Microsoft.EntityFrameworkCore.Query.Internal.SingleQueryingEnumerable`1.AsyncEnumerator.InitializeReaderAsync(AsyncEnumerator enumerator, CancellationToken cancellationToken)
+   at Microsoft.EntityFrameworkCore.SqlServer.Storage.Internal.SqlServerExecutionStrategy.ExecuteAsync[TState,TResult](TState state, Func`4 operation, Func`4 verifySucceeded, CancellationToken cancellationToken)
+   at Microsoft.EntityFrameworkCore.Query.Internal.SingleQueryingEnumerable`1.AsyncEnumerator.MoveNextAsync()
+ClientConnectionId:c38c3cb0-5f16-4752-ad20-4df502505a1e
+Error Number:208,State:1,Class:16
+Microsoft.Data.SqlClient.SqlException (0x80131904): Invalid object name 'HR_SalaryTotalLine'.
+   at System.Threading.Tasks.ContinuationResultTaskFromResultTask`2.InnerInvoke()
+   at System.Threading.ExecutionContext.RunInternal(ExecutionContext executionContext, ContextCallback callback, Object state)
+--- End of stack trace from previous location ---
+   at System.Threading.ExecutionContext.RunInternal(ExecutionContext executionContext, ContextCallback callback, Object state)
+   at System.Threading.Tasks.Task.ExecuteWithThreadLocal(Task& currentTaskSlot, Thread threadPoolThread)
+--- End of stack trace from previous location ---
+   at Microsoft.EntityFrameworkCore.Storage.RelationalCommand.ExecuteReaderAsync(RelationalCommandParameterObject parameterObject, CancellationToken cancellationToken)
+   at Microsoft.EntityFrameworkCore.Storage.RelationalCommand.ExecuteReaderAsync(RelationalCommandParameterObject parameterObject, CancellationToken cancellationToken)
+   at Microsoft.EntityFrameworkCore.Query.Internal.SingleQueryingEnumerable`1.AsyncEnumerator.InitializeReaderAsync(AsyncEnumerator enumerator, CancellationToken cancellationToken)
+   at Microsoft.EntityFrameworkCore.SqlServer.Storage.Internal.SqlServerExecutionStrategy.ExecuteAsync[TState,TResult](TState state, Func`4 operation, Func`4 verifySucceeded, CancellationToken cancellationToken)
+   at Microsoft.EntityFrameworkCore.Query.Internal.SingleQueryingEnumerable`1.AsyncEnumerator.MoveNextAsync()
+ClientConnectionId:c38c3cb0-5f16-4752-ad20-4df502505a1e
+Error Number:208,State:1,Class:16
+[11:56:15 ERR] An exception occurred while iterating over the results of a query for context type 'SolutionOne_DataAccessLayer.Entities.HrmsystemContext'.
+Microsoft.Data.SqlClient.SqlException (0x80131904): Invalid column name 'ShowHeader'.
+Invalid column name 'TotalLabel'.
+   at System.Threading.Tasks.ContinuationResultTaskFromResultTask`2.InnerInvoke()
+   at System.Threading.ExecutionContext.RunInternal(ExecutionContext executionContext, ContextCallback callback, Object state)
+--- End of stack trace from previous location ---
+   at System.Threading.ExecutionContext.RunInternal(ExecutionContext executionContext, ContextCallback callback, Object state)
+   at System.Threading.Tasks.Task.ExecuteWithThreadLocal(Task& currentTaskSlot, Thread threadPoolThread)
+--- End of stack trace from previous location ---
+   at Microsoft.EntityFrameworkCore.Storage.RelationalCommand.ExecuteReaderAsync(RelationalCommandParameterObject parameterObject, CancellationToken cancellationToken)
+   at Microsoft.EntityFrameworkCore.Storage.RelationalCommand.ExecuteReaderAsync(RelationalCommandParameterObject parameterObject, CancellationToken cancellationToken)
+   at Microsoft.EntityFrameworkCore.Query.Internal.SingleQueryingEnumerable`1.AsyncEnumerator.InitializeReaderAsync(AsyncEnumerator enumerator, CancellationToken cancellationToken)
+   at Microsoft.EntityFrameworkCore.SqlServer.Storage.Internal.SqlServerExecutionStrategy.ExecuteAsync[TState,TResult](TState state, Func`4 operation, Func`4 verifySucceeded, CancellationToken cancellationToken)
+   at Microsoft.EntityFrameworkCore.Query.Internal.SingleQueryingEnumerable`1.AsyncEnumerator.MoveNextAsync()
+ClientConnectionId:eb083c36-1d06-4457-b844-a114aec6be86
+Error Number:207,State:1,Class:16
+Microsoft.Data.SqlClient.SqlException (0x80131904): Invalid column name 'ShowHeader'.
+Invalid column name 'TotalLabel'.
+   at System.Threading.Tasks.ContinuationResultTaskFromResultTask`2.InnerInvoke()
+   at System.Threading.ExecutionContext.RunInternal(ExecutionContext executionContext, ContextCallback callback, Object state)
+--- End of stack trace from previous location ---
+   at System.Threading.ExecutionContext.RunInternal(ExecutionContext executionContext, ContextCallback callback, Object state)
+   at System.Threading.Tasks.Task.ExecuteWithThreadLocal(Task& currentTaskSlot, Thread threadPoolThread)
+--- End of stack trace from previous location ---
+   at Microsoft.EntityFrameworkCore.Storage.RelationalCommand.ExecuteReaderAsync(RelationalCommandParameterObject parameterObject, CancellationToken cancellationToken)
+   at Microsoft.EntityFrameworkCore.Storage.RelationalCommand.ExecuteReaderAsync(RelationalCommandParameterObject parameterObject, CancellationToken cancellationToken)
+   at Microsoft.EntityFrameworkCore.Query.Internal.SingleQueryingEnumerable`1.AsyncEnumerator.InitializeReaderAsync(AsyncEnumerator enumerator, CancellationToken cancellationToken)
+   at Microsoft.EntityFrameworkCore.SqlServer.Storage.Internal.SqlServerExecutionStrategy.ExecuteAsync[TState,TResult](TState state, Func`4 operation, Func`4 verifySucceeded, CancellationToken cancellationToken)
+   at Microsoft.EntityFrameworkCore.Query.Internal.SingleQueryingEnumerable`1.AsyncEnumerator.MoveNextAsync()
+ClientConnectionId:eb083c36-1d06-4457-b844-a114aec6be86
+Error Number:207,State:1,Class:16
+[11:56:15 DBG] EFCore: fail: 10/24/2026 11:56:15.901 CoreEventId.QueryIterationFailed[10100] (Microsoft.EntityFrameworkCore.Query)
+      An exception occurred while iterating over the results of a query for context type 'SolutionOne_DataAccessLayer.Entities.HrmsystemContext'.
+      Microsoft.Data.SqlClient.SqlException (0x80131904): Invalid object name 'HR_SalaryTotalLine'.
+         at System.Threading.Tasks.ContinuationResultTaskFromResultTask`2.InnerInvoke()
+         at System.Threading.ExecutionContext.RunInternal(ExecutionContext executionContext, ContextCallback callback, Object state)
+      --- End of stack trace from previous location ---
+         at System.Threading.ExecutionContext.RunInternal(ExecutionContext executionContext, ContextCallback callback, Object state)
+         at System.Threading.Tasks.Task.ExecuteWithThreadLocal(Task& currentTaskSlot, Thread threadPoolThread)
+      --- End of stack trace from previous location ---
+         at Microsoft.EntityFrameworkCore.Storage.RelationalCommand.ExecuteReaderAsync(RelationalCommandParameterObject parameterObject, CancellationToken cancellationToken)
+         at Microsoft.EntityFrameworkCore.Storage.RelationalCommand.ExecuteReaderAsync(RelationalCommandParameterObject parameterObject, CancellationToken cancellationToken)
+         at Microsoft.EntityFrameworkCore.Query.Internal.SingleQueryingEnumerable`1.AsyncEnumerator.InitializeReaderAsync(AsyncEnumerator enumerator, CancellationToken cancellationToken)
+         at Microsoft.EntityFrameworkCore.SqlServer.Storage.Internal.SqlServerExecutionStrategy.ExecuteAsync[TState,TResult](TState state, Func`4 operation, Func`4 verifySucceeded, CancellationToken cancellationToken)
+         at Microsoft.EntityFrameworkCore.Query.Internal.SingleQueryingEnumerable`1.AsyncEnumerator.MoveNextAsync()
+      ClientConnectionId:c38c3cb0-5f16-4752-ad20-4df502505a1e
+      Error Number:208,State:1,Class:16
+[11:56:15 DBG] EFCore: fail: 10/24/2026 11:56:15.901 CoreEventId.QueryIterationFailed[10100] (Microsoft.EntityFrameworkCore.Query)
+      An exception occurred while iterating over the results of a query for context type 'SolutionOne_DataAccessLayer.Entities.HrmsystemContext'.
+      Microsoft.Data.SqlClient.SqlException (0x80131904): Invalid column name 'ShowHeader'.
+      Invalid column name 'TotalLabel'.
+         at System.Threading.Tasks.ContinuationResultTaskFromResultTask`2.InnerInvoke()
+         at System.Threading.ExecutionContext.RunInternal(ExecutionContext executionContext, ContextCallback callback, Object state)
+      --- End of stack trace from previous location ---
+         at System.Threading.ExecutionContext.RunInternal(ExecutionContext executionContext, ContextCallback callback, Object state)
+         at System.Threading.Tasks.Task.ExecuteWithThreadLocal(Task& currentTaskSlot, Thread threadPoolThread)
+      --- End of stack trace from previous location ---
+         at Microsoft.EntityFrameworkCore.Storage.RelationalCommand.ExecuteReaderAsync(RelationalCommandParameterObject parameterObject, CancellationToken cancellationToken)
+         at Microsoft.EntityFrameworkCore.Storage.RelationalCommand.ExecuteReaderAsync(RelationalCommandParameterObject parameterObject, CancellationToken cancellationToken)
+         at Microsoft.EntityFrameworkCore.Query.Internal.SingleQueryingEnumerable`1.AsyncEnumerator.InitializeReaderAsync(AsyncEnumerator enumerator, CancellationToken cancellationToken)
+         at Microsoft.EntityFrameworkCore.SqlServer.Storage.Internal.SqlServerExecutionStrategy.ExecuteAsync[TState,TResult](TState state, Func`4 operation, Func`4 verifySucceeded, CancellationToken cancellationToken)
+         at Microsoft.EntityFrameworkCore.Query.Internal.SingleQueryingEnumerable`1.AsyncEnumerator.MoveNextAsync()
+      ClientConnectionId:eb083c36-1d06-4457-b844-a114aec6be86
+      Error Number:207,State:1,Class:16
+[11:56:15 ERR] Error while retrieving salary total lines
+Microsoft.Data.SqlClient.SqlException (0x80131904): Invalid object name 'HR_SalaryTotalLine'.
+   at System.Threading.Tasks.ContinuationResultTaskFromResultTask`2.InnerInvoke()
+   at System.Threading.ExecutionContext.RunInternal(ExecutionContext executionContext, ContextCallback callback, Object state)
+--- End of stack trace from previous location ---
+   at System.Threading.ExecutionContext.RunInternal(ExecutionContext executionContext, ContextCallback callback, Object state)
+   at System.Threading.Tasks.Task.ExecuteWithThreadLocal(Task& currentTaskSlot, Thread threadPoolThread)
+--- End of stack trace from previous location ---
+   at Microsoft.EntityFrameworkCore.Storage.RelationalCommand.ExecuteReaderAsync(RelationalCommandParameterObject parameterObject, CancellationToken cancellationToken)
+   at Microsoft.EntityFrameworkCore.Storage.RelationalCommand.ExecuteReaderAsync(RelationalCommandParameterObject parameterObject, CancellationToken cancellationToken)
+   at Microsoft.EntityFrameworkCore.Query.Internal.SingleQueryingEnumerable`1.AsyncEnumerator.InitializeReaderAsync(AsyncEnumerator enumerator, CancellationToken cancellationToken)
+   at Microsoft.EntityFrameworkCore.SqlServer.Storage.Internal.SqlServerExecutionStrategy.ExecuteAsync[TState,TResult](TState state, Func`4 operation, Func`4 verifySucceeded, CancellationToken cancellationToken)
+   at Microsoft.EntityFrameworkCore.Query.Internal.SingleQueryingEnumerable`1.AsyncEnumerator.MoveNextAsync()
+   at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ToListAsync[TSource](IQueryable`1 source, CancellationToken cancellationToken)
+   at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ToListAsync[TSource](IQueryable`1 source, CancellationToken cancellationToken)
+   at SolutionOne_DataAccessLayer.Repositories.HR.Implementation.HrSalaryTotalLineRepository.GetAllItems(Nullable`1 companyMasterId) in /home/rudy/docs/office/hrms/HRMS_BackEnd/SolutionOne_DataAccessLayer/Repositories/HR/Implementation/HrSalaryTotalLineRepository.cs:line 23
+   at SolutionOne_BusinessLogicLayer.Services.HR.Implematation.SalaryTotalLineService.ReadList(Func`1 read, String what) in /home/rudy/docs/office/hrms/HRMS_BackEnd/SolutionOne_BusinessLogicLayer/Services/HR/Implematation/SalaryTotalLineService.cs:line 256
+ClientConnectionId:c38c3cb0-5f16-4752-ad20-4df502505a1e
+Error Number:208,State:1,Class:16
+[11:56:15 ERR] Error while retrieving salary buckets
+Microsoft.Data.SqlClient.SqlException (0x80131904): Invalid column name 'ShowHeader'.
+Invalid column name 'TotalLabel'.
+   at System.Threading.Tasks.ContinuationResultTaskFromResultTask`2.InnerInvoke()
+   at System.Threading.ExecutionContext.RunInternal(ExecutionContext executionContext, ContextCallback callback, Object state)
+--- End of stack trace from previous location ---
+   at System.Threading.ExecutionContext.RunInternal(ExecutionContext executionContext, ContextCallback callback, Object state)
+   at System.Threading.Tasks.Task.ExecuteWithThreadLocal(Task& currentTaskSlot, Thread threadPoolThread)
+--- End of stack trace from previous location ---
+   at Microsoft.EntityFrameworkCore.Storage.RelationalCommand.ExecuteReaderAsync(RelationalCommandParameterObject parameterObject, CancellationToken cancellationToken)
+   at Microsoft.EntityFrameworkCore.Storage.RelationalCommand.ExecuteReaderAsync(RelationalCommandParameterObject parameterObject, CancellationToken cancellationToken)
+   at Microsoft.EntityFrameworkCore.Query.Internal.SingleQueryingEnumerable`1.AsyncEnumerator.InitializeReaderAsync(AsyncEnumerator enumerator, CancellationToken cancellationToken)
+   at Microsoft.EntityFrameworkCore.SqlServer.Storage.Internal.SqlServerExecutionStrategy.ExecuteAsync[TState,TResult](TState state, Func`4 operation, Func`4 verifySucceeded, CancellationToken cancellationToken)
+   at Microsoft.EntityFrameworkCore.Query.Internal.SingleQueryingEnumerable`1.AsyncEnumerator.MoveNextAsync()
+   at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ToListAsync[TSource](IQueryable`1 source, CancellationToken cancellationToken)
+   at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ToListAsync[TSource](IQueryable`1 source, CancellationToken cancellationToken)
+   at SolutionOne_DataAccessLayer.Repositories.HR.Implementation.HrSalaryBucketMasterRepository.GetAllItems(Nullable`1 companyMasterId) in /home/rudy/docs/office/hrms/HRMS_BackEnd/SolutionOne_DataAccessLayer/Repositories/HR/Implementation/HrSalaryBucketMasterRepository.cs:line 28
+   at SolutionOne_BusinessLogicLayer.Services.HR.Implematation.SalaryBucketMasterService.GetAllItems() in /home/rudy/docs/office/hrms/HRMS_BackEnd/SolutionOne_BusinessLogicLayer/Services/HR/Implematation/SalaryBucketMasterService.cs:line 38
+ClientConnectionId:eb083c36-1d06-4457-b844-a114aec6be86
+Error Number:207,State:1,Class:16
+[11:56:15 DBG] EFCore: info: 10/24/2026 11:56:15.914 RelationalEventId.CommandExecuted[20101] (Microsoft.EntityFrameworkCore.Database.Command)
+      Executed DbCommand (56ms) [Parameters=[@__companyMasterId_Value_0='1'], CommandType='Text', CommandTimeout='30']
+      SELECT [h].[DesignationMasterID], [h].[CompanyMasterID], [h].[Description], [h].[DesignationCode], [h].[DesignationName], [h].[EditDateTime], [h].[EditMasterID], [h].[EntryDateTime], [h].[EntryMasterId], [h].[FormID], [h].[Status], [h].[SystemName], [h].[UnitMasterID]
+      FROM [HR_DesignationMaster] AS [h]
+      WHERE [h].[CompanyMasterID] = @__companyMasterId_Value_0
+      ORDER BY [h].[DesignationName]
+[11:56:15 DBG] EFCore: info: 10/24/2026 11:56:15.922 RelationalEventId.CommandExecuted[20101] (Microsoft.EntityFrameworkCore.Database.Command)
+      Executed DbCommand (8ms) [Parameters=[@__companyMasterId_Value_0='1'], CommandType='Text', CommandTimeout='30']
+      SELECT [h].[Id], [h].[BodyContent], [h].[CompanyMasterID], [h].[DepartmentMasterID], [h].[DesignationMasterID], [h].[EditUserDateTime], [h].[EditUserMasterId], [h].[EmploymentType], [h].[EntryUserDateTime], [h].[EntryUserMasterId], [h].[FooterConfigJson], [h].[HeaderConfigJson], [h].[Name], [h].[Status], [h].[SystemName], [h0].[DepartmentMasterID], [h0].[CompanyMasterID], [h0].[DepartmentCode], [h0].[DepartmentName], [h0].[Description], [h0].[EditDateTime], [h0].[EditMasterID], [h0].[EntryDateTime], [h0].[EntryMasterId], [h0].[FormID], [h0].[Status], [h0].[SystemName], [h0].[UnitMasterID], [h1].[DesignationMasterID], [h1].[CompanyMasterID], [h1].[Description], [h1].[DesignationCode], [h1].[DesignationName], [h1].[EditDateTime], [h1].[EditMasterID], [h1].[EntryDateTime], [h1].[EntryMasterId], [h1].[FormID], [h1].[Status], [h1].[SystemName], [h1].[UnitMasterID]
+      FROM [HR_JoiningLetterTemplate] AS [h]
+      LEFT JOIN [HR_DepartmentMaster] AS [h0] ON [h].[DepartmentMasterID] = [h0].[DepartmentMasterID]
+      LEFT JOIN [HR_DesignationMaster] AS [h1] ON [h].[DesignationMasterID] = [h1].[DesignationMasterID]
+      WHERE [h].[CompanyMasterID] = @__companyMasterId_Value_0
+      ORDER BY [h].[Name]
+[11:56:15 DBG]
+Request completed.
+Elapsed: 80 ms
+Path: /api/DesignationMaster/GetAllDesignationMaster
+Query:
+Request:
+
+Headers:
+{"Accept": "application/json, text/plain, */*", "Connection": "keep-alive", "Host": "localhost:5043", "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1", "Accept-Encoding": "gzip, deflate, br, zstd", "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8", "Origin": "http://localhost:4200", "Referer": "http://localhost:4200/", "sec-ch-ua-platform": "\"iOS\"", "sec-ch-ua": "\"Not:A-Brand\";v=\"8\", \"Chromium\";v=\"156\", \"Google Chrome\";v=\"156\"", "sec-ch-ua-mobile": "?1", "Sec-Fetch-Site": "same-site", "Sec-Fetch-Mode": "cors", "Sec-Fetch-Dest": "empty"}
+Status Code: 200
+Response:
+{"isSuccess":true,"message":"Designation found successfully.","designations":[{"designationMasterID":2,"designationCode":"DG00000002","designationName":"Assistant Manager","status":true,"unitMasterId":1,"companyMasterId":1},{"designationMasterID":41,"designationCode":"DG00000041","designationName":"CEO","status":true,"unitMasterId":1,"companyMasterId":1},{"designationMasterID":46,"designationCode":"DG00000046","designationName":"Deputy General Manager","status":true,"unitMasterId":2,"companyMasterId":1},{"designationMasterID":44,"designationCode":"DG00000044","designationName":"Deputy Manager","status":true,"unitMasterId":1,"companyMasterId":1},{"designationMasterID":39,"designationCode":"DG00000039","designationName":"Director","status":true,"unitMasterId":2,"companyMasterId":1},{"designationMasterID":17,"designationCode":"DG00000017","designationName":"Driver","status":true,"unitMasterId":1,"companyMasterId":1},{"designationMasterID":30,"designationCode":"DG00000030","designationName":"Executive","status":true,"unitMasterId":2,"companyMasterId":1},{"designationMasterID":42,"designationCode":"DG00000042","designationName":"General Manager","status":true,"unitMasterId":1,"companyMasterId":1},{"designationMasterID":3,"designationCode":"DG00000003","designationName":"Helper","status":true,"unitMasterId":1,"companyMasterId":1},{"designationMasterID":16,"designationCode":"DG00000016","designationName":"Junior Executive","status":true,"unitMasterId":1,"companyMasterId":1},{"designationMasterID":5,"designationCode":"DG00000005","designationName":"Junior Helper","status":true,"unitMasterId":1,"companyMasterId":1},{"designationMasterID":11,"designationCode":"DG00000011","designationName":"Junior Machine Operater","status":true,"unitMasterId":1,"companyMasterId":1},{"designationMasterID":7,"designationCode":"DG00000007","designationName":"Junior Visual Inspector","status":true,"unitMasterId":1,"companyMasterId":1},{"designationMasterID":8,"designationCode":"DG00000008","designationName":"Machine Operater","status":true,"unitMasterId":1,"companyMasterId":1},{"designationMasterID":1,"designationCode":"DG00000001","designationName":"Manager","status":true,"unitMasterId":1,"companyMasterId":1},{"designationMasterID":20,"designationCode":"DG00000020","designationName":"Managing Director","status":true,"unitMasterId":1,"companyMasterId":1},{"designationMasterID":18,"designationCode":"DG00000018","designationName":"Peon","status":true,"unitMasterId":1,"companyMasterId":1},{"designationMasterID":15,"designationCode":"DG00000015","designationName":"Senior Executive","status":true,"unitMasterId":1,"companyMasterId":1},{"designationMasterID":9,"designationCode":"DG00000009","designationName":"Senior Helper","status":true,"unitMasterId":1,"companyMasterId":1},{"designationMasterID":4,"designationCode":"DG00000004","designationName":"Senior Machine Operater","status":true,"unitMasterId":1,"companyMasterId":1},{"designationMasterID":10,"designationCode":"DG00000010","designationName":"Senior Visual Inspector","status":true,"unitMasterId":1,"companyMasterId":1},{"designationMasterID":6,"designationCode":"DG00000006","designationName":"Visual Inspector","status":true,"unitMasterId":1,"companyMasterId":1}]}
+
+[11:56:15 DBG]
+Request completed.
+Elapsed: 212 ms
+Path: /api/SalaryTotalLine/GetAllItems
+Query:
+Request:
+
+Headers:
+{"Accept": "application/json, text/plain, */*", "Connection": "keep-alive", "Host": "localhost:5043", "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1", "Accept-Encoding": "gzip, deflate, br, zstd", "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8", "Origin": "http://localhost:4200", "Referer": "http://localhost:4200/", "sec-ch-ua-platform": "\"iOS\"", "sec-ch-ua": "\"Not:A-Brand\";v=\"8\", \"Chromium\";v=\"156\", \"Google Chrome\";v=\"156\"", "sec-ch-ua-mobile": "?1", "Sec-Fetch-Site": "same-site", "Sec-Fetch-Mode": "cors", "Sec-Fetch-Dest": "empty"}
+Status Code: 500
+Response:
+{"isSuccess":false,"message":"Invalid object name 'HR_SalaryTotalLine'.","items":[]}
+
+[11:56:15 DBG]
+Request completed.
+Elapsed: 213 ms
+Path: /api/SalaryBucketMaster/GetAllItems
+Query:
+Request:
+
+Headers:
+{"Accept": "application/json, text/plain, */*", "Connection": "keep-alive", "Host": "localhost:5043", "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1", "Accept-Encoding": "gzip, deflate, br, zstd", "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8", "Origin": "http://localhost:4200", "Referer": "http://localhost:4200/", "sec-ch-ua-platform": "\"iOS\"", "sec-ch-ua": "\"Not:A-Brand\";v=\"8\", \"Chromium\";v=\"156\", \"Google Chrome\";v=\"156\"", "sec-ch-ua-mobile": "?1", "Sec-Fetch-Site": "same-site", "Sec-Fetch-Mode": "cors", "Sec-Fetch-Dest": "empty"}
+Status Code: 500
+Response:
+{"isSuccess":false,"message":"Invalid column name 'ShowHeader'.\nInvalid column name 'TotalLabel'.","items":[]}
+
+[11:56:15 DBG] Action SolutionOneWebPortal_API.Controllers.HR.SalaryBucketMasterController.GetAllItems (SolutionOneWebPortal_API) args: {}
+[11:56:15 ERR] Failed executing DbCommand (3ms) [Parameters=[@__companyMasterId_Value_0='1'], CommandType='Text', CommandTimeout='30']
+SELECT [h].[Id], [h].[CompanyMasterID], [h].[EditUserDateTime], [h].[EditUserMasterId], [h].[EntryUserDateTime], [h].[EntryUserMasterId], [h].[FormulaRole], [h].[Key], [h].[Name], [h].[ShowHeader], [h].[SrNo], [h].[Status], [h].[SystemName], [h].[TotalLabel]
+FROM [HR_SalaryBucketMaster] AS [h]
+WHERE [h].[CompanyMasterID] = @__companyMasterId_Value_0
+ORDER BY [h].[SrNo], [h].[Name]
+[11:56:15 DBG]
+Request completed.
+Elapsed: 233 ms
+Path: /api/JoiningLetterTemplate/GetAllTemplates
+Query:
+Request:
+
+Headers:
+{"Accept": "application/json, text/plain, */*", "Connection": "keep-alive", "Host": "localhost:5043", "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1", "Accept-Encoding": "gzip, deflate, br, zstd", "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8", "Origin": "http://localhost:4200", "Referer": "http://localhost:4200/", "sec-ch-ua-platform": "\"iOS\"", "sec-ch-ua": "\"Not:A-Brand\";v=\"8\", \"Chromium\";v=\"156\", \"Google Chrome\";v=\"156\"", "sec-ch-ua-mobile": "?1", "Sec-Fetch-Site": "same-site", "Sec-Fetch-Mode": "cors", "Sec-Fetch-Dest": "empty"}
+Status Code: 200
+Response:
+{"isSuccess":true,"message":"Joining letter templates retrieved successfully.","templates":[{"id":2,"name":"Default Joining Letter","bodyContent":"Greetings for the day! Welcome to **{{CompanyName}}**!\r\n\r\nWe are pleased to confirm your acceptance of our offer for the position of **{{DesignationName}} - {{DepartmentName}}**.\r\n\r\nWe are delighted to have you join our team and look forward to your contribution to the organization. Prior to your joining, we will share a list of documents required for the joining formalities. You are requested to keep the necessary documents ready and carry valid proof of identity on your date of joining.\r\n\r\nTo ensure a smooth transition into your new role, you will be introduced to your colleagues, supervisors, and the Human Resources team during your initial days. They will be available to support and guide you as you take on your new responsibilities.\r\n\r\nPlease treat this email as the final confirmation from our end. We request you to kindly acknowledge and confirm your acceptance by replying to this email.\r\n\r\nMeanwhile, please share a copy of your accepted resignation letter from your current organization, along with your confirmed date of joining, so that we can proceed with the issuance of your formal Offer Letter.\r\n\r\nFor any queries or assistance, please feel free to contact us at 7600400314 / 7600400931 or email us at hr@deviindia.com.\r\n\r\nOnce again, congratulations! We look forward to welcoming you to the **{{CompanyName}}** family.","headerConfigJson":"{\"showLogo\":true,\"logoOverrideUrl\":null,\"logoOverridePath\":null,\"companyNameOverride\":null,\"companyAddressOverride\":null,\"showTitle\":true,\"titleOverride\":\"Job Confirmation Letter\",\"titlePosition\":\"Middle\",\"showLetterDetails\":false,\"letterDetailsPosition\":\"Right\",\"titleBarPageVisibility\":\"AllPages\",\"fontType\":\"Calibri\"}","footerConfigJson":"{\"includeFooter\":true,\"closingSalutationText\":\"Best Regards,\\n\\n**HR Department**\\n{{CompanyName}}\"}","status":true,"companyMasterId":1},{"id":1,"name":"Joining Letter","departmentMasterId":1,"departmentName":"Quality","designationMasterId":1,"designationName":"Manager","employmentType":"Full Time","bodyContent":"Dear {{CandidateName}},\r\n\r\nWe are pleased to confirm your joining with {{CompanyName}} as {{DesignationName}} in the {{DepartmentName}} {{DesignationName}}, effective from {{JoiningDate}}.\r\n\r\nYou are requested to report to Reporting Manager and carry out the duties and responsibilities assigned to you from time to time.\r\n\r\nYour employment with the Company will be subject to the terms and conditions mentioned in your Offer/Appointment Letter and the Company's policies, rules, and regulations as applicable.\r\n\r\nWe welcome you to {{CompanyName}} and wish you a successful and rewarding career with us.\r\n\r\nYours sincerely,\r\n\r\nFor {{CompanyName}}\r\n\r\nPooja\r\nHR Department\r\n{{CompanyName}}\r\n","headerConfigJson":"{\"showLogo\":true,\"companyNameOverride\":null,\"companyAddressOverride\":null}","footerConfigJson":"{\"includeFooter\":true,\"closingSalutationText\":null}","status":true,"companyMasterId":1}]}
+
+[11:56:15 DBG] EFCore: fail: 10/24/2026 11:56:15.951 RelationalEventId.CommandError[20102] (Microsoft.EntityFrameworkCore.Database.Command)
+      Failed executing DbCommand (3ms) [Parameters=[@__companyMasterId_Value_0='1'], CommandType='Text', CommandTimeout='30']
+      SELECT [h].[Id], [h].[CompanyMasterID], [h].[EditUserDateTime], [h].[EditUserMasterId], [h].[EntryUserDateTime], [h].[EntryUserMasterId], [h].[FormulaRole], [h].[Key], [h].[Name], [h].[ShowHeader], [h].[SrNo], [h].[Status], [h].[SystemName], [h].[TotalLabel]
+      FROM [HR_SalaryBucketMaster] AS [h]
+      WHERE [h].[CompanyMasterID] = @__companyMasterId_Value_0
+      ORDER BY [h].[SrNo], [h].[Name]
+[11:56:15 ERR] An exception occurred while iterating over the results of a query for context type 'SolutionOne_DataAccessLayer.Entities.HrmsystemContext'.
+Microsoft.Data.SqlClient.SqlException (0x80131904): Invalid column name 'ShowHeader'.
+Invalid column name 'TotalLabel'.
+   at System.Threading.Tasks.ContinuationResultTaskFromResultTask`2.InnerInvoke()
+   at System.Threading.ExecutionContext.RunInternal(ExecutionContext executionContext, ContextCallback callback, Object state)
+--- End of stack trace from previous location ---
+   at System.Threading.ExecutionContext.RunInternal(ExecutionContext executionContext, ContextCallback callback, Object state)
+   at System.Threading.Tasks.Task.ExecuteWithThreadLocal(Task& currentTaskSlot, Thread threadPoolThread)
+--- End of stack trace from previous location ---
+   at Microsoft.EntityFrameworkCore.Storage.RelationalCommand.ExecuteReaderAsync(RelationalCommandParameterObject parameterObject, CancellationToken cancellationToken)
+   at Microsoft.EntityFrameworkCore.Storage.RelationalCommand.ExecuteReaderAsync(RelationalCommandParameterObject parameterObject, CancellationToken cancellationToken)
+   at Microsoft.EntityFrameworkCore.Query.Internal.SingleQueryingEnumerable`1.AsyncEnumerator.InitializeReaderAsync(AsyncEnumerator enumerator, CancellationToken cancellationToken)
+   at Microsoft.EntityFrameworkCore.SqlServer.Storage.Internal.SqlServerExecutionStrategy.ExecuteAsync[TState,TResult](TState state, Func`4 operation, Func`4 verifySucceeded, CancellationToken cancellationToken)
+   at Microsoft.EntityFrameworkCore.Query.Internal.SingleQueryingEnumerable`1.AsyncEnumerator.MoveNextAsync()
+ClientConnectionId:f8891905-de0a-4a50-99e9-b4d75754b17a
+Error Number:207,State:1,Class:16
+Microsoft.Data.SqlClient.SqlException (0x80131904): Invalid column name 'ShowHeader'.
+Invalid column name 'TotalLabel'.
+   at System.Threading.Tasks.ContinuationResultTaskFromResultTask`2.InnerInvoke()
+   at System.Threading.ExecutionContext.RunInternal(ExecutionContext executionContext, ContextCallback callback, Object state)
+--- End of stack trace from previous location ---
+   at System.Threading.ExecutionContext.RunInternal(ExecutionContext executionContext, ContextCallback callback, Object state)
+   at System.Threading.Tasks.Task.ExecuteWithThreadLocal(Task& currentTaskSlot, Thread threadPoolThread)
+--- End of stack trace from previous location ---
+   at Microsoft.EntityFrameworkCore.Storage.RelationalCommand.ExecuteReaderAsync(RelationalCommandParameterObject parameterObject, CancellationToken cancellationToken)
+   at Microsoft.EntityFrameworkCore.Storage.RelationalCommand.ExecuteReaderAsync(RelationalCommandParameterObject parameterObject, CancellationToken cancellationToken)
+   at Microsoft.EntityFrameworkCore.Query.Internal.SingleQueryingEnumerable`1.AsyncEnumerator.InitializeReaderAsync(AsyncEnumerator enumerator, CancellationToken cancellationToken)
+   at Microsoft.EntityFrameworkCore.SqlServer.Storage.Internal.SqlServerExecutionStrategy.ExecuteAsync[TState,TResult](TState state, Func`4 operation, Func`4 verifySucceeded, CancellationToken cancellationToken)
+   at Microsoft.EntityFrameworkCore.Query.Internal.SingleQueryingEnumerable`1.AsyncEnumerator.MoveNextAsync()
+ClientConnectionId:f8891905-de0a-4a50-99e9-b4d75754b17a
+Error Number:207,State:1,Class:16
+[11:56:15 DBG] EFCore: fail: 10/24/2026 11:56:15.955 CoreEventId.QueryIterationFailed[10100] (Microsoft.EntityFrameworkCore.Query)
+      An exception occurred while iterating over the results of a query for context type 'SolutionOne_DataAccessLayer.Entities.HrmsystemContext'.
+      Microsoft.Data.SqlClient.SqlException (0x80131904): Invalid column name 'ShowHeader'.
+      Invalid column name 'TotalLabel'.
+         at System.Threading.Tasks.ContinuationResultTaskFromResultTask`2.InnerInvoke()
+         at System.Threading.ExecutionContext.RunInternal(ExecutionContext executionContext, ContextCallback callback, Object state)
+      --- End of stack trace from previous location ---
+         at System.Threading.ExecutionContext.RunInternal(ExecutionContext executionContext, ContextCallback callback, Object state)
+         at System.Threading.Tasks.Task.ExecuteWithThreadLocal(Task& currentTaskSlot, Thread threadPoolThread)
+      --- End of stack trace from previous location ---
+         at Microsoft.EntityFrameworkCore.Storage.RelationalCommand.ExecuteReaderAsync(RelationalCommandParameterObject parameterObject, CancellationToken cancellationToken)
+         at Microsoft.EntityFrameworkCore.Storage.RelationalCommand.ExecuteReaderAsync(RelationalCommandParameterObject parameterObject, CancellationToken cancellationToken)
+         at Microsoft.EntityFrameworkCore.Query.Internal.SingleQueryingEnumerable`1.AsyncEnumerator.InitializeReaderAsync(AsyncEnumerator enumerator, CancellationToken cancellationToken)
+         at Microsoft.EntityFrameworkCore.SqlServer.Storage.Internal.SqlServerExecutionStrategy.ExecuteAsync[TState,TResult](TState state, Func`4 operation, Func`4 verifySucceeded, CancellationToken cancellationToken)
+         at Microsoft.EntityFrameworkCore.Query.Internal.SingleQueryingEnumerable`1.AsyncEnumerator.MoveNextAsync()
+      ClientConnectionId:f8891905-de0a-4a50-99e9-b4d75754b17a
+      Error Number:207,State:1,Class:16
+[11:56:15 ERR] Error while retrieving salary buckets
+Microsoft.Data.SqlClient.SqlException (0x80131904): Invalid column name 'ShowHeader'.
+Invalid column name 'TotalLabel'.
+   at System.Threading.Tasks.ContinuationResultTaskFromResultTask`2.InnerInvoke()
+   at System.Threading.ExecutionContext.RunInternal(ExecutionContext executionContext, ContextCallback callback, Object state)
+--- End of stack trace from previous location ---
+   at System.Threading.ExecutionContext.RunInternal(ExecutionContext executionContext, ContextCallback callback, Object state)
+   at System.Threading.Tasks.Task.ExecuteWithThreadLocal(Task& currentTaskSlot, Thread threadPoolThread)
+--- End of stack trace from previous location ---
+   at Microsoft.EntityFrameworkCore.Storage.RelationalCommand.ExecuteReaderAsync(RelationalCommandParameterObject parameterObject, CancellationToken cancellationToken)
+   at Microsoft.EntityFrameworkCore.Storage.RelationalCommand.ExecuteReaderAsync(RelationalCommandParameterObject parameterObject, CancellationToken cancellationToken)
+   at Microsoft.EntityFrameworkCore.Query.Internal.SingleQueryingEnumerable`1.AsyncEnumerator.InitializeReaderAsync(AsyncEnumerator enumerator, CancellationToken cancellationToken)
+   at Microsoft.EntityFrameworkCore.SqlServer.Storage.Internal.SqlServerExecutionStrategy.ExecuteAsync[TState,TResult](TState state, Func`4 operation, Func`4 verifySucceeded, CancellationToken cancellationToken)
+   at Microsoft.EntityFrameworkCore.Query.Internal.SingleQueryingEnumerable`1.AsyncEnumerator.MoveNextAsync()
+   at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ToListAsync[TSource](IQueryable`1 source, CancellationToken cancellationToken)
+   at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ToListAsync[TSource](IQueryable`1 source, CancellationToken cancellationToken)
+   at SolutionOne_DataAccessLayer.Repositories.HR.Implementation.HrSalaryBucketMasterRepository.GetAllItems(Nullable`1 companyMasterId) in /home/rudy/docs/office/hrms/HRMS_BackEnd/SolutionOne_DataAccessLayer/Repositories/HR/Implementation/HrSalaryBucketMasterRepository.cs:line 28
+   at SolutionOne_BusinessLogicLayer.Services.HR.Implematation.SalaryBucketMasterService.GetAllItems() in /home/rudy/docs/office/hrms/HRMS_BackEnd/SolutionOne_BusinessLogicLayer/Services/HR/Implematation/SalaryBucketMasterService.cs:line 38
+ClientConnectionId:f8891905-de0a-4a50-99e9-b4d75754b17a
+Error Number:207,State:1,Class:16

@@ -1,0 +1,34 @@
+using System.ComponentModel.DataAnnotations;
+
+namespace SubscriptionPortal.Core.DTOs.Account
+{
+    /// <summary>
+    /// Deliberately minimal - just enough to create an account. Product/plan selection (Demo or
+    /// Purchase) happens later from the dashboard via ISubscriptionService.ActivateProductAsync,
+    /// not at signup time.
+    /// </summary>
+    public class SignupRequest
+    {
+        [Required]
+        [StringLength(200, MinimumLength = 2)]
+        public string CompanyName { get; set; } = string.Empty;
+
+        [Required]
+        [StringLength(150, MinimumLength = 2)]
+        public string AdminName { get; set; } = string.Empty;
+
+        [Required]
+        [StringLength(256)]
+        [EmailAddress]
+        public string AdminEmail { get; set; } = string.Empty;
+
+        // Contact Number is optional for now - uncomment these to make it mandatory again.
+        // When mandatory, AccountService.SignupAsync's own manual format check becomes a
+        // harmless double-check (ModelState validation runs first either way).
+        // [Required]
+        // [StringLength(20, MinimumLength = 7)]
+        // [RegularExpression(@"^\+?[0-9\-\s]{7,20}$", ErrorMessage = "Enter a valid contact number.")]
+        [StringLength(20)]
+        public string ContactNumber { get; set; } = string.Empty;
+    }
+}

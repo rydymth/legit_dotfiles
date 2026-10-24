@@ -1,0 +1,162 @@
+# deployer
+
+Builds projects in parallel, packs each one, ships it to its target over SSH,
+and runs a handoff hook. Live terminal interface; plain output for CI.
+
+It is deliberately stack-agnostic. A project is *a command that produces a
+directory* plus *somewhere to send it*, so .NET, Angular and a folder someone
+precompiled on a Windows box three weeks ago are all the same shape.
+
+## What it does not do
+
+It stops once the archive has landed and the `post_ship` hook has run.
+Unpacking it, swapping the live release, restarting services, health checks —
+that belongs to whatever runs on the server, not to the thing that delivered
+the file. Keeping that line sharp is why the tool stays small.
+
+## Architecture
+
+```
+  deploy.toml ──► config ──► steps.Pipeline ──┐
+                                               │
+                              ┌────────────────▼─────────────────┐
+                              │  engine.Runner                   │
+                              │  N pipelines in parallel,        │
+                              │  steps sequential within one     │
+                              └────────────────┬─────────────────┘
+                                               │ chan engine.Event
+                           ┌───────────────────┴──────────────────┐
+                           ▼                                      ▼
+                    ui/tui (Bubble Tea)                     ui/plain (CI)
+```
+
+The engine knows nothing about builds, archives or SSH — it runs `Step`s and
+emits events. Both renderers are pure consumers of that one stream, so neither
+is load-bearing and the engine stays testable without a terminal.
+
+| Package | Responsibility |
+|---|---|
+| `internal/config` | Parse and validate the plan. A config that survives `Load` is runnable. |
+| `internal/engine` | Event types, the `Step` interface, the parallel runner. |
+| `internal/steps` | `build` → `pack` → `ship` → `handoff`. The only package that knows what a deploy is. |
+| `internal/transport` | SSH connection, plus `sftp` and `scp` behind one interface. |
+| `internal/ui/*` | Rendering. No logic. |
+
+### Why SFTP is the default
+
+Both transports speak to the same sshd with the same credentials. SFTP runs
+over the connection we already hold, so we own the byte stream and progress is
+exact rather than scraped out of another program's output — and it never needs
+a shell on the far side, which matters on Windows where the default shell is
+anybody's guess. `scp` is kept as a genuine fallback: it shares none of that
+code path, so when something is wrong with ours it reaches the server the same
+way you would by hand.
+
+## Build
+
+```sh
+cd ~/docs/office/deployer
+go mod tidy          # resolve dependencies, write go.sum
+go build -o deploy ./cmd/deploy
+```
+
+## Use
+
+```sh
+cp deploy.example.toml deploy.toml   # then fill in the targets
+./deploy --list                      # show the plan
+./deploy --dry-run                   # walk it without touching anything
+./deploy                             # interactive
+./deploy --only hrms-api,hrms-web    # a subset
+./deploy --plain --verbose           # for CI, or a connection too thin for a TUI
+```
+
+Keys: `↑↓` pick a project · `a` follow all logs · `g`/`G` top/bottom · `q`
+cancel the run, again to quit.
+
+A clean run closes itself. A failed one stays up, because that log is why you
+ran it.
+
+## Config
+
+```toml
+jobs = 3                       # parallel projects; default NumCPU/2
+
+[targets.prod-linux]
+host = "1.2.3.4"
+port = 22                      # default 22
+user = "deploy"
+key  = "~/.ssh/id_ed25519"     # omit to use the SSH agent
+shell = "sh"                   # sh | powershell | cmd
+insecure_skip_host_key_check = false
+
+[[projects]]
+name      = "api"
+dir       = "../api"           # build working dir, relative to this file
+build     = "dotnet publish -c Release -o {out}"
+artifact  = "{out}"            # what gets packed; default "{out}"
+env       = { ASPNETCORE_ENVIRONMENT = "Production" }
+exclude   = ["wwwroot/Uploads", "*.pdb"]
+archive   = "tar.zst"          # tar.zst | tar.gz
+transport = "sftp"             # sftp | scp
+target    = "prod-linux"
+remote    = "/srv/artifacts/api"
+post_ship = "docker compose -f /srv/api/compose.yml up -d"
+enabled   = true
+```
+
+Placeholders: `{out}` and `{name}` in `build`/`artifact`; `{archive}`, `{dir}`
+and `{name}` in `post_ship`.
+
+Omit `build` to ship a directory that already exists — set `artifact` to it.
+
+### exclude
+
+Patterns match the path relative to the artifact root, three ways:
+
+- an exact path or anything under it — `wwwroot/OfferLetters`
+- a glob on the whole relative path — `logs/*.txt`
+- a glob on the file name alone — `*.pdb`
+
+**This is load-bearing.** `SolutionOneWebPortal/wwwroot` holds uploaded offer
+letters, joining letters, leave attachments and profile images — live user
+data that is not in the build output. If the server-side step extracts over
+the site root, anything not excluded here is anything that gets destroyed.
+The example plan excludes them; keep it that way.
+
+## Testing
+
+```sh
+docker compose -f test/compose.yml up -d
+./deploy --config test/deploy.test.toml
+docker compose -f test/compose.yml down -v      # reset
+```
+
+A free, disposable SSH target that exercises the real connection, both
+transports, the `.part` rename and the handoff hook. The test plan includes a
+~120 MB project so progress reporting and concurrent writes get a real
+workout, and a deliberately broken one (`--only broken`) to confirm a failure
+is contained to its own pipeline.
+
+It is Linux, so it does **not** cover the legacy Windows path. Before trusting
+a deploy to that box, run one against a Windows Server evaluation VM: IIS file
+locking, `tar.exe`'s zstd support and PowerShell-over-SSH quoting are all
+things only a real Windows target will tell you the truth about.
+
+## Known rough edges
+
+- `scp` reports no progress until the file lands. OpenSSH's progress output is
+  not stable across versions and parsing it would be worse than not having it.
+  Use `sftp` if you want a bar.
+- `tar.zst` needs a zstd-aware tar on the far side. Modern Linux is fine;
+  older Windows Server builds are not, hence `archive = "tar.gz"` per project.
+- Passphrase-protected keys are not prompted for. Add them to your agent;
+  the error says so.
+
+## Likely next
+
+- Content-hash skip — don't rebuild or re-upload an artifact that hasn't changed.
+- A `registry` transport: build an image and push it, for projects whose
+  server side is compose anyway. The `Transport` interface already allows it.
+- `rsync` transport for Linux targets, once the frontend's 201 MB is worth
+  delta-transferring.

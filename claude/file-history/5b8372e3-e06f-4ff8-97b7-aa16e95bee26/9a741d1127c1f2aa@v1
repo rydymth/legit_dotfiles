@@ -1,0 +1,240 @@
+// Package config loads and validates the deploy plan from a TOML file.
+//
+// Nothing here knows about .NET, Angular or any other stack: a project is
+// just a command that produces a directory, plus somewhere to send it.
+package config
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+
+	"github.com/BurntSushi/toml"
+)
+
+// Config is a whole deploy plan: how much to run at once, the machines we can
+// reach, and the projects to ship to them.
+type Config struct {
+	Jobs     int                `toml:"jobs"`
+	Targets  map[string]*Target `toml:"targets"`
+	Projects []*Project         `toml:"projects"`
+
+	// Dir is the directory holding the config file. Relative project paths
+	// resolve against it, so a plan is portable between checkouts.
+	Dir string `toml:"-"`
+}
+
+// Target is a machine we can open an SSH connection to.
+type Target struct {
+	Name string `toml:"-"`
+
+	Host string `toml:"host"`
+	Port int    `toml:"port"`
+	User string `toml:"user"`
+
+	// Key is a private key path. Empty means fall back to the SSH agent,
+	// which is the better habit anyway.
+	Key string `toml:"key"`
+
+	// Shell decides how post_ship hooks are quoted and invoked:
+	// "sh" (default), "powershell", or "cmd" for the legacy Windows boxes.
+	Shell string `toml:"shell"`
+
+	// KnownHosts defaults to ~/.ssh/known_hosts.
+	KnownHosts string `toml:"known_hosts"`
+
+	// InsecureSkipHostKeyCheck disables host key verification. Useful against
+	// a throwaway Docker test container, dangerous anywhere else.
+	InsecureSkipHostKeyCheck bool `toml:"insecure_skip_host_key_check"`
+}
+
+// Project is one buildable, shippable thing.
+type Project struct {
+	Name string `toml:"name"`
+
+	// Dir is the working directory for the build command.
+	Dir string `toml:"dir"`
+
+	// Build produces the artifact. "{out}" is replaced with a scratch
+	// directory we create. An empty Build means the artifact already exists
+	// on disk (a prebuilt folder, say) and we skip straight to packing.
+	Build string `toml:"build"`
+
+	// Artifact is the directory to pack, defaulting to "{out}".
+	Artifact string `toml:"artifact"`
+
+	// Env adds variables to the build command's environment.
+	Env map[string]string `toml:"env"`
+
+	// Exclude drops paths from the archive. Patterns match the path relative
+	// to the artifact root; a match on a directory drops everything under it.
+	// This is how live user data on the server survives a deploy.
+	Exclude []string `toml:"exclude"`
+
+	// Archive is "tar.zst" (default) or "tar.gz".
+	Archive string `toml:"archive"`
+
+	// Transport is "sftp" (default) or "scp".
+	Transport string `toml:"transport"`
+
+	// Target names an entry in Config.Targets.
+	Target string `toml:"target"`
+
+	// Remote is the directory on the target to drop the archive into.
+	Remote string `toml:"remote"`
+
+	// PostShip runs on the target once the archive has landed. This is the
+	// handoff point to whatever unpacks and runs it.
+	PostShip string `toml:"post_ship"`
+
+	// Enabled defaults to true; set false to park a project without deleting it.
+	Enabled *bool `toml:"enabled"`
+}
+
+// On reports whether the project should run.
+func (p *Project) On() bool { return p.Enabled == nil || *p.Enabled }
+
+var (
+	validArchives   = map[string]bool{"tar.zst": true, "tar.gz": true}
+	validTransports = map[string]bool{"sftp": true, "scp": true}
+	validShells     = map[string]bool{"sh": true, "powershell": true, "cmd": true}
+)
+
+// Load reads a config file, applies defaults and validates it. A config that
+// survives Load is one the engine can run without further checking.
+func Load(path string) (*Config, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	var c Config
+	if _, err := toml.DecodeFile(abs, &c); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	c.Dir = filepath.Dir(abs)
+
+	if c.Jobs <= 0 {
+		// Builds are hungry. Half the cores leaves the machine usable and
+		// stops four concurrent bundlers from swapping it to death.
+		if c.Jobs = runtime.NumCPU() / 2; c.Jobs < 1 {
+			c.Jobs = 1
+		}
+	}
+
+	for name, t := range c.Targets {
+		t.Name = name
+		if t.Port == 0 {
+			t.Port = 22
+		}
+		if t.Shell == "" {
+			t.Shell = "sh"
+		}
+		t.Key = expandUser(t.Key)
+		t.KnownHosts = expandUser(t.KnownHosts)
+	}
+
+	for _, p := range c.Projects {
+		if p.Archive == "" {
+			p.Archive = "tar.zst"
+		}
+		if p.Transport == "" {
+			p.Transport = "sftp"
+		}
+		if p.Artifact == "" {
+			p.Artifact = "{out}"
+		}
+	}
+
+	return &c, c.validate()
+}
+
+func (c *Config) validate() error {
+	if len(c.Projects) == 0 {
+		return fmt.Errorf("no projects defined")
+	}
+
+	for name, t := range c.Targets {
+		if t.Host == "" {
+			return fmt.Errorf("target %q: host is required", name)
+		}
+		if !validShells[t.Shell] {
+			return fmt.Errorf("target %q: shell %q must be sh, powershell or cmd", name, t.Shell)
+		}
+		if t.Key != "" {
+			if _, err := os.Stat(t.Key); err != nil {
+				return fmt.Errorf("target %q: key %s: %w", name, t.Key, err)
+			}
+		}
+	}
+
+	seen := map[string]bool{}
+	for i, p := range c.Projects {
+		where := fmt.Sprintf("project #%d", i+1)
+		if p.Name == "" {
+			return fmt.Errorf("%s: name is required", where)
+		}
+		where = fmt.Sprintf("project %q", p.Name)
+		if seen[p.Name] {
+			return fmt.Errorf("%s: duplicate name", where)
+		}
+		seen[p.Name] = true
+
+		if !validArchives[p.Archive] {
+			return fmt.Errorf("%s: archive %q must be tar.zst or tar.gz", where, p.Archive)
+		}
+		if !validTransports[p.Transport] {
+			return fmt.Errorf("%s: transport %q must be sftp or scp", where, p.Transport)
+		}
+		if p.Build == "" && !strings.Contains(p.Artifact, "{out}") {
+			// Fine: a prebuilt directory. But it has to actually be named.
+			if p.Artifact == "" {
+				return fmt.Errorf("%s: needs either build or artifact", where)
+			}
+		}
+		if p.Build == "" && strings.Contains(p.Artifact, "{out}") {
+			return fmt.Errorf("%s: artifact uses {out} but there is no build command to produce it", where)
+		}
+		if p.Target == "" {
+			return fmt.Errorf("%s: target is required", where)
+		}
+		if _, ok := c.Targets[p.Target]; !ok {
+			return fmt.Errorf("%s: unknown target %q", where, p.Target)
+		}
+		if p.Remote == "" {
+			return fmt.Errorf("%s: remote is required", where)
+		}
+	}
+	return nil
+}
+
+// ResolveDir turns a project's dir into an absolute path, relative to the
+// config file rather than to wherever the user happened to run the command.
+func (c *Config) ResolveDir(p *Project) string {
+	d := expandUser(p.Dir)
+	if d == "" {
+		return c.Dir
+	}
+	if filepath.IsAbs(d) {
+		return d
+	}
+	return filepath.Join(c.Dir, d)
+}
+
+func expandUser(p string) string {
+	if p == "" || !strings.HasPrefix(p, "~") {
+		return p
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return p
+	}
+	if p == "~" {
+		return home
+	}
+	if strings.HasPrefix(p, "~/") {
+		return filepath.Join(home, p[2:])
+	}
+	return p
+}

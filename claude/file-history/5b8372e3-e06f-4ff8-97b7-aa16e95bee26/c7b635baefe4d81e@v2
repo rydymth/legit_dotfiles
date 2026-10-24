@@ -1,0 +1,62 @@
+package steps
+
+import (
+	"context"
+	"fmt"
+	"path"
+	"path/filepath"
+	"strings"
+
+	"github.com/rudy/deployer/internal/config"
+	"github.com/rudy/deployer/internal/engine"
+)
+
+// hookStep runs the project's post_ship command on the target.
+//
+// This is the seam between this tool and whatever unpacks and runs the
+// artifact on the server. We deliberately stop here: deciding what to do with
+// a landed archive belongs to the compose project, not to the thing that
+// delivered it.
+type hookStep struct {
+	cfg  *config.Config
+	p    *config.Project
+	st   *state
+	opts Options
+}
+
+func (h *hookStep) Name() string { return "handoff" }
+
+func (h *hookStep) Run(ctx context.Context, em *engine.Emitter) error {
+	remote := path.Join(h.p.Remote, filepath.Base(h.st.archivePath))
+
+	// The hook almost always needs to know what just arrived, so the archive
+	// is offered as placeholders rather than having to be guessed at.
+	cmd := expand(h.p.PostShip, map[string]string{
+		"archive": remote,
+		"dir":     h.p.Remote,
+		"name":    h.p.Name,
+	})
+
+	if h.opts.DryRun {
+		em.Log("would run on %s:", h.p.Target)
+		em.Log("  %s", cmd)
+		return nil
+	}
+
+	if h.st.client == nil {
+		return fmt.Errorf("no connection to %s", h.p.Target)
+	}
+
+	em.Log("$ %s", cmd)
+
+	out, err := h.st.client.Run(ctx, cmd)
+	for _, line := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
+		if line != "" {
+			em.Log("%s", line)
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("post_ship failed: %w", err)
+	}
+	return nil
+}

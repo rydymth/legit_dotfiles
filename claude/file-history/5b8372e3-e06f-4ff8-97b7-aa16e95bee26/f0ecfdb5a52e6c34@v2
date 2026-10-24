@@ -1,0 +1,142 @@
+package steps
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"os/exec"
+	"runtime"
+	"strings"
+
+	"github.com/rudy/deployer/internal/config"
+	"github.com/rudy/deployer/internal/engine"
+)
+
+// buildStep runs the project's build command and records where its output
+// landed.
+type buildStep struct {
+	cfg  *config.Config
+	p    *config.Project
+	st   *state
+	opts Options
+
+	scratch string // created in Run, removed in Cleanup
+}
+
+func (b *buildStep) Name() string { return "build" }
+
+func (b *buildStep) Run(ctx context.Context, em *engine.Emitter) error {
+	dir := b.cfg.ResolveDir(b.p)
+	if _, err := os.Stat(dir); err != nil {
+		return fmt.Errorf("build dir %s: %w", dir, err)
+	}
+
+	// Every build gets a fresh output directory. Reusing one is how stale
+	// files from a previous release end up inside a new artifact.
+	scratch, err := os.MkdirTemp("", "deployer-build-")
+	if err != nil {
+		return err
+	}
+	b.scratch = scratch
+	b.st.outDir = scratch
+
+	cmd := expand(b.p.Build, map[string]string{"out": scratch, "name": b.p.Name})
+	b.st.artifactDir = expand(b.p.Artifact, map[string]string{"out": scratch, "name": b.p.Name})
+
+	if b.opts.DryRun {
+		em.Log("would run in %s:", dir)
+		em.Log("  %s", cmd)
+		return nil
+	}
+
+	em.Log("$ %s", cmd)
+
+	shell, flag := localShell()
+	c := exec.CommandContext(ctx, shell, flag, cmd)
+	c.Dir = dir
+	c.Env = buildEnv(b.p.Env)
+
+	// Both streams go to the same line-splitting writer: compilers put
+	// warnings on stderr and the ordering between the two is what makes a
+	// build log readable.
+	w := em.Writer()
+	c.Stdout = w
+	c.Stderr = w
+
+	if err := c.Run(); err != nil {
+		return fmt.Errorf("build command failed: %w", err)
+	}
+
+	if _, err := os.Stat(b.st.artifactDir); err != nil {
+		return fmt.Errorf("build finished but artifact %s is missing: %w", b.st.artifactDir, err)
+	}
+	return nil
+}
+
+// Cleanup removes the scratch output directory. It runs whether the build
+// succeeded or not, so a failed run does not leak a few hundred megabytes
+// into the temp directory.
+func (b *buildStep) Cleanup() {
+	if b.scratch != "" {
+		_ = os.RemoveAll(b.scratch)
+	}
+}
+
+// resolveStep stands in for build when a project ships a directory that
+// already exists, such as a precompiled site produced elsewhere.
+type resolveStep struct {
+	cfg *config.Config
+	p   *config.Project
+	st  *state
+}
+
+func (r *resolveStep) Name() string { return "resolve" }
+
+func (r *resolveStep) Run(ctx context.Context, em *engine.Emitter) error {
+	dir := expand(r.p.Artifact, map[string]string{"name": r.p.Name})
+	if !isAbs(dir) {
+		dir = joinPath(r.cfg.ResolveDir(r.p), dir)
+	}
+
+	info, err := os.Stat(dir)
+	if err != nil {
+		return fmt.Errorf("prebuilt artifact %s: %w", dir, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("prebuilt artifact %s is a file, expected a directory", dir)
+	}
+
+	r.st.artifactDir = dir
+	em.Log("using prebuilt artifact %s", dir)
+	return nil
+}
+
+// buildEnv layers the project's env settings over the ambient environment, so
+// a build inherits PATH and toolchain variables but can still be pinned.
+func buildEnv(extra map[string]string) []string {
+	env := os.Environ()
+	for k, v := range extra {
+		env = append(env, k+"="+v)
+	}
+	return env
+}
+
+// localShell picks the shell used to run build commands on this machine.
+func localShell() (string, string) {
+	if runtime.GOOS == "windows" {
+		return "cmd", "/c"
+	}
+	if sh := os.Getenv("SHELL"); sh != "" {
+		return sh, "-c"
+	}
+	return "/bin/sh", "-c"
+}
+
+// expand replaces {key} placeholders. Unknown placeholders are left alone, so
+// a build command containing braces for its own reasons still works.
+func expand(s string, vars map[string]string) string {
+	for k, v := range vars {
+		s = strings.ReplaceAll(s, "{"+k+"}", v)
+	}
+	return s
+}

@@ -1,0 +1,38 @@
+import {
+  ApplicationConfig,
+  DEFAULT_CURRENCY_CODE,
+  LOCALE_ID,
+  provideBrowserGlobalErrorListeners
+} from '@angular/core';
+import { registerLocaleData } from '@angular/common';
+import localeEnIn from '@angular/common/locales/en-IN';
+import { provideRouter } from '@angular/router';
+import { provideHttpClient, withInterceptors } from '@angular/common/http';
+import dxConfig from 'devextreme/core/config';
+import { locale as setDxLocale } from 'devextreme/localization';
+
+import { routes } from './app.routes';
+import { authInterceptor } from './core/interceptors/auth.interceptor';
+import { sessionExpiryInterceptor } from './core/interceptors/session-expiry.interceptor';
+import { loadingInterceptor } from './core/interceptors/loading.interceptor';
+
+// India is this portal's market. The API already charges in INR - PaymentService creates every
+// Razorpay order with currency "INR" - so the UI has to quote INR too; left at Angular's
+// defaults the currency pipe renders USD, and a GBP 349 plan was being shown as "$349.00".
+// Registering en-IN also switches number grouping to the Indian system (1,00,000 - lakh/crore).
+registerLocaleData(localeEnIn, 'en-IN');
+
+// DevExtreme formats independently of Angular's LOCALE_ID, so its grids and editors need telling
+// separately - otherwise any currency/number column in them falls back to en-US and USD.
+setDxLocale('en-IN');
+dxConfig({ defaultCurrency: 'INR' });
+
+export const appConfig: ApplicationConfig = {
+  providers: [
+    provideBrowserGlobalErrorListeners(),
+    provideRouter(routes),
+    provideHttpClient(withInterceptors([authInterceptor, sessionExpiryInterceptor, loadingInterceptor])),
+    { provide: LOCALE_ID, useValue: 'en-IN' },
+    { provide: DEFAULT_CURRENCY_CODE, useValue: 'INR' }
+  ]
+};

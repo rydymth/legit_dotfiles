@@ -1,0 +1,94 @@
+package transport
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"os"
+	"os/exec"
+	"path"
+	"path/filepath"
+	"strings"
+)
+
+// scpTransport shells out to the system scp binary.
+//
+// It exists as a fallback that shares none of the SFTP path's code: if a
+// server does something our Go client dislikes, this reaches it with the same
+// tool you would use by hand. The trade-off is progress reporting — scp's own
+// output is not machine-readable across OpenSSH versions and we refuse to
+// parse it, so this reports nothing until the file has landed.
+type scpTransport struct{}
+
+func (scpTransport) Name() string { return "scp" }
+
+func (scpTransport) Send(ctx context.Context, c *Client, localPath, remoteDir string, progress ProgressFn) error {
+	if _, err := exec.LookPath("scp"); err != nil {
+		return fmt.Errorf("scp binary not found on PATH: %w (use transport = \"sftp\")", err)
+	}
+
+	// Unlike SFTP, scp cannot create the destination directory itself.
+	if err := c.MkdirAll(ctx, remoteDir); err != nil {
+		return err
+	}
+
+	t := c.Target()
+
+	args := []string{
+		"-q",                     // no progress meter; we cannot use it anyway
+		"-p",                     // keep timestamps, which helps remote-side caching
+		"-P", fmt.Sprint(t.Port), //nolint:gocritic // scp spells the port -P
+		"-o", "BatchMode=yes", // never sit at a password prompt inside a TUI
+	}
+	if t.Key != "" {
+		args = append(args, "-i", t.Key, "-o", "IdentitiesOnly=yes")
+	}
+	switch {
+	case t.InsecureSkipHostKeyCheck:
+		args = append(args,
+			"-o", "StrictHostKeyChecking=no",
+			"-o", "UserKnownHostsFile=/dev/null")
+	case t.KnownHosts != "":
+		args = append(args, "-o", "UserKnownHostsFile="+t.KnownHosts)
+	}
+
+	user := t.User
+	if user == "" {
+		user = os.Getenv("USER")
+	}
+
+	// The remote half of an scp argument is expanded by the remote shell, so
+	// it needs quoting that shell will understand.
+	remote := path.Join(remoteDir, filepath.Base(localPath))
+	dest := fmt.Sprintf("%s@%s:%s", user, t.Host, quoteRemote(t.Shell, remote))
+
+	args = append(args, localPath, dest)
+
+	var out bytes.Buffer
+	cmd := exec.CommandContext(ctx, "scp", args...)
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("scp: %w: %s", err, strings.TrimSpace(out.String()))
+	}
+
+	// Report completion so the UI does not leave the bar sitting at zero.
+	if progress != nil {
+		if st, err := os.Stat(localPath); err == nil {
+			progress(st.Size(), st.Size())
+		}
+	}
+	return nil
+}
+
+func quoteRemote(shell, p string) string {
+	switch shell {
+	case "powershell":
+		return psQuote(p)
+	case "cmd":
+		return cmdQuote(p)
+	default:
+		return shQuote(p)
+	}
+}

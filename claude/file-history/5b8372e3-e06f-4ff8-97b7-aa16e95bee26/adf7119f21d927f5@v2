@@ -1,0 +1,215 @@
+// Command deploy builds projects in parallel, packs them and ships them to
+// their targets.
+//
+// What happens to an artifact once it lands is deliberately not this tool's
+// business: it delivers, runs the project's post_ship hook, and stops there.
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"text/tabwriter"
+
+	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/rudy/deployer/internal/config"
+	"github.com/rudy/deployer/internal/engine"
+	"github.com/rudy/deployer/internal/steps"
+	"github.com/rudy/deployer/internal/ui/plain"
+	"github.com/rudy/deployer/internal/ui/tui"
+)
+
+var version = "dev"
+
+func main() { os.Exit(run()) }
+
+func run() int {
+	var (
+		cfgPath     = flag.String("config", "deploy.toml", "path to the deploy plan")
+		only        = flag.String("only", "", "comma-separated projects to deploy (default: all enabled)")
+		skip        = flag.String("skip", "", "comma-separated projects to leave out")
+		jobs        = flag.Int("jobs", 0, "max projects to run at once (default: from config)")
+		plainOut    = flag.Bool("plain", false, "plain line output instead of the interactive interface")
+		verbose     = flag.Bool("verbose", false, "include build output in plain mode")
+		dryRun      = flag.Bool("dry-run", false, "report what would happen without doing any of it")
+		keepArchive = flag.Bool("keep-archive", false, "leave the packed archive on local disk")
+		list        = flag.Bool("list", false, "list the projects in the plan and exit")
+		showVersion = flag.Bool("version", false, "print the version and exit")
+	)
+	flag.Usage = usage
+	flag.Parse()
+
+	if *showVersion {
+		fmt.Println("deploy", version)
+		return 0
+	}
+
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 2
+	}
+
+	selected, err := selectProjects(cfg, *only, *skip)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 2
+	}
+
+	if *list {
+		printPlan(cfg, selected)
+		return 0
+	}
+
+	if len(selected) == 0 {
+		fmt.Fprintln(os.Stderr, "nothing to deploy")
+		return 2
+	}
+
+	opts := steps.Options{DryRun: *dryRun, KeepArchive: *keepArchive}
+	pipelines := make([]engine.Pipeline, 0, len(selected))
+	for _, p := range selected {
+		pipelines = append(pipelines, steps.Pipeline(cfg, p, opts))
+	}
+
+	n := cfg.Jobs
+	if *jobs > 0 {
+		n = *jobs
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	runner := engine.NewRunner(n)
+	errCh := make(chan error, 1)
+	go func() { errCh <- runner.Run(ctx, pipelines) }()
+
+	if *plainOut {
+		// Bubble Tea takes ctrl+c as a keystroke, so the signal handler is
+		// only wanted on the path where nothing else is reading the terminal.
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+		go func() {
+			<-sig
+			fmt.Fprintln(os.Stderr, "\ninterrupted, cancelling…")
+			cancel()
+		}()
+
+		plain.Render(os.Stdout, runner.Events(), *verbose)
+	} else {
+		prog := tea.NewProgram(
+			tui.New(runner.Events(), cancel),
+			tea.WithAltScreen(),
+			tea.WithMouseCellMotion(),
+		)
+		if _, err := prog.Run(); err != nil {
+			fmt.Fprintln(os.Stderr, "error: interface:", err)
+			cancel()
+		}
+	}
+
+	// If the interface was force-quit the engine may still be working; this
+	// stops it rather than leaving orphaned builds behind.
+	cancel()
+	runErr := <-errCh
+
+	if runErr != nil {
+		fmt.Fprintln(os.Stderr, "\n"+runErr.Error())
+		return 1
+	}
+	if *dryRun {
+		fmt.Println("\ndry run complete — nothing was built, sent or executed")
+	}
+	return 0
+}
+
+// selectProjects applies --only and --skip on top of each project's enabled flag.
+func selectProjects(cfg *config.Config, only, skip string) ([]*config.Project, error) {
+	onlySet := splitSet(only)
+	skipSet := splitSet(skip)
+
+	// Catch typos rather than silently deploying nothing.
+	known := map[string]bool{}
+	for _, p := range cfg.Projects {
+		known[p.Name] = true
+	}
+	for _, set := range []map[string]bool{onlySet, skipSet} {
+		for name := range set {
+			if !known[name] {
+				return nil, fmt.Errorf("unknown project %q", name)
+			}
+		}
+	}
+
+	var out []*config.Project
+	for _, p := range cfg.Projects {
+		if len(onlySet) > 0 {
+			// An explicit --only overrides enabled=false: naming a project
+			// is a clearer statement of intent than the config's default.
+			if !onlySet[p.Name] {
+				continue
+			}
+		} else if !p.On() {
+			continue
+		}
+		if skipSet[p.Name] {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out, nil
+}
+
+func splitSet(s string) map[string]bool {
+	set := map[string]bool{}
+	for _, part := range strings.Split(s, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			set[part] = true
+		}
+	}
+	return set
+}
+
+func printPlan(cfg *config.Config, selected []*config.Project) {
+	in := map[string]bool{}
+	for _, p := range selected {
+		in[p.Name] = true
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "PROJECT\tTARGET\tTRANSPORT\tARCHIVE\tREMOTE\t")
+	for _, p := range cfg.Projects {
+		name := p.Name
+		if !in[name] {
+			name += " (skipped)"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t\n", name, p.Target, p.Transport, p.Archive, p.Remote)
+	}
+	w.Flush()
+
+	fmt.Printf("\n%d of %d projects selected, %d at a time\n",
+		len(selected), len(cfg.Projects), cfg.Jobs)
+}
+
+func usage() {
+	fmt.Fprintf(os.Stderr, `deploy — build, pack and ship projects in parallel
+
+usage:
+  deploy [flags]
+
+examples:
+  deploy                          deploy everything enabled in deploy.toml
+  deploy --only hrms-api,hrms-web deploy two projects
+  deploy --dry-run                show the plan without touching anything
+  deploy --plain --verbose        line output with build logs, for CI
+  deploy --list                   show the plan and exit
+
+flags:
+`)
+	flag.PrintDefaults()
+}

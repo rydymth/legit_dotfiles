@@ -1,0 +1,35 @@
+# A throwaway SSH target for developing the deploy tool against.
+#
+# This is the inner loop: it exercises the real connection, the real SFTP or
+# scp path and the real post_ship hook, costs nothing, and resets in seconds.
+# What it does not cover is Windows — IIS file locks and tar.exe quirks need a
+# Windows Server evaluation VM before you trust a deploy to the legacy box.
+#
+#   docker compose -f test/compose.yml up -d
+#   ./deploy --config test/deploy.test.toml --dry-run
+#   ./deploy --config test/deploy.test.toml
+#   docker compose -f test/compose.yml down -v     # reset
+#
+# Artifacts land under /config inside the container, which is the only tree
+# the unprivileged deploy user owns. Point `remote` there in the test plan.
+
+services:
+  target:
+    image: lscr.io/linuxserver/openssh-server:latest
+    container_name: deployer-test-target
+    hostname: deployer-test
+    environment:
+      PUID: 1000
+      PGID: 1000
+      TZ: Etc/UTC
+      USER_NAME: deploy
+      PUBLIC_KEY_FILE: /keys/authorized_key.pub
+      PASSWORD_ACCESS: "false"
+      SUDO_ACCESS: "false"
+    volumes:
+      # Reuse the key you already deploy with, so the test target
+      # authenticates exactly the way production does.
+      - ${HOME}/.local/keys/ssh/id_ed25519.pub:/keys/authorized_key.pub:ro
+    ports:
+      # The image's sshd listens on 2222, not 22.
+      - "127.0.0.1:2222:2222"

@@ -1,0 +1,2 @@
+- [Angular CLI blocked by Node version](ng-build-blocked-node-version.md) — can't `ng build`/`ng serve` here; verify FE with `npx tsc` / `npx ngc` instead.
+- [Indianization scope decision](indianization-scope.md) — locale/currency done 2026-10-24; GST and address fields deliberately deferred.

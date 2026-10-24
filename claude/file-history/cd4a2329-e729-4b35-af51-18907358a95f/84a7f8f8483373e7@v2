@@ -1,0 +1,166 @@
+using Microsoft.AspNetCore.Identity;
+using Microsoft.Extensions.Logging;
+using SubscriptionPortal.BusinessLogicLayer.Security;
+using SubscriptionPortal.BusinessLogicLayer.Services.Account.Interface;
+using SubscriptionPortal.BusinessLogicLayer.Services.Notifications.Interface;
+using SubscriptionPortal.BusinessLogicLayer.Services.RoleRights.Interface;
+using SubscriptionPortal.Core.CommonModels;
+using SubscriptionPortal.Core.DTOs.Account;
+using SubscriptionPortal.Core.Entities;
+using SubscriptionPortal.Core.Security;
+using SubscriptionPortal.Core.Validation;
+using SubscriptionPortal.Core.Enums;
+using SubscriptionPortal.DataAccessLayer.Repositories.Account.Interface;
+
+namespace SubscriptionPortal.BusinessLogicLayer.Services.Account.Implementation
+{
+    public class AccountService : IAccountService
+    {
+        private readonly IAccountRepository _accountRepository;
+        private readonly IJwtTokenGenerator _jwtTokenGenerator;
+        private readonly IRoleRightsService _roleRightsService;
+        private readonly IEmailService _emailService;
+        private readonly ILogger<AccountService> _logger;
+        private readonly PasswordHasher<PortalUser> _passwordHasher = new();
+
+        public AccountService(
+            IAccountRepository accountRepository,
+            IJwtTokenGenerator jwtTokenGenerator,
+            IRoleRightsService roleRightsService,
+            IEmailService emailService,
+            ILogger<AccountService> logger)
+        {
+            _accountRepository = accountRepository;
+            _jwtTokenGenerator = jwtTokenGenerator;
+            _roleRightsService = roleRightsService;
+            _emailService = emailService;
+            _logger = logger;
+        }
+
+        /// <summary>
+        /// Deliberately minimal: company name, admin name, email, contact number. No password is
+        /// collected here and no product/plan is chosen. This creates ONLY the login itself - no
+        /// Tenant/company record yet (see PortalUser.TenantId's own doc comment) - so the person
+        /// can log in and browse Available Products, but their company account only gets created
+        /// the moment they actually activate a product (Demo or Purchase) via
+        /// ISubscriptionService.ActivateProductAsync.
+        /// </summary>
+        public async Task<ApiResponse<SignupResponse>> SignupAsync(SignupRequest request)
+        {
+            var adminEmail = request.AdminEmail.Trim().ToLowerInvariant();
+            var companyName = request.CompanyName.Trim();
+            var contactNumber = request.ContactNumber.Trim();
+
+            // Contact Number is optional (see SignupRequest.ContactNumber) - only its format is
+            // checked, and only when something was actually entered.
+            if (!string.IsNullOrWhiteSpace(contactNumber) && !IndianMobile.IsValid(contactNumber))
+            {
+                return ApiResponse<SignupResponse>.Failure(IndianMobile.ErrorMessage);
+            }
+
+            if (await _accountRepository.EmailExistsAsync(adminEmail))
+            {
+                return ApiResponse<SignupResponse>.Failure(
+                    $"An account with email '{adminEmail}' already exists. Please log in or use a different email.");
+            }
+
+            var generatedPassword = GeneratedPassword.Create();
+
+            var pendingUser = new PortalUser
+            {
+                Name = request.AdminName.Trim(),
+                Email = adminEmail,
+                ContactNumber = contactNumber,
+                PendingCompanyName = companyName
+                // TenantId/RoleId stay null until this person activates their first product.
+            };
+            pendingUser.PasswordHash = _passwordHasher.HashPassword(pendingUser, generatedPassword);
+
+            await _accountRepository.CreatePendingUserAsync(pendingUser);
+
+            try
+            {
+                await _emailService.SendEmailAsync(
+                    pendingUser.Email,
+                    "Your Subscription Portal account is ready",
+                    Notifications.Implementation.EmailTemplates.AccountReady(
+                        companyName, pendingUser.Name, pendingUser.Email, generatedPassword));
+            }
+            catch (Exception ex)
+            {
+                // The account already exists at this point - a failed welcome email must not
+                // fail Signup. The admin can still be looked up/reset by support if needed.
+                _logger.LogWarning(ex, "Signup succeeded for PortalUserId {PortalUserId} but the welcome email failed to send.", pendingUser.Id);
+            }
+
+            var response = new SignupResponse
+            {
+                CompanyName = companyName,
+                AdminEmail = pendingUser.Email
+            };
+
+            return ApiResponse<SignupResponse>.Success(
+                response,
+                "Your account has been registered. Check your email for your login details.");
+        }
+
+        public async Task<ApiResponse<LoginResponse>> LoginAsync(LoginRequest request)
+        {
+            var email = request.Email.Trim().ToLowerInvariant();
+            var user = await _accountRepository.GetActiveUserWithTenantByEmailAsync(email);
+
+            if (user is null)
+            {
+                return ApiResponse<LoginResponse>.Failure("Invalid email or password.");
+            }
+
+            var verificationResult = _passwordHasher.VerifyHashedPassword(user, user.PasswordHash, request.Password);
+            if (verificationResult == PasswordVerificationResult.Failed)
+            {
+                return ApiResponse<LoginResponse>.Failure("Invalid email or password.");
+            }
+
+            // A Tenant only exists once this user has activated a product (see
+            // PortalUser.TenantId's own doc comment) - a tenant-less login is valid and expected,
+            // not a failure case.
+            if (user.Tenant is not null && user.Tenant.Status is TenantStatus.Blocked or TenantStatus.Deleted)
+            {
+                return ApiResponse<LoginResponse>.Failure(
+                    "This company's account is no longer active. Please contact support.");
+            }
+
+            await _accountRepository.UpdateLastLoginDateAsync(user.Id);
+
+            var (token, expiresAtUtc) = _jwtTokenGenerator.GenerateToken(user);
+
+            // No Tenant yet means no Role to look rights up for - this person has only signed up.
+            // They get the pages PageMaster flags as defaults (Available Products + My
+            // Subscriptions today), which is also exactly what their company's own default role
+            // will be granted when they activate their first product, so the sidenav doesn't
+            // change under them at that moment.
+            var permissions = user.TenantId is null
+                ? await _roleRightsService.GetDefaultPermissionsAsync()
+                : await _roleRightsService.GetEffectivePermissionsAsync(user.RoleId!.Value);
+
+            var response = new LoginResponse
+            {
+                Token = token,
+                ExpiresAtUtc = expiresAtUtc,
+                TenantId = user.TenantId,
+                CompanyName = user.Tenant?.CompanyName ?? user.PendingCompanyName ?? string.Empty,
+                Subdomain = user.Tenant?.Subdomain ?? string.Empty,
+                TenantStatus = user.Tenant?.Status.ToString() ?? "Registered",
+                AdminName = user.Name,
+                Email = user.Email,
+                ContactNumber = user.ContactNumber,
+                RoleId = user.RoleId,
+                Role = user.Role?.RoleName ?? string.Empty,
+                IsPlatformOwner = user.IsPlatformOwner,
+                Permissions = permissions
+            };
+
+            return ApiResponse<LoginResponse>.Success(response, "Login successful.");
+        }
+
+    }
+}

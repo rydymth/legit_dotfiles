@@ -1,0 +1,78 @@
+// Package plain renders the event stream as ordinary lines of text.
+//
+// It is what runs under --plain: in CI, over a connection too flaky for an
+// alternate screen buffer, or any time the output is going to be piped
+// somewhere and read later.
+package plain
+
+import (
+	"fmt"
+	"io"
+	"sync"
+	"time"
+
+	"github.com/rudy/deployer/internal/engine"
+)
+
+// Render consumes events until the channel closes.
+//
+// Log lines are only printed when verbose is set. Without it the output is
+// one line per step transition, which is what you actually want to read in a
+// CI log after the fact.
+func Render(w io.Writer, events <-chan engine.Event, verbose bool) {
+	start := time.Now()
+
+	// Progress is reported per written byte, which would be thousands of
+	// lines. Only milestones are worth a line in a log file.
+	milestones := map[string]int{}
+
+	var mu sync.Mutex
+	printf := func(format string, args ...any) {
+		mu.Lock()
+		defer mu.Unlock()
+		fmt.Fprintf(w, "%7s  ", time.Since(start).Round(100*time.Millisecond))
+		fmt.Fprintf(w, format+"\n", args...)
+	}
+
+	for ev := range events {
+		switch ev.Kind {
+		case engine.KindProject:
+			switch ev.Status {
+			case engine.Running:
+				printf("[%s] started", ev.Project)
+			case engine.Done:
+				printf("[%s] OK", ev.Project)
+			case engine.Failed:
+				printf("[%s] FAILED: %v", ev.Project, ev.Err)
+			case engine.Skipped:
+				printf("[%s] skipped", ev.Project)
+			}
+
+		case engine.KindStep:
+			switch ev.Status {
+			case engine.Running:
+				printf("[%s] %s ...", ev.Project, ev.Step)
+			case engine.Done:
+				printf("[%s] %s done", ev.Project, ev.Step)
+			case engine.Failed:
+				printf("[%s] %s FAILED: %v", ev.Project, ev.Step, ev.Err)
+			}
+
+		case engine.KindLog:
+			if verbose {
+				printf("[%s/%s] %s", ev.Project, ev.Step, ev.Line)
+			}
+
+		case engine.KindProgress:
+			if ev.Total <= 0 {
+				continue
+			}
+			key := ev.Project + "/" + ev.Step
+			pct := int(float64(ev.Sent) / float64(ev.Total) * 100)
+			if bucket := pct / 25; bucket > milestones[key] {
+				milestones[key] = bucket
+				printf("[%s] %s %d%%", ev.Project, ev.Step, bucket*25)
+			}
+		}
+	}
+}

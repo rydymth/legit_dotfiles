@@ -1,0 +1,77 @@
+package transport
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"sort"
+)
+
+// ProgressFn is called as bytes move. total is 0 when the size is unknown.
+type ProgressFn func(sent, total int64)
+
+// Transport sends one local file to a remote directory.
+//
+// Implementations are responsible for creating the remote directory, because
+// how that is best done differs: SFTP can do it at protocol level without
+// involving a shell, while an external scp has to ask the shell.
+type Transport interface {
+	Name() string
+	Send(ctx context.Context, c *Client, localPath, remoteDir string, progress ProgressFn) error
+}
+
+var registry = map[string]Transport{
+	"sftp": sftpTransport{},
+	"scp":  scpTransport{},
+}
+
+// Get looks up a transport by name.
+func Get(name string) (Transport, error) {
+	t, ok := registry[name]
+	if !ok {
+		return nil, fmt.Errorf("unknown transport %q (have: %s)", name, Names())
+	}
+	return t, nil
+}
+
+// Names lists the registered transports, for error messages and --help.
+func Names() string {
+	names := make([]string, 0, len(registry))
+	for n := range registry {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	out := ""
+	for i, n := range names {
+		if i > 0 {
+			out += ", "
+		}
+		out += n
+	}
+	return out
+}
+
+// progressReader counts bytes on their way through and reports them, and
+// aborts the read if the deploy is cancelled. Wrapping the *source* means the
+// count is accurate even when the transport writes in concurrent chunks.
+type progressReader struct {
+	r     io.Reader
+	ctx   context.Context
+	fn    ProgressFn
+	total int64
+	sent  int64
+}
+
+func (p *progressReader) Read(b []byte) (int, error) {
+	if err := p.ctx.Err(); err != nil {
+		return 0, err
+	}
+	n, err := p.r.Read(b)
+	if n > 0 {
+		p.sent += int64(n)
+		if p.fn != nil {
+			p.fn(p.sent, p.total)
+		}
+	}
+	return n, err
+}

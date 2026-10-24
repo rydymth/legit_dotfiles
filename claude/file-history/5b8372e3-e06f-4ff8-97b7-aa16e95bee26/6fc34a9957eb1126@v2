@@ -1,0 +1,308 @@
+package tui
+
+import (
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/charmbracelet/lipgloss"
+
+	"github.com/rudy/deployer/internal/engine"
+)
+
+// Adaptive colours so the interface is legible on a light terminal as well as
+// a dark one, which matters more than it sounds when half a team is on each.
+var (
+	colAccent = lipgloss.AdaptiveColor{Light: "#5B21B6", Dark: "#A78BFA"}
+	colOK     = lipgloss.AdaptiveColor{Light: "#15803D", Dark: "#4ADE80"}
+	colFail   = lipgloss.AdaptiveColor{Light: "#B91C1C", Dark: "#F87171"}
+	colMuted  = lipgloss.AdaptiveColor{Light: "#6B7280", Dark: "#9CA3AF"}
+	colFaint  = lipgloss.AdaptiveColor{Light: "#B8BCC4", Dark: "#5B616E"}
+)
+
+var (
+	styleAccent = lipgloss.NewStyle().Foreground(colAccent)
+	styleOK     = lipgloss.NewStyle().Foreground(colOK)
+	styleFail   = lipgloss.NewStyle().Foreground(colFail)
+	styleMuted  = lipgloss.NewStyle().Foreground(colMuted)
+	styleFaint  = lipgloss.NewStyle().Foreground(colFaint)
+
+	styleTitle = lipgloss.NewStyle().Foreground(colAccent).Bold(true)
+	styleName  = lipgloss.NewStyle().Bold(true)
+	styleRule  = lipgloss.NewStyle().Foreground(colFaint)
+	styleSelBar = lipgloss.NewStyle().Foreground(colAccent)
+)
+
+// chromeHeight is everything that is not the log viewport: header, the
+// project list, the divider and the footer.
+func (m *Model) chromeHeight() int {
+	rows := len(m.projects)
+	if rows == 0 {
+		rows = 1
+	}
+	return rows + 6
+}
+
+func (m *Model) View() string {
+	if !m.ready {
+		return "\n  starting…\n"
+	}
+
+	var b strings.Builder
+
+	b.WriteString(m.renderHeader())
+	b.WriteString("\n\n")
+	b.WriteString(m.renderProjects())
+	b.WriteString("\n")
+	b.WriteString(m.renderDivider())
+	b.WriteString("\n")
+	b.WriteString(m.vp.View())
+	b.WriteString("\n")
+	b.WriteString(m.renderFooter())
+
+	return b.String()
+}
+
+func (m *Model) renderHeader() string {
+	elapsed := time.Since(m.start)
+	if m.finished {
+		// Freeze the clock once there is nothing left to time.
+		elapsed = m.latestEnd().Sub(m.start)
+	}
+
+	done, failed := 0, 0
+	for _, p := range m.projects {
+		switch p.status {
+		case engine.Done:
+			done++
+		case engine.Failed:
+			failed++
+		}
+	}
+
+	summary := fmt.Sprintf("%d/%d done", done, len(m.projects))
+	if failed > 0 {
+		summary += styleFail.Render(fmt.Sprintf(" · %d failed", failed))
+	}
+
+	return "  " + styleTitle.Render("deployer") + "  " +
+		styleMuted.Render(summary+" · "+fmtDur(elapsed))
+}
+
+func (m *Model) renderProjects() string {
+	if len(m.projects) == 0 {
+		return styleMuted.Render("  no projects")
+	}
+
+	width := 0
+	for _, p := range m.projects {
+		if n := lipgloss.Width(p.name); n > width {
+			width = n
+		}
+	}
+
+	var b strings.Builder
+	for i, p := range m.projects {
+		// A selection marker only means anything when the log pane is
+		// actually following one project.
+		marker := "  "
+		if !m.followAll && i == m.sel {
+			marker = styleSelBar.Render("▌ ")
+		}
+
+		b.WriteString(marker)
+		b.WriteString(m.glyph(p.status))
+		b.WriteString(" ")
+		b.WriteString(styleName.Render(pad(p.name, width)))
+		b.WriteString("  ")
+		b.WriteString(m.renderSteps(p))
+
+		if d := p.elapsed(); d > 0 {
+			b.WriteString(styleFaint.Render("  " + fmtDur(d)))
+		}
+		if i < len(m.projects)-1 {
+			b.WriteString("\n")
+		}
+	}
+	return b.String()
+}
+
+// renderSteps draws one project's steps as a row of chips, expanding the
+// running one into a progress bar when it knows how much work is left.
+func (m *Model) renderSteps(p *project) string {
+	var parts []string
+	for _, s := range p.steps {
+		switch {
+		case s.status == engine.Running && s.total > 0:
+			pct := float64(s.sent) / float64(s.total)
+			parts = append(parts, fmt.Sprintf("%s %s %s",
+				styleAccent.Render(s.name),
+				bar(pct, 12),
+				styleMuted.Render(fmt.Sprintf("%3.0f%% %s", pct*100, humanBytes(s.total))),
+			))
+		case s.status == engine.Running:
+			parts = append(parts, styleAccent.Render(s.name)+" "+m.sp.View())
+		case s.status == engine.Done:
+			parts = append(parts, styleMuted.Render(s.name)+" "+styleOK.Render("✓"))
+		case s.status == engine.Failed:
+			parts = append(parts, styleFail.Render(s.name+" ✗"))
+		case s.status == engine.Skipped:
+			parts = append(parts, styleFaint.Render(s.name+" –"))
+		default:
+			parts = append(parts, styleFaint.Render(s.name+" ·"))
+		}
+	}
+	return strings.Join(parts, styleFaint.Render("  "))
+}
+
+func (m *Model) renderDivider() string {
+	label := " all logs "
+	if p := m.selected(); p != nil {
+		label = " " + p.name + " "
+	}
+
+	w := m.w - 4 - lipgloss.Width(label)
+	if w < 0 {
+		w = 0
+	}
+	return "  " + styleFaint.Render("──") + styleMuted.Render(label) +
+		styleRule.Render(strings.Repeat("─", w))
+}
+
+func (m *Model) renderFooter() string {
+	if m.cancelled && !m.finished {
+		return "  " + styleFail.Render("cancelling…") + styleMuted.Render("  press q again to quit now")
+	}
+
+	if m.finished {
+		var status string
+		switch {
+		case m.cancelled:
+			status = styleFail.Render("cancelled")
+		case m.failures > 0:
+			status = styleFail.Render(fmt.Sprintf("%d project(s) failed", m.failures))
+		default:
+			status = styleOK.Render("all projects deployed")
+		}
+		return "  " + status + styleMuted.Render("  ·  q quit  ·  ↑↓ project  ·  a all logs")
+	}
+
+	return "  " + styleMuted.Render("↑↓ project  ·  a all logs  ·  g/G top/bottom  ·  q cancel")
+}
+
+// renderLogs builds the viewport body, filtered to the selected project unless
+// we are following everything.
+func (m *Model) renderLogs() string {
+	sel := m.selected()
+
+	// Prefix width only needs to cover what is actually on screen.
+	nameW := 0
+	if sel == nil {
+		for _, p := range m.projects {
+			if n := lipgloss.Width(p.name); n > nameW {
+				nameW = n
+			}
+		}
+	}
+
+	var b strings.Builder
+	for _, l := range m.logs {
+		if sel != nil && l.project != sel.name {
+			continue
+		}
+
+		prefix := ""
+		if sel == nil {
+			prefix = styleAccent.Render(pad(l.project, nameW)) + " "
+		}
+		prefix += styleFaint.Render(pad(l.step, 8)) + " "
+
+		// Truncate rather than wrap: a wrapped 400-character compiler line
+		// pushes everything else off the screen and tells you less.
+		text := truncate(l.text, m.vp.Width-lipgloss.Width(prefix))
+
+		b.WriteString(" ")
+		b.WriteString(prefix)
+		b.WriteString(text)
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+func (m *Model) glyph(s engine.Status) string {
+	switch s {
+	case engine.Running:
+		return m.sp.View()
+	case engine.Done:
+		return styleOK.Render("✓")
+	case engine.Failed:
+		return styleFail.Render("✗")
+	case engine.Skipped:
+		return styleFaint.Render("–")
+	default:
+		return styleFaint.Render("·")
+	}
+}
+
+func (m *Model) latestEnd() time.Time {
+	latest := m.start
+	for _, p := range m.projects {
+		if p.end.After(latest) {
+			latest = p.end
+		}
+	}
+	return latest
+}
+
+func bar(pct float64, width int) string {
+	if pct < 0 {
+		pct = 0
+	}
+	if pct > 1 {
+		pct = 1
+	}
+	filled := int(pct * float64(width))
+	return styleAccent.Render(strings.Repeat("▰", filled)) +
+		styleFaint.Render(strings.Repeat("▱", width-filled))
+}
+
+func pad(s string, w int) string {
+	if n := lipgloss.Width(s); n < w {
+		return s + strings.Repeat(" ", w-n)
+	}
+	return s
+}
+
+func truncate(s string, w int) string {
+	if w <= 1 {
+		return ""
+	}
+	if lipgloss.Width(s) <= w {
+		return s
+	}
+	r := []rune(s)
+	if len(r) > w-1 {
+		r = r[:w-1]
+	}
+	return string(r) + styleFaint.Render("…")
+}
+
+func fmtDur(d time.Duration) string {
+	if d < time.Minute {
+		return fmt.Sprintf("%.1fs", d.Seconds())
+	}
+	return fmt.Sprintf("%dm%02ds", int(d.Minutes()), int(d.Seconds())%60)
+}
+
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for v := n / unit; v >= unit; v /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f%cB", float64(n)/float64(div), "KMGTPE"[exp])
+}

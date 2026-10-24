@@ -1,0 +1,3 @@
+module github.com/rudy/deployer
+
+go 1.26.10

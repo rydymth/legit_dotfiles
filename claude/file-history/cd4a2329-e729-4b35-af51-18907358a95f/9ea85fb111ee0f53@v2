@@ -1,0 +1,170 @@
+<div class="page-wrapper page-wrapper--mesh">
+  <div class="mesh-orb mesh-orb--1"></div>
+  <div class="mesh-orb mesh-orb--2"></div>
+  <div class="mesh-orb mesh-orb--3"></div>
+  <div class="auth-grid"></div>
+  <div class="auth-beam"></div>
+
+  @if (submitResult(); as result) {
+    <!-- The success card is the whole page here (no hero alongside it), so it centres itself in
+         the viewport. dvh, not vh, so it isn't pushed under a mobile address bar. -->
+    <div class="auth-form-zone auth-form-zone--solo">
+      <div class="auth-wrap">
+        <div class="form-card glass-card signup-success">
+          <div class="signup-success__icon"><i class="fa-solid fa-circle-check"></i></div>
+          <h1 class="signup-success__title">You're all set, {{ result.companyName }}!</h1>
+          <p class="signup-success__body">
+            Your company has been registered. Check <strong>{{ result.adminEmail }}</strong> for your
+            login email and password.
+          </p>
+          <p class="signup-success__note">
+            Once you log in, you can try a free Demo or go straight to Purchase for any product -
+            and it's fine to just look around first too.
+          </p>
+          <a routerLink="/login" class="btn btn-accent px-4">Go to Login</a>
+        </div>
+      </div>
+    </div>
+  } @else {
+  <div class="signup-split">
+
+    <!-- Left: pitch / hero -->
+    <div class="signup-hero">
+      <span class="signup-hero__eyebrow"><i class="fa-solid fa-bolt"></i> Why Subscription Portal</span>
+      <h1 class="signup-hero__title">All the software your business needs — in one place.</h1>
+      <p class="signup-hero__subtitle">
+        Stop running your business on spreadsheets and scattered tools. Subscribe to any product
+        your company needs, try a free Demo first, or purchase when you're ready - all from one
+        account.
+      </p>
+
+      <div class="hero-preview">
+        <div class="hero-preview-card">
+          <div class="hero-preview-card__row">
+            <span class="hero-preview-card__icon"><i class="fa-solid fa-building"></i></span>
+            <div>
+              <p class="hero-preview-card__title">Your Company</p>
+              <p class="hero-preview-card__subtitle">Registered in seconds</p>
+            </div>
+            <span class="hero-preview-pill hero-preview-pill--trial">Trial</span>
+          </div>
+        </div>
+
+        <div class="hero-preview-connector">
+          <i class="fa-solid fa-arrow-down"></i>
+          <span>Explore anytime, no pressure</span>
+        </div>
+
+        <div class="hero-preview-card hero-preview-card--choice">
+          <div class="hero-preview-choice">
+            <span class="hero-preview-choice__btn"><i class="fa-solid fa-flask"></i> Demo</span>
+            <span class="hero-preview-choice__btn hero-preview-choice__btn--accent"><i class="fa-solid fa-credit-card"></i> Purchase</span>
+          </div>
+          <p class="hero-preview-card__footnote">No commitment until you're ready</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Right: form -->
+    <div class="auth-form-zone">
+      <div class="auth-wrap">
+        <div class="form-card glass-card">
+          <div class="brand-lockup">
+            <img class="brand-lockup__mark" src="/brand/solution-one-logo.png" alt="Solution One" />
+          </div>
+          <form [formGroup]="form" (ngSubmit)="submit()" novalidate>
+            <div class="auth-card-head">
+              <h2>Create Your Account</h2>
+              <p>Just a few details to get started.</p>
+            </div>
+
+            <div class="form-card-body d-flex flex-column gap-3">
+
+              <!-- Company name -->
+              <div>
+                <label class="form-label" for="companyName">Company Name<span class="required">*</span></label>
+                <div class="input-icon-wrap">
+                  <i class="fa-solid fa-building input-icon"></i>
+                  <input id="companyName" type="text" class="form-control" formControlName="companyName"
+                         [class.is-invalid]="isInvalid('companyName')" placeholder="Acme Corporation" />
+                </div>
+                @if (isInvalid('companyName')) {
+                  <div class="field-error">
+                    @if (f.companyName.errors?.['required']) { Company name is required. }
+                    @else if (f.companyName.errors?.['minlength']) { Company name must be at least 2 characters. }
+                    @else if (f.companyName.errors?.['maxlength']) { Company name cannot exceed 200 characters. }
+                  </div>
+                }
+              </div>
+
+              <!-- Stacked here, not side by side: this form lives in the 420px auth card
+                   (.auth-wrap), where two columns gave each field a ~190px box. The page forms use
+                   the stretching .form-grid instead - see styles.scss. -->
+              <div class="form-grid-stack">
+                <div class="form-field">
+                  <label class="form-label" for="adminName">Your Name<span class="required">*</span></label>
+                  <div class="input-icon-wrap">
+                    <i class="fa-solid fa-user input-icon"></i>
+                    <input id="adminName" type="text" class="form-control" formControlName="adminName"
+                           [class.is-invalid]="isInvalid('adminName')" placeholder="Jane Doe" />
+                  </div>
+                  @if (isInvalid('adminName')) {
+                    <div class="field-error">Name is required (min 2 characters).</div>
+                  }
+                </div>
+                <div class="form-field">
+                  <label class="form-label" for="adminEmail">Email<span class="required">*</span></label>
+                  <div class="input-icon-wrap">
+                    <i class="fa-solid fa-envelope input-icon"></i>
+                    <input id="adminEmail" type="email" class="form-control" formControlName="adminEmail"
+                           [class.is-invalid]="isInvalid('adminEmail')" placeholder="jane@acme.com" />
+                  </div>
+                  @if (isInvalid('adminEmail')) {
+                    <div class="field-error">
+                      @if (f.adminEmail.errors?.['required']) { Email is required. }
+                      @else if (f.adminEmail.errors?.['email']) { Enter a valid email address. }
+                    </div>
+                  }
+                </div>
+              </div>
+
+              <div>
+                <label class="form-label" for="contactNumber">Contact Number<!-- <span class="required">*</span> --></label>
+                <div class="input-icon-wrap">
+                  <i class="fa-solid fa-phone input-icon"></i>
+                  <input id="contactNumber" type="tel" class="form-control" formControlName="contactNumber"
+                         [class.is-invalid]="isInvalid('contactNumber')" placeholder="+91 98765 43210" />
+                </div>
+                @if (isInvalid('contactNumber')) {
+                  <div class="field-error">Enter a valid 10-digit Indian mobile number, for example +91 98765 43210.</div>
+                }
+              </div>
+
+              @if (submitError()) {
+                <div class="form-note form-note--error">
+                  <i class="fa-solid fa-triangle-exclamation"></i>
+                  <div>{{ submitError() }}</div>
+                </div>
+              }
+
+              <p class="mb-0" style="font-size:13px; color: var(--text-soft)">
+                Already have an account? <a routerLink="/login">Log in here</a>.
+              </p>
+            </div>
+
+            <div class="form-card-footer">
+              <button type="submit" class="btn btn-accent px-4" [disabled]="isSubmitting()">
+                @if (isSubmitting()) {
+                  <span><i class="fa-solid fa-spinner fa-spin"></i> Registering...</span>
+                } @else {
+                  <span>Create Account <i class="fa-solid fa-arrow-right"></i></span>
+                }
+              </button>
+            </div>
+          </form>
+        </div>
+      </div>
+    </div>
+  </div>
+  }
+</div>

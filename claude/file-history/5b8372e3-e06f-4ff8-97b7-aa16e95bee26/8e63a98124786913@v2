@@ -1,0 +1,116 @@
+# Deploy plan.
+#
+# Copy to deploy.toml and fill in the targets. Nothing here is specific to the
+# tool: a project is a command that produces a directory, plus somewhere to
+# send it, so anything that builds into a folder can be added the same way.
+
+# How many projects build at once. Builds are memory-hungry; the default is
+# half your cores, which keeps the machine usable.
+jobs = 3
+
+
+# ---------------------------------------------------------------------------
+# Targets
+# ---------------------------------------------------------------------------
+
+[targets.prod-linux]
+host = "45.55.33.49"
+port = 22
+user = "root"
+key  = "~/.local/keys/ssh/id_ed25519"
+# shell defaults to "sh"
+
+[targets.legacy-win]
+host  = "YOUR.WINDOWS.HOST"
+port  = 22
+user  = "Administrator"
+key   = "~/.local/keys/ssh/id_ed25519"
+# Hooks are sent as a base64 -EncodedCommand, so a post_ship script can
+# contain quotes and newlines without any escaping gymnastics.
+shell = "powershell"
+
+# A throwaway test box, e.g. the Docker container in test/compose.yml.
+[targets.local-test]
+host = "127.0.0.1"
+port = 2222
+user = "deploy"
+key  = "~/.local/keys/ssh/id_ed25519"
+insecure_skip_host_key_check = true
+
+
+# ---------------------------------------------------------------------------
+# Projects
+# ---------------------------------------------------------------------------
+
+[[projects]]
+name = "hrms-api"
+dir  = "../hrms/HRMS_BackEnd"
+build = "dotnet publish SolutionOneWebPortal/SolutionOneWebPortal_API.csproj -c Release -o {out}"
+
+# These directories hold uploaded employee documents that live on the server
+# and are not in the build output. Without these lines a deploy that extracts
+# over the site root would destroy them.
+exclude = [
+  "wwwroot/OfferLetters",
+  "wwwroot/JoiningLetters",
+  "wwwroot/LeaveAttachments",
+  "wwwroot/ProfileImages",
+  "wwwroot/Documents",
+  "UploadedResumes",
+  "logs",
+  "appsettings.Development.json",
+  "*.pdb",
+]
+
+archive   = "tar.zst"
+transport = "sftp"
+target    = "prod-linux"
+remote    = "/srv/artifacts/hrms-api"
+post_ship = "ls -lh {archive}"
+
+
+[[projects]]
+name = "hrms-web"
+dir  = "../hrms/HRMS_FrontEnd"
+
+# Angular's application builder writes the site into a "browser" subfolder of
+# whatever --output-path it is given, which is why the artifact points one
+# level deeper than the build output.
+build    = "npm ci --prefer-offline --no-audit && npx ng build --configuration production --output-path {out}"
+artifact = "{out}/browser"
+
+exclude = [
+  "*.map",
+  "stats.json",
+]
+
+archive   = "tar.zst"
+transport = "sftp"
+target    = "prod-linux"
+remote    = "/srv/artifacts/hrms-web"
+post_ship = "ls -lh {archive}"
+
+
+# A project with no build command ships a directory that already exists. The
+# Web Forms app is compiled on a Windows machine, so this one only packs and
+# delivers whatever is currently in that folder.
+[[projects]]
+name     = "payroll-web"
+artifact = "../hrms/HRMS_Payroll/PrecompiledWeb_Fresh3"
+
+exclude = [
+  "App_Data",
+  "ProofUploads",
+  "*.pdb",
+]
+
+# zstd needs a tar that understands it. Older Windows Server builds ship a
+# tar.exe that does not, so this one stays on gzip.
+archive   = "tar.gz"
+transport = "sftp"
+target    = "legacy-win"
+remote    = "C:/artifacts/payroll-web"
+post_ship = "Get-Item '{archive}' | Select-Object Name, Length, LastWriteTime"
+
+# Parked, not deleted: --only payroll-web still deploys it.
+enabled = false
